@@ -4,7 +4,7 @@ dnl
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.60])
-AC_INIT([libfabric], [1.6.1], [ofiwg@lists.openfabrics.org])
+AC_INIT([libfabric], [1.7.0], [ofiwg@lists.openfabrics.org])
 AC_CONFIG_SRCDIR([src/fabric.c])
 AC_CONFIG_AUX_DIR(config)
 AC_CONFIG_MACRO_DIR(config)
@@ -50,9 +50,9 @@ AS_IF([test x"$with_build_id" = x"no"], [with_build_id=""])
 AC_DEFINE_UNQUOTED([BUILD_ID],["$with_build_id"],
                    [adds build_id to version if it was defined])
 
-# Fix autoconf's habit of setting CFLAGS="-g -O2" by default while still
+# Override autoconf default CFLAG settings (e.g. "-g -O2") while still
 # allowing the user to explicitly set CFLAGS=""
-: ${CFLAGS="-fvisibility=hidden -O2 -DNDEBUG ${base_c_warn_flags}"}
+: ${CFLAGS="-fvisibility=hidden ${base_c_warn_flags}"}
 
 # AM_PROG_AS would set CFLAGS="-g -O2" by default if not set already so it
 # should not be called earlier
@@ -95,30 +95,22 @@ AC_ARG_ENABLE([debug],
 
 AS_IF([test x"$enable_debug" != x"no"],
       [dbg=1
-       CFLAGS_save=
-       # Remove -DNDEBUG flag if set
-       for flag in $CFLAGS; do
-           if test "$flag" != "-DNDEBUG"; then
-               CFLAGS_save="$CFLAGS_save $flag"
-           fi
-       done
        # See if all the flags in $debug_c_other_flags work
        good_flags=
        for flag in $debug_c_other_flags; do
            AC_MSG_CHECKING([to see if compiler supports $flag])
-           CFLAGS="$flag $CFLAGS_save"
+           CFLAGS="$flag $CFLAGS"
            AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[]], [[int i = 3;]])],
 	                     [AC_MSG_RESULT([yes])
 			      good_flags="$flag $good_flags"],
 			     [AC_MSG_RESULT([no])])
        done
        debug_c_other_flags=$good_flags
-       CFLAGS=$CFLAGS_save
        unset good_flags
-       unset CFLAGS_save
 
        CFLAGS="-g -O0 ${base_c_warn_flags} ${debug_c_warn_flags} ${debug_c_other_flags} $CFLAGS"],
-      [dbg=0])
+      [dbg=0
+       CFLAGS="-O2 -DNDEBUG $CFLAGS"])
 
 AC_DEFINE_UNQUOTED([ENABLE_DEBUG],[$dbg],
                    [defined to 1 if libfabric was configured with --enable-debug, 0 otherwise])
@@ -246,6 +238,31 @@ AC_TRY_LINK([#include <stdint.h>],
     ],
     [AC_MSG_RESULT(no)])
 
+dnl Check for gcc memory model aware built-in atomics
+dnl If supported check to see if not internal to compiler
+AC_MSG_CHECKING(compiler support for built-in memory model aware atomics)
+AC_TRY_LINK([#include <stdint.h>],
+    [uint64_t d;
+     uint64_t s;
+     uint64_t c;
+     uint64_t r;
+      r = __atomic_fetch_add(&d, s, __ATOMIC_SEQ_CST);
+      __atomic_load(&d, &r, __ATOMIC_SEQ_CST);
+      __atomic_exchange(&d, &s, &r, __ATOMIC_SEQ_CST);
+      __atomic_compare_exchange(&d,&c,&s,0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+     #if defined(__PPC__) && !defined(__PPC64__)
+       #error compiler built-in memory model aware atomics are not supported on PowerPC 32-bit
+     #else
+       return 0;
+     #endif
+    ],
+    [
+        AC_MSG_RESULT(yes)
+        AC_SEARCH_LIBS([__atomic_load_8], [atomic])
+        AC_DEFINE(HAVE_BUILTIN_MM_ATOMICS, 1, [Set to 1 to use built-in intrinsics memory model aware atomics])
+    ],
+    [AC_MSG_RESULT(no)])
+
 dnl Check for gcc cpuid intrinsics
 AC_MSG_CHECKING(compiler support for cpuid)
 AC_TRY_LINK([
@@ -368,9 +385,12 @@ FI_PROVIDER_SETUP([gni])
 FI_PROVIDER_SETUP([udp])
 FI_PROVIDER_SETUP([tcp])
 FI_PROVIDER_SETUP([rxm])
+FI_PROVIDER_SETUP([mrail])
 FI_PROVIDER_SETUP([rxd])
 FI_PROVIDER_SETUP([bgq])
 FI_PROVIDER_SETUP([shm])
+FI_PROVIDER_SETUP([rstream])
+FI_PROVIDER_SETUP([perf])
 FI_PROVIDER_FINI
 dnl Configure the .pc file
 FI_PROVIDER_SETUP_PC

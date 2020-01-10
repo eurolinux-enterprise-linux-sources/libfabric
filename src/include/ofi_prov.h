@@ -206,4 +206,38 @@ SHM_INI ;
 #  define SHM_INIT NULL
 #endif
 
+#if (HAVE_MRAIL) && (HAVE_MRAIL_DL)
+#  define MRAIL_INI FI_EXT_INI
+#  define MRAIL_INIT NULL
+#elif (HAVE_MRAIL)
+#  define MRAIL_INI INI_SIG(fi_mrail_ini)
+#  define MRAIL_INIT fi_mrail_ini()
+MRAIL_INI ;
+#else
+#  define MRAIL_INIT NULL
+#endif
+
+#if (HAVE_RSTREAM) && (HAVE_RSTREAM_DL)
+#  define RSTREAM_INI FI_EXT_INI
+#  define RSTREAM_INIT NULL
+#elif (HAVE_RSTREAM)
+#  define RSTREAM_INI INI_SIG(fi_rstream_ini)
+#  define RSTREAM_INIT fi_rstream_ini()
+RSTREAM_INI ;
+#else
+#  define RSTREAM_INIT NULL
+#endif
+
+#if(HAVE_PERF)
+#  define PERF_HOOK_INI INI_SIG(fi_perf_hook_ini)
+#  define PERF_HOOK_INIT fi_perf_hook_ini()
+PERF_HOOK_INI ;
+#else
+#  define PERF_HOOK_INIT NULL
+#endif
+
+#  define NOOP_HOOK_INI INI_SIG(fi_noop_hook_ini)
+#  define NOOP_HOOK_INIT fi_noop_hook_ini()
+NOOP_HOOK_INI ;
+
 #endif /* _OFI_PROV_H_ */

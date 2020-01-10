@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
+ * Copyright (c) 2015-2018 Cray Inc. All rights reserved.
  * Copyright (c) 2015-2018 Los Alamos National Security, LLC.
  *                         All rights reserved.
  *
@@ -44,6 +44,7 @@
 #include "gnix_vc.h"
 #include "gnix_mbox_allocator.h"
 #include "gnix_util.h"
+#include "fi_ext_gni.h"
 
 /*
  * TODO: make this a domain parameter
@@ -163,13 +164,12 @@ try_again:
 		retry = 1;
 		break;
 	case GNI_RC_TIMEOUT:
-		retry = 1;
-		break;
 	case GNI_RC_NOT_DONE:
+        /* Invalid state indicates call interrupted by signal using various tools */
+	case GNI_RC_INVALID_STATE:
 		retry = 1;
 		break;
 	case GNI_RC_INVALID_PARAM:
-	case GNI_RC_INVALID_STATE:
 	case GNI_RC_ERROR_RESOURCE:
 	case GNI_RC_ERROR_NOMEM:
 		retry = 0;
@@ -205,6 +205,7 @@ static int __nic_setup_irq_cq(struct gnix_nic *nic)
 	int vmdh_index = -1;
 	int flags = GNI_MEM_READWRITE;
 	struct gnix_auth_key *info;
+	struct fi_gni_auth_key key;
 
 	len = (size_t)sysconf(_SC_PAGESIZE);
 
@@ -220,9 +221,15 @@ static int __nic_setup_irq_cq(struct gnix_nic *nic)
 	nic->irq_mmap_addr = mmap_addr;
 	nic->irq_mmap_len = len;
 
+	/* On some systems, the page may not be zero'd from first use.
+		 Memset it here */
+	memset(mmap_addr, 0x0, len);
+
 	if (nic->using_vmdh) {
-		info = _gnix_auth_key_lookup(GNIX_PROV_DEFAULT_AUTH_KEY,
-				GNIX_PROV_DEFAULT_AUTH_KEYLEN);
+		key.type = GNIX_AKT_RAW;
+		key.raw.protection_key = nic->cookie;
+
+		info = _gnix_auth_key_lookup((uint8_t *) &key, sizeof(key));
 		assert(info);
 
 		if (!nic->mdd_resources_set) {

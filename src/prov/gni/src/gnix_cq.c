@@ -351,6 +351,9 @@ ssize_t _gnix_cq_add_error(struct gnix_fid_cq *cq, void *op_context,
 
 	_gnix_queue_enqueue(cq->errors, &event->item);
 
+	if (cq->wait)
+		_gnix_signal_wait_obj(cq->wait);
+
 err:
 	COND_RELEASE(cq->requires_lock, &cq->lock);
 
@@ -455,7 +458,7 @@ static ssize_t __gnix_cq_readfrom(struct fid_cq *cq, void *buf,
 		assert(event->the_entry);
 		memcpy(buf, event->the_entry, cq_priv->entry_size);
 		if (src_addr)
-			memcpy(src_addr, &event->src_addr, sizeof(fi_addr_t));
+			memcpy(&src_addr[read_count], &event->src_addr, sizeof(fi_addr_t));
 
 		_gnix_queue_enqueue_free(cq_priv->events, &event->item);
 

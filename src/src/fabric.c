@@ -43,7 +43,9 @@
 #include <rdma/fi_errno.h>
 #include "ofi_util.h"
 #include "ofi.h"
+#include "shared/ofi_str.h"
 #include "ofi_prov.h"
+#include "ofi_perf.h"
 
 #ifdef HAVE_LIBDL
 #include <dlfcn.h>
@@ -73,11 +75,26 @@ static int ofi_find_name(char **names, const char *name)
 	return -1;
 }
 
-static int ofi_is_util_prov(const struct fi_provider *provider)
+static enum ofi_prov_type ofi_prov_type(const struct fi_provider *provider)
 {
 	const struct fi_prov_context *ctx;
 	ctx = (const struct fi_prov_context *) &provider->context;
-	return ctx->is_util_prov;
+	return ctx->type;
+}
+
+static int ofi_is_util_prov(const struct fi_provider *provider)
+{
+	return ofi_prov_type(provider) == OFI_PROV_UTIL;
+}
+
+static int ofi_is_core_prov(const struct fi_provider *provider)
+{
+	return ofi_prov_type(provider) == OFI_PROV_CORE;
+}
+
+static int ofi_is_hook_prov(const struct fi_provider *provider)
+{
+	return ofi_prov_type(provider) == OFI_PROV_HOOK;
 }
 
 int ofi_apply_filter(struct fi_filter *filter, const char *name)
@@ -91,14 +108,15 @@ int ofi_apply_filter(struct fi_filter *filter, const char *name)
 	return 0;
 }
 
-/*
- * Utility providers may be disabled, but do not need to be explicitly
- * enabled.  This allows them to always be available when only a core
- * provider is enabled.
- */
 static int ofi_getinfo_filter(const struct fi_provider *provider)
 {
-	if (!prov_filter.negated && ofi_is_util_prov(provider))
+	/* Positive filters only apply to core providers.  They must be
+	 * explicitly enabled by the filter.  Other providers (i.e. utility)
+	 * are automatically enabled in this case, so that they can work
+	 * over any enabled core filter.  Negative filters may be used
+	 * to disable any provider.
+	 */
+	if (!prov_filter.negated && !ofi_is_core_prov(provider))
 		return 0;
 
 	return ofi_apply_filter(&prov_filter, provider->name);
@@ -115,6 +133,38 @@ static struct ofi_prov *ofi_getprov(const char *prov_name, size_t len)
 	}
 
 	return NULL;
+}
+
+struct fi_provider *ofi_get_hook(const char *name)
+{
+	struct ofi_prov *prov;
+	struct fi_provider *provider = NULL;
+	char *try_name = NULL;
+	int ret;
+
+	prov = ofi_getprov(name, strlen(name));
+	if (!prov) {
+		ret = asprintf(&try_name, "ofi_%s_hook", name);
+		if (ret > 0)
+			prov = ofi_getprov(try_name, ret);
+		else
+			try_name = NULL;
+	}
+
+	if (prov) {
+		if (prov->provider && ofi_is_hook_prov(prov->provider)) {
+			provider = prov->provider;
+		} else {
+			FI_WARN(&core_prov, FI_LOG_CORE,
+				"Specified provider is not a hook: %s\n", name);
+		}
+	} else {
+		FI_WARN(&core_prov, FI_LOG_CORE,
+			"No hook found for: %s\n", name);
+	}
+
+	free(try_name);
+	return provider;
 }
 
 static void cleanup_provider(struct fi_provider *provider, void *dlhandle)
@@ -166,26 +216,44 @@ static struct ofi_prov *ofi_create_prov_entry(const char *prov_name)
  */
 static void ofi_ordered_provs_init(void)
 {
-	char *ordered_prov_names[] =
-			{"psm2", "psm", "usnic", "mlx", "gni",
-			 "bgq", "netdir", "ofi_rxm", "ofi_rxd", "verbs",
-			/* Initialize the socket(s) provider last.  This will result in
-			 * it being the least preferred provider. */
+	char *ordered_prov_names[] = {
+		"psm2", "psm", "usnic", "mlx", "gni",
+		"bgq", "netdir", "ofi_rxm", "ofi_rxd", "verbs",
+		/* Initialize the socket based providers last of the
+		 * standard providers.  This will result in them being
+		 * the least preferred providers.
+		 */
 
-			/* Before you add ANYTHING here, read the comment above!!! */
-			"UDP", "sockets", "tcp" /* NOTHING GOES HERE! */};
-			/* Seriously, read it! */
+		/* Before you add ANYTHING here, read the comment above!!! */
+		"UDP", "sockets", "tcp", /* NOTHING GOES HERE! */
+		/* Seriously, read it! */
+
+		/* These are hooking providers only.  Their order
+		 * doesn't matter
+		 */
+		"ofi_perf_hook", "ofi_noop_hook",
+	};
 	int num_provs = sizeof(ordered_prov_names)/sizeof(ordered_prov_names[0]), i;
 
 	for (i = 0; i < num_provs; i++)
 		ofi_create_prov_entry(ordered_prov_names[i]);
 }
 
+static void ofi_set_prov_type(struct fi_prov_context *ctx,
+			      struct fi_provider *provider)
+{
+	if (!provider->getinfo)
+		ctx->type = OFI_PROV_HOOK;
+	else if (ofi_has_util_prefix(provider->name))
+		ctx->type = OFI_PROV_UTIL;
+	else
+		ctx->type = OFI_PROV_CORE;
+}
+
 static int ofi_register_provider(struct fi_provider *provider, void *dlhandle)
 {
 	struct fi_prov_context *ctx;
 	struct ofi_prov *prov = NULL;
-	size_t len;
 	int ret;
 
 	if (!provider || !provider->name) {
@@ -199,7 +267,7 @@ static int ofi_register_provider(struct fi_provider *provider, void *dlhandle)
 	       "registering provider: %s (%d.%d)\n", provider->name,
 	       FI_MAJOR(provider->version), FI_MINOR(provider->version));
 
-	if (!provider->getinfo || !provider->fabric) {
+	if (!provider->fabric) {
 		FI_WARN(&core_prov, FI_LOG_CORE,
 			"provider missing mandatory entry points\n");
 		ret = -FI_EINVAL;
@@ -223,7 +291,7 @@ static int ofi_register_provider(struct fi_provider *provider, void *dlhandle)
 	}
 
 	ctx = (struct fi_prov_context *) &provider->context;
-	ctx->is_util_prov = (ofi_util_name(provider->name, &len) != NULL);
+	ofi_set_prov_type(ctx, provider);
 
 	if (ofi_getinfo_filter(provider)) {
 		FI_INFO(&core_prov, FI_LOG_CORE,
@@ -295,75 +363,9 @@ static int lib_filter(const struct dirent *entry)
 }
 #endif
 
-/* split the given string "s" using the specified delimiter(s) in the string
- * "delim" and return an array of strings.  The array is terminated with a NULL
- * pointer.  You can clean this array up with a call to free_string_array().
- *
- * Returns NULL on failure.
- */
-static char **split_and_alloc(const char *s, const char *delim)
-{
-	int i, n;
-	char *tmp;
-	char *dup = NULL;
-	char **arr = NULL;
-
-	if (!s || !delim)
-		return NULL;
-
-	dup = strdup(s);
-	if (!dup) {
-		FI_WARN(&core_prov, FI_LOG_CORE, "failed to allocate memory\n");
-		return NULL;
-	}
-
-	/* compute the array size */
-	n = 1;
-	for (tmp = dup; *tmp != '\0'; ++tmp) {
-		for (i = 0; delim[i] != '\0'; ++i) {
-			if (*tmp == delim[i]) {
-				++n;
-				break;
-			}
-		}
-	}
-
-	/* +1 to leave space for NULL terminating pointer */
-	arr = calloc(n + 1, sizeof(*arr));
-	if (!arr) {
-		FI_WARN(&core_prov, FI_LOG_CORE, "failed to allocate memory\n");
-		goto cleanup;
-	}
-
-	/* set array elts to point inside the dup'ed string */
-	for (tmp = dup, i = 0; tmp != NULL; ++i) {
-		arr[i] = strsep(&tmp, delim);
-	}
-	assert(i == n);
-
-	return arr;
-
-cleanup:
-	free(dup);
-	free(arr);
-	return NULL;
-}
-
-/* see split_and_alloc() */
-static void free_string_array(char **s)
-{
-	/* all strings are allocated from the same strdup'ed slab, so just free
-	 * the first element */
-	if (s != NULL)
-		free(s[0]);
-
-	/* and then the actual array of pointers */
-	free(s);
-}
-
 void ofi_free_filter(struct fi_filter *filter)
 {
-	free_string_array(filter->names);
+	ofi_free_string_array(filter->names);
 }
 
 void ofi_create_filter(struct fi_filter *filter, const char *raw_filter)
@@ -377,7 +379,7 @@ void ofi_create_filter(struct fi_filter *filter, const char *raw_filter)
 		++raw_filter;
 	}
 
-	filter->names = split_and_alloc(raw_filter, ",");
+	filter->names= ofi_split_and_alloc(raw_filter, ",", NULL);
 	if (!filter->names)
 		FI_WARN(&core_prov, FI_LOG_CORE,
 			"unable to parse filter from: %s\n", raw_filter);
@@ -444,6 +446,8 @@ void fi_ini(void)
 	fi_log_init();
 	ofi_osd_init();
 	ofi_pmem_init();
+	ofi_perf_init();
+	ofi_hook_init();
 
 	fi_param_define(NULL, "provider", FI_PARAM_STRING,
 			"Only use specified provider (default: all available)");
@@ -481,12 +485,12 @@ void fi_ini(void)
 	if (!provdir)
 		provdir = PROVDLDIR;
 
-	dirs = split_and_alloc(provdir, ":");
+	dirs = ofi_split_and_alloc(provdir, ":", NULL);
 	if (dirs) {
 		for (n = 0; dirs[n]; ++n) {
 			ofi_ini_dir(dirs[n]);
 		}
-		free_string_array(dirs);
+		ofi_free_string_array(dirs);
 	}
 libdl_done:
 #endif
@@ -501,19 +505,16 @@ libdl_done:
 	ofi_register_provider(SHM_INIT, NULL);
 	ofi_register_provider(RXM_INIT, NULL);
 	ofi_register_provider(VERBS_INIT, NULL);
-
-	{
-		/* TODO: RXD is not stable for now. Disable it by default */
-		int enable_rxd = 0;
-		fi_param_define(NULL, "rxd_enable", FI_PARAM_BOOL,
-				"Enable RXD provider (default: no)");
-		fi_param_get_bool(NULL, "rxd_enable", &enable_rxd);
-		if (enable_rxd)
-			ofi_register_provider(RXD_INIT, NULL);
-	}
+	/* ofi_register_provider(RSTREAM_INIT, NULL); - no support */
+	ofi_register_provider(MRAIL_INIT, NULL);
+	ofi_register_provider(RXD_INIT, NULL);
 
 	ofi_register_provider(UDP_INIT, NULL);
 	ofi_register_provider(SOCKETS_INIT, NULL);
+	ofi_register_provider(TCP_INIT, NULL);
+
+	ofi_register_provider(PERF_HOOK_INIT, NULL);
+	ofi_register_provider(NOOP_HOOK_INIT, NULL);
 
 	ofi_init = 1;
 
@@ -542,6 +543,155 @@ FI_DESTRUCTOR(fi_fini(void))
 	ofi_osd_fini();
 }
 
+/* The provider must free any prov_attr data prior to calling this
+ * routine.
+ */
+int ofi_nic_close(struct fid *fid)
+{
+	struct fid_nic *nic = (struct fid_nic *) fid;
+
+	assert(fid && fid->fclass == FI_CLASS_NIC);
+
+	if (nic->device_attr) {
+		free(nic->device_attr->name);
+		free(nic->device_attr->device_id);
+		free(nic->device_attr->device_version);
+		free(nic->device_attr->vendor_id);
+		free(nic->device_attr->driver);
+		free(nic->device_attr->firmware);
+		free(nic->device_attr);
+	}
+
+	free(nic->bus_attr);
+
+	if (nic->link_attr) {
+		free(nic->link_attr->address);
+		free(nic->link_attr->network_type);
+		free(nic->link_attr);
+	}
+
+	free(nic);
+	return 0;
+}
+
+int ofi_nic_control(struct fid *fid, int command, void *arg)
+{
+	struct fid_nic *nic = container_of(fid, struct fid_nic, fid);
+	struct fid_nic **dup = (struct fid_nic **) arg;
+
+	switch(command) {
+	case FI_DUP:
+		*dup = ofi_nic_dup(nic);
+		return *dup ? FI_SUCCESS : -FI_ENOMEM;
+	default:
+		return -FI_ENOSYS;
+	}
+}
+
+struct fi_ops default_nic_ops = {
+	.size = sizeof(struct fi_ops),
+	.close = ofi_nic_close,
+	.control = ofi_nic_control,
+	.tostr = ofi_nic_tostr,
+};
+
+static int ofi_dup_dev_attr(const struct fi_device_attr *attr,
+			    struct fi_device_attr **dup_attr)
+{
+	*dup_attr = calloc(1, sizeof(**dup_attr));
+	if (!*dup_attr)
+		return -FI_ENOMEM;
+
+	if (ofi_str_dup(attr->name, &(*dup_attr)->name) ||
+	    ofi_str_dup(attr->device_id, &(*dup_attr)->device_id) ||
+	    ofi_str_dup(attr->device_version, &(*dup_attr)->device_version) ||
+	    ofi_str_dup(attr->vendor_id, &(*dup_attr)->vendor_id) ||
+	    ofi_str_dup(attr->driver, &(*dup_attr)->driver) ||
+	    ofi_str_dup(attr->firmware, &(*dup_attr)->firmware))
+		return -FI_ENOMEM;
+
+	return 0;
+}
+
+static int ofi_dup_bus_attr(const struct fi_bus_attr *attr,
+			    struct fi_bus_attr **dup_attr)
+{
+	*dup_attr = calloc(1, sizeof(**dup_attr));
+	if (!*dup_attr)
+		return -FI_ENOMEM;
+
+	**dup_attr = *attr;
+	return 0;
+}
+
+static int ofi_dup_link_attr(const struct fi_link_attr *attr,
+			     struct fi_link_attr **dup_attr)
+{
+	*dup_attr = calloc(1, sizeof(**dup_attr));
+	if (!*dup_attr)
+		return -FI_ENOMEM;
+
+	if (ofi_str_dup(attr->address, &(*dup_attr)->address) ||
+	    ofi_str_dup(attr->network_type, &(*dup_attr)->network_type))
+		return -FI_ENOMEM;
+
+	(*dup_attr)->mtu = attr->mtu;
+	(*dup_attr)->speed = attr->speed;
+	(*dup_attr)->state = attr->state;
+	return 0;
+}
+
+struct fid_nic *ofi_nic_dup(const struct fid_nic *nic)
+{
+	struct fid_nic *dup_nic;
+	int ret;
+
+	dup_nic = calloc(1, sizeof(*dup_nic));
+	if (!dup_nic)
+		return NULL;
+
+	if (!nic) {
+		dup_nic->fid.fclass = FI_CLASS_NIC;
+		dup_nic->device_attr = calloc(1, sizeof(*dup_nic->device_attr));
+		dup_nic->bus_attr = calloc(1, sizeof(*dup_nic->bus_attr));
+		dup_nic->link_attr = calloc(1, sizeof(*dup_nic->link_attr));
+
+		if (!dup_nic->device_attr || !dup_nic->bus_attr ||
+		    !dup_nic->link_attr)
+			goto fail;
+
+		dup_nic->fid.ops = &default_nic_ops;
+		return dup_nic;
+	}
+
+	assert(nic->fid.fclass == FI_CLASS_NIC);
+	dup_nic->fid = nic->fid;
+
+	if (nic->device_attr) {
+		ret = ofi_dup_dev_attr(nic->device_attr, &dup_nic->device_attr);
+		if (ret)
+			goto fail;
+	}
+
+	if (nic->bus_attr) {
+		ret = ofi_dup_bus_attr(nic->bus_attr, &dup_nic->bus_attr);
+		if (ret)
+			goto fail;
+	}
+
+	if (nic->link_attr) {
+		ret = ofi_dup_link_attr(nic->link_attr, &dup_nic->link_attr);
+		if (ret)
+			goto fail;
+	}
+
+	return dup_nic;
+
+fail:
+	ofi_nic_close(&dup_nic->fid);
+	return NULL;
+}
+
 __attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
 void DEFAULT_SYMVER_PRE(fi_freeinfo)(struct fi_info *info)
 {
@@ -567,6 +717,10 @@ void DEFAULT_SYMVER_PRE(fi_freeinfo)(struct fi_info *info)
 			free(info->fabric_attr->name);
 			free(info->fabric_attr->prov_name);
 			free(info->fabric_attr);
+		}
+		if (info->nic &&
+		    FI_CHECK_OP(info->nic->fid.ops, struct fi_ops, close)) {
+			fi_close(&info->nic->fid);
 		}
 		free(info);
 	}
@@ -630,7 +784,7 @@ static void ofi_set_prov_attr(struct fi_fabric_attr *attr,
 		attr->prov_name = ofi_strdup_append(core_name, prov->name);
 		free(core_name);
 	} else {
-		assert(!ofi_is_util_prov(prov));
+		assert(ofi_is_core_prov(prov));
 		attr->prov_name = strdup(prov->name);
 	}
 	attr->prov_version = prov->version;
@@ -638,59 +792,81 @@ static void ofi_set_prov_attr(struct fi_fabric_attr *attr,
 
 /*
  * The layering of utility providers over core providers follows these rules.
- * 1. If both are specified, then only return that layering
- * 2. If a utility provider is specified, return it over any* core provider.
- * 3. If a core provider is specified, return any utility provider that can
- *    layer over it, plus the core provider itself, if possible.
- * 4* A utility provider will not layer over the sockets provider unless the
- *    user explicitly requests that combination.
- *
- * Utility providers use an internal flag, OFI_CORE_PROV_ONLY, to indicate
- * that only core providers should respond to an fi_getinfo query.  This
- * prevents utility providers from layering over other utility providers.
+ * 0. Provider names are delimited by ";"
+ * 1. Rules when # of providers <= 2:
+ *    1a. If both are specified, then only return that layering
+ *    1b. If a utility provider is specified, return it over any* core provider.
+ *    1c. If a core provider is specified, return any utility provider that can
+ *        layer over it, plus the core provider itself, if possible.
+ *    1d. A utility provider will not layer over the sockets provider unless the
+ *        user explicitly requests that combination.
+ *    1e. OFI_CORE_PROV_ONLY flag prevents utility providers layering over other
+ *        utility providers.
+ * 2. If both the providers are utility providers or if more than two providers
+ *    are specified, the rightmost provider would be compared.
+ * 3. If any provider has a caret symbol "^" is prefixed before any provider
+ *    name it would be excluded (internal use only). These excluded providers
+ *    should be listed only at the end.
  */
 static int ofi_layering_ok(const struct fi_provider *provider,
-			   const char *util_name, size_t util_len,
-			   const char *core_name, size_t core_len,
+			   char **prov_vec, size_t count,
 			   uint64_t flags)
 {
+	char *prov_name;
+	int i;
+
+	/* Excluded providers must be at the end */
+	for (i = count - 1; i >= 0; i--) {
+		if (prov_vec[i][0] != '^')
+		    break;
+
+		if (!strcasecmp(&prov_vec[i][1], provider->name))
+			return 0;
+	}
+	count = i + 1;
+
 	if (flags & OFI_CORE_PROV_ONLY) {
-		if (ofi_is_util_prov(provider)) {
+		assert((count == 1) || (count == 0));
+		if (!ofi_is_core_prov(provider)) {
 			FI_INFO(&core_prov, FI_LOG_CORE,
-				"Need core provider, skipping util %s\n",
+				"Need core provider, skipping %s\n",
 				provider->name);
 			return 0;
 		}
 
-		if ((!core_len || !core_name) &&
-		    !strcasecmp(provider->name, "sockets")) {
+		if ((count == 0) && !strcasecmp(provider->name, "sockets")) {
 			FI_INFO(&core_prov, FI_LOG_CORE,
 				"Skipping util;sockets layering\n");
 			return 0;
 		}
 	}
 
-	if (util_len && util_name) {
-		assert(!(flags & OFI_CORE_PROV_ONLY));
-		if ((strlen(provider->name) != util_len) ||
-		    strncasecmp(util_name, provider->name, util_len))
-			return 0;
+	if (!count)
+		return 1;
 
-	} else if (core_len && core_name) {
-		if (!strncasecmp(core_name, "sockets", core_len) &&
-		    ofi_is_util_prov(provider)) {
+	/* To maintain backward compatibility with the previous behavior of
+	 * ofi_layering_ok we need to check if the # of providers is two or
+	 * fewer. In such a case, we have to be agnostic to the ordering of
+	 * core and utility providers */
+
+	if ((count == 1) && ofi_is_util_prov(provider) &&
+	    !ofi_has_util_prefix(prov_vec[0])) {
+		if (!strcasecmp(prov_vec[0], "sockets")) {
 			FI_INFO(&core_prov, FI_LOG_CORE,
 				"Sockets requested, skipping util layering\n");
 			return 0;
+		} else {
+			return 1;
 		}
-
-		if (!ofi_is_util_prov(provider) &&
-		    ((strlen(provider->name) != core_len) ||
-		     strncasecmp(core_name, provider->name, core_len)))
-			return 0;
 	}
 
-	return 1;
+	if ((count == 2) && ofi_has_util_prefix(prov_vec[0]) &&
+	    !ofi_has_util_prefix(prov_vec[1]))
+		prov_name = prov_vec[0];
+	else
+		prov_name = prov_vec[count - 1];
+
+	return !strcasecmp(provider->name, prov_name);
 }
 
 __attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
@@ -700,8 +876,8 @@ int DEFAULT_SYMVER_PRE(fi_getinfo)(uint32_t version, const char *node,
 {
 	struct ofi_prov *prov;
 	struct fi_info *tail, *cur;
-	const char *util_name = NULL, *core_name = NULL;
-	size_t util_len = 0, core_len = 0;
+	char **prov_vec = NULL;
+	size_t count = 0;
 	int ret;
 
 	if (!ofi_init)
@@ -718,19 +894,20 @@ int DEFAULT_SYMVER_PRE(fi_getinfo)(uint32_t version, const char *node,
 	}
 
 	if (hints && hints->fabric_attr && hints->fabric_attr->prov_name) {
-		util_name = ofi_util_name(hints->fabric_attr->prov_name,
-					  &util_len);
-		core_name = ofi_core_name(hints->fabric_attr->prov_name,
-					  &core_len);
+		prov_vec = ofi_split_and_alloc(hints->fabric_attr->prov_name,
+					       ";", &count);
+		if (!prov_vec)
+			return -FI_ENOMEM;
+		FI_DBG(&core_prov, FI_LOG_CORE, "hints prov_name: %s\n",
+		       hints->fabric_attr->prov_name);
 	}
 
 	*info = tail = NULL;
 	for (prov = prov_head; prov; prov = prov->next) {
-		if (!prov->provider)
+		if (!prov->provider || !prov->provider->getinfo)
 			continue;
 
-		if (!ofi_layering_ok(prov->provider, util_name, util_len,
-				     core_name, core_len, flags))
+		if (!ofi_layering_ok(prov->provider, prov_vec, count, flags))
 			continue;
 
 		if (FI_VERSION_LT(prov->provider->fi_version, version)) {
@@ -771,6 +948,7 @@ int DEFAULT_SYMVER_PRE(fi_getinfo)(uint32_t version, const char *node,
 		ofi_set_prov_attr(tail->fabric_attr, prov->provider);
 		tail->fabric_attr->api_version = version;
 	}
+	ofi_free_string_array(prov_vec);
 
 	return *info ? 0 : -FI_ENODATA;
 }
@@ -804,6 +982,7 @@ __attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
 struct fi_info *DEFAULT_SYMVER_PRE(fi_dupinfo)(const struct fi_info *info)
 {
 	struct fi_info *dup;
+	int ret;
 
 	if (!info)
 		return ofi_allocinfo_internal();
@@ -891,6 +1070,13 @@ struct fi_info *DEFAULT_SYMVER_PRE(fi_dupinfo)(const struct fi_info *info)
 				goto fail;
 		}
 	}
+
+	if (info->nic) {
+		ret = fi_control(&info->nic->fid, FI_DUP, &dup->nic);
+		if (ret && ret != -FI_ENOSYS)
+			goto fail;
+	}
+
 	return dup;
 
 fail:
@@ -905,7 +1091,6 @@ int DEFAULT_SYMVER_PRE(fi_fabric)(struct fi_fabric_attr *attr,
 {
 	struct ofi_prov *prov;
 	const char *top_name;
-	size_t len;
 	int ret;
 
 	if (!attr || !attr->prov_name || !attr->name)
@@ -914,23 +1099,32 @@ int DEFAULT_SYMVER_PRE(fi_fabric)(struct fi_fabric_attr *attr,
 	if (!ofi_init)
 		fi_ini();
 
-	top_name = ofi_util_name(attr->prov_name, &len);
-	if (!top_name)
-		top_name = ofi_core_name(attr->prov_name, &len);
+	top_name = strrchr(attr->prov_name, OFI_NAME_DELIM);
+	if (top_name)
+		top_name++;
+	else
+		top_name = attr->prov_name;
 
 	if (!top_name)
 		return -FI_EINVAL;
 
-	prov = ofi_getprov(top_name, len);
+	prov = ofi_getprov(top_name, strlen(top_name));
 	if (!prov || !prov->provider || !prov->provider->fabric)
 		return -FI_ENODEV;
 
 	ret = prov->provider->fabric(attr, fabric, context);
-	if (!ret && FI_VERSION_GE(prov->provider->fi_version, FI_VERSION(1, 5)))
-		(*fabric)->api_version = attr->api_version;
+	if (!ret) {
+		if (FI_VERSION_GE(prov->provider->fi_version, FI_VERSION(1, 5)))
+			(*fabric)->api_version = attr->api_version;
+		FI_INFO(&core_prov, FI_LOG_CORE, "Opened fabric: %s\n",
+			attr->name);
+
+		ofi_hook_install(*fabric, fabric, prov->provider);
+	}
+
 	return ret;
 }
-CURRENT_SYMVER(fi_fabric_, fi_fabric);
+DEFAULT_SYMVER(fi_fabric_, fi_fabric, FABRIC_1.1);
 
 __attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
 uint32_t DEFAULT_SYMVER_PRE(fi_version)(void)

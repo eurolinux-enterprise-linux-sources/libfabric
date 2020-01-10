@@ -42,7 +42,7 @@ void psmx2_cntr_check_trigger(struct psmx2_fid_cntr *cntr)
 	if (!cntr->trigger)
 		return;
 
-	psmx2_lock(&cntr->trigger_lock, 2);
+	cntr->domain->trigger_lock_fn(&cntr->trigger_lock, 2);
 
 	trigger = cntr->trigger;
 	while (trigger) {
@@ -65,10 +65,10 @@ void psmx2_cntr_check_trigger(struct psmx2_fid_cntr *cntr)
 		}
 
 		if (trx_ctxt->am_initialized) {
-			psmx2_lock(&trx_ctxt->trigger_queue.lock, 2);
+			cntr->domain->trigger_queue_lock_fn(&trx_ctxt->trigger_queue.lock, 2);
 			slist_insert_tail(&trigger->list_entry,
 					  &trx_ctxt->trigger_queue.list);
-			psmx2_unlock(&trx_ctxt->trigger_queue.lock, 2);
+			cntr->domain->trigger_queue_unlock_fn(&trx_ctxt->trigger_queue.lock, 2);
 		} else {
 			psmx2_process_trigger(trx_ctxt, trigger);
 		}
@@ -76,7 +76,7 @@ void psmx2_cntr_check_trigger(struct psmx2_fid_cntr *cntr)
 		trigger = cntr->trigger;
 	}
 
-	psmx2_unlock(&cntr->trigger_lock, 2);
+	cntr->domain->trigger_unlock_fn(&cntr->trigger_lock, 2);
 }
 
 void psmx2_cntr_add_trigger(struct psmx2_fid_cntr *cntr,
@@ -84,7 +84,7 @@ void psmx2_cntr_add_trigger(struct psmx2_fid_cntr *cntr,
 {
 	struct psmx2_trigger *p, *q;
 
-	psmx2_lock(&cntr->trigger_lock, 2);
+	cntr->domain->trigger_lock_fn(&cntr->trigger_lock, 2);
 
 	q = NULL;
 	p = cntr->trigger;
@@ -98,49 +98,48 @@ void psmx2_cntr_add_trigger(struct psmx2_fid_cntr *cntr,
 		cntr->trigger = trigger;
 	trigger->next = p;
 
-	psmx2_unlock(&cntr->trigger_lock, 2);
+	cntr->domain->trigger_unlock_fn(&cntr->trigger_lock, 2);
 
 	psmx2_cntr_check_trigger(cntr);
 }
 
-#define PSMX2_CNTR_POLL_THRESHOLD 100
-static uint64_t psmx2_cntr_read(struct fid_cntr *cntr)
+DIRECT_FN
+STATIC uint64_t psmx2_cntr_read(struct fid_cntr *cntr)
 {
 	struct psmx2_fid_cntr *cntr_priv;
 	struct psmx2_poll_ctxt *poll_ctxt;
 	struct slist_entry *item, *prev;
-	static int poll_cnt = 0;
 
 	cntr_priv = container_of(cntr, struct psmx2_fid_cntr, cntr);
 
-	if (poll_cnt++ >= PSMX2_CNTR_POLL_THRESHOLD) {
-		if (cntr_priv->poll_all) {
-			psmx2_progress_all(cntr_priv->domain);
-		} else {
-			slist_foreach(&cntr_priv->poll_list, item, prev) {
-				poll_ctxt = container_of(item,
-							 struct psmx2_poll_ctxt,
-							 list_entry);
-				psmx2_progress(poll_ctxt->trx_ctxt);
-				(void) prev; /* suppress compiler warning */
-			}
+	if (cntr_priv->poll_all) {
+		psmx2_progress_all(cntr_priv->domain);
+	} else {
+		slist_foreach(&cntr_priv->poll_list, item, prev) {
+			poll_ctxt = container_of(item,
+						 struct psmx2_poll_ctxt,
+						 list_entry);
+			psmx2_progress(poll_ctxt->trx_ctxt);
+			(void) prev; /* suppress compiler warning */
 		}
-		poll_cnt = 0;
 	}
 
 	return ofi_atomic_get64(&cntr_priv->counter);
 }
 
-static uint64_t psmx2_cntr_readerr(struct fid_cntr *cntr)
+DIRECT_FN
+STATIC uint64_t psmx2_cntr_readerr(struct fid_cntr *cntr)
 {
 	struct psmx2_fid_cntr *cntr_priv;
 
 	cntr_priv = container_of(cntr, struct psmx2_fid_cntr, cntr);
+	cntr_priv->error_avail = 0;
 
 	return ofi_atomic_get64(&cntr_priv->error_counter);
 }
 
-static int psmx2_cntr_add(struct fid_cntr *cntr, uint64_t value)
+DIRECT_FN
+STATIC int psmx2_cntr_add(struct fid_cntr *cntr, uint64_t value)
 {
 	struct psmx2_fid_cntr *cntr_priv;
 
@@ -155,7 +154,8 @@ static int psmx2_cntr_add(struct fid_cntr *cntr, uint64_t value)
 	return 0;
 }
 
-static int psmx2_cntr_set(struct fid_cntr *cntr, uint64_t value)
+DIRECT_FN
+STATIC int psmx2_cntr_set(struct fid_cntr *cntr, uint64_t value)
 {
 	struct psmx2_fid_cntr *cntr_priv;
 
@@ -170,12 +170,14 @@ static int psmx2_cntr_set(struct fid_cntr *cntr, uint64_t value)
 	return 0;
 }
 
-static int psmx2_cntr_adderr(struct fid_cntr *cntr, uint64_t value)
+DIRECT_FN
+STATIC int psmx2_cntr_adderr(struct fid_cntr *cntr, uint64_t value)
 {
 	struct psmx2_fid_cntr *cntr_priv;
 
 	cntr_priv = container_of(cntr, struct psmx2_fid_cntr, cntr);
 	ofi_atomic_add64(&cntr_priv->error_counter, value);
+	cntr_priv->error_avail = 1;
 
 	psmx2_cntr_check_trigger(cntr_priv);
 
@@ -185,12 +187,14 @@ static int psmx2_cntr_adderr(struct fid_cntr *cntr, uint64_t value)
 	return 0;
 }
 
-static int psmx2_cntr_seterr(struct fid_cntr *cntr, uint64_t value)
+DIRECT_FN
+STATIC int psmx2_cntr_seterr(struct fid_cntr *cntr, uint64_t value)
 {
 	struct psmx2_fid_cntr *cntr_priv;
 
 	cntr_priv = container_of(cntr, struct psmx2_fid_cntr, cntr);
 	ofi_atomic_set64(&cntr_priv->error_counter, value);
+	cntr_priv->error_avail = 1;
 
 	psmx2_cntr_check_trigger(cntr_priv);
 
@@ -200,7 +204,8 @@ static int psmx2_cntr_seterr(struct fid_cntr *cntr, uint64_t value)
 	return 0;
 }
 
-static int psmx2_cntr_wait(struct fid_cntr *cntr, uint64_t threshold, int timeout)
+DIRECT_FN
+STATIC int psmx2_cntr_wait(struct fid_cntr *cntr, uint64_t threshold, int timeout)
 {
 	struct psmx2_fid_cntr *cntr_priv;
 	struct psmx2_poll_ctxt *poll_ctxt;
@@ -214,6 +219,11 @@ static int psmx2_cntr_wait(struct fid_cntr *cntr, uint64_t threshold, int timeou
 	clock_gettime(CLOCK_REALTIME, &ts0);
 
 	while (ofi_atomic_get64(&cntr_priv->counter) < threshold) {
+		if (cntr_priv->error_avail) {
+			ret = -FI_EAVAIL;
+			break;
+		}
+
 		if (cntr_priv->wait) {
 			ret = fi_wait((struct fid_wait *)cntr_priv->wait,
 				      timeout - msec_passed);
@@ -229,6 +239,11 @@ static int psmx2_cntr_wait(struct fid_cntr *cntr, uint64_t threshold, int timeou
 				psmx2_progress(poll_ctxt->trx_ctxt);
 				(void) prev; /* suppress compiler warning */
 			}
+		}
+
+		if (cntr_priv->error_avail) {
+			ret = -FI_EAVAIL;
+			break;
 		}
 
 		if (ofi_atomic_get64(&cntr_priv->counter) >= threshold)
@@ -261,6 +276,8 @@ static int psmx2_cntr_close(fid_t fid)
 	while (!slist_empty(&cntr->poll_list)) {
 		entry = slist_remove_head(&cntr->poll_list);
 		item = container_of(entry, struct psmx2_poll_ctxt, list_entry);
+		if (!ofi_atomic_dec32(&item->trx_ctxt->poll_refcnt))
+			free(item->trx_ctxt);
 		free(item);
 	}
 
@@ -327,6 +344,7 @@ static struct fi_ops_cntr psmx2_cntr_ops = {
 	.seterr = psmx2_cntr_seterr,
 };
 
+DIRECT_FN
 int psmx2_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
 			struct fid_cntr **cntr, void *context)
 {

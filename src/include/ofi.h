@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2013-2018 Intel Corporation. All rights reserved.
- * Copyright (c) 2016 Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2016-2018 Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -81,6 +81,10 @@ extern "C" {
 		_a > _b ? _a : _b; })
 #endif
 
+#define ofi_div_ceil(a, b) ((a + b - 1) / b)
+
+#define OFI_MAGIC_64 (0x0F1C0DE0F1C0DE64)
+
 
 /*
  * CPU specific features
@@ -97,10 +101,16 @@ enum {
 int ofi_cpu_supports(unsigned func, unsigned reg, unsigned bit);
 
 
-/* Restrict to size of struct fi_context */
+enum ofi_prov_type {
+	OFI_PROV_CORE,
+	OFI_PROV_UTIL,
+	OFI_PROV_HOOK,
+};
+
+/* Restrict to size of struct fi_provider::context (struct fi_context) */
 struct fi_prov_context {
+	enum ofi_prov_type type;
 	int disable_logging;
-	int is_util_prov;
 };
 
 struct fi_filter {
@@ -115,11 +125,21 @@ void ofi_create_filter(struct fi_filter *filter, const char *env_name);
 void ofi_free_filter(struct fi_filter *filter);
 int ofi_apply_filter(struct fi_filter *filter, const char *name);
 
+int ofi_nic_close(struct fid *fid);
+struct fid_nic *ofi_nic_dup(const struct fid_nic *nic);
+int ofi_nic_tostr(const struct fid *fid_nic, char *buf, size_t len);
+
+struct fi_provider *ofi_get_hook(const char *name);
+
 void fi_log_init(void);
 void fi_log_fini(void);
 void fi_param_init(void);
 void fi_param_fini(void);
 void fi_param_undefine(const struct fi_provider *provider);
+void ofi_hook_init(void);
+void ofi_hook_fini(void);
+void ofi_hook_install(struct fid_fabric *hfabric, struct fid_fabric **fabric,
+		      struct fi_provider *prov);
 
 const char *ofi_hex_str(const uint8_t *data, size_t len);
 
@@ -150,6 +170,7 @@ static inline size_t fi_get_aligned_sz(size_t size, size_t alignment)
 uint64_t ofi_max_tag(uint64_t mem_tag_format);
 uint64_t ofi_tag_format(uint64_t max_tag);
 uint8_t ofi_msb(uint64_t num);
+uint8_t ofi_lsb(uint64_t num);
 
 int ofi_send_allowed(uint64_t caps);
 int ofi_recv_allowed(uint64_t caps);
@@ -161,7 +182,6 @@ int ofi_check_rx_mode(const struct fi_info *info, uint64_t flags);
 
 uint64_t fi_gettime_ms(void);
 uint64_t fi_gettime_us(void);
-
 
 #define OFI_ENUM_VAL(X) X
 #define OFI_STR(X) #X

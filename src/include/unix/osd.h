@@ -43,6 +43,10 @@
 #include <netinet/in.h>
 #include <sys/uio.h>
 
+#ifdef HAVE_GLIBC_MALLOC_HOOKS
+# include <malloc.h>
+#endif
+
 /* MSG_NOSIGNAL doesn't exist on OS X */
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -75,6 +79,8 @@
 #define OFI_SOCK_TRY_CONN_AGAIN(err)	\
 	((err) == EINPROGRESS)
 
+#define OFI_MAX_SOCKET_BUF_SIZE	SIZE_MAX
+
 struct util_shm
 {
 	int		shared_fd;
@@ -106,6 +112,11 @@ static inline int ofi_getsockname(SOCKET fd, struct sockaddr *addr, socklen_t *l
 	return getsockname(fd, addr, len);
 }
 
+static inline int ofi_getpeername(SOCKET fd, struct sockaddr *addr, socklen_t *len)
+{
+	return getpeername(fd, addr, len);
+}
+
 static inline SOCKET ofi_socket(int domain, int type, int protocol)
 {
 	return socket(domain, type, protocol);
@@ -127,10 +138,10 @@ static inline ssize_t ofi_recv_socket(SOCKET fd, void *buf, size_t count,
 	return recv(fd, buf, count, flags);
 }
 
-static inline ssize_t ofi_recvfrom_socket(SOCKET fd, const void *buf, size_t count, int flags,
-					  const struct sockaddr *to, socklen_t tolen)
+static inline ssize_t ofi_recvfrom_socket(SOCKET fd, void *buf, size_t count, int flags,
+					  struct sockaddr *from, socklen_t *fromlen)
 {
-	return sendto(fd, buf, count, flags, to, tolen);
+	return recvfrom(fd, buf, count, flags, from, fromlen);
 }
 
 static inline ssize_t ofi_send_socket(SOCKET fd, const void *buf, size_t count,
@@ -153,6 +164,30 @@ static inline ssize_t ofi_writev_socket(SOCKET fd, struct iovec *iov, size_t iov
 static inline ssize_t ofi_readv_socket(SOCKET fd, struct iovec *iov, int iov_cnt)
 {
 	return readv(fd, iov, iov_cnt);
+}
+
+static inline ssize_t
+ofi_sendmsg_tcp(SOCKET fd, const struct msghdr *msg, int flags)
+{
+	return sendmsg(fd, msg, flags);
+}
+
+static inline ssize_t
+ofi_sendmsg_udp(SOCKET fd, const struct msghdr *msg, int flags)
+{
+	return sendmsg(fd, msg, flags);
+}
+
+static inline ssize_t
+ofi_recvmsg_tcp(SOCKET fd, struct msghdr *msg, int flags)
+{
+	return recvmsg(fd, msg, flags);
+}
+
+static inline ssize_t
+ofi_recvmsg_udp(SOCKET fd, struct msghdr *msg, int flags)
+{
+	return recvmsg(fd, msg, flags);
 }
 
 static inline int ofi_shutdown(SOCKET socket, int how)
@@ -279,6 +314,121 @@ ofi_cpuid(unsigned func, unsigned subfunc, unsigned cpuinfo[4])
 
 #endif /* defined(__x86_64__) || defined(__amd64__) */
 
+typedef void (*ofi_mem_free_hook)(void *, const void *);
+typedef void *(*ofi_mem_realloc_hook)(void *, size_t, const void *);
 
+#ifdef HAVE_GLIBC_MALLOC_HOOKS
+
+static inline void ofi_set_mem_free_hook(ofi_mem_free_hook free_hook)
+{
+#ifdef __INTEL_COMPILER /* ICC */
+# pragma warning push
+# pragma warning disable 1478
+	__free_hook = free_hook;
+# pragma warning pop
+#elif defined __clang__ /* Clang */
+# pragma clang diagnostic push
+# pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	__free_hook = free_hook;
+# pragma clang diagnostic pop
+#elif __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6) /* GCC >= 4.6 */
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+	__free_hook = free_hook;
+# pragma GCC diagnostic pop
+#else /* others */
+	__free_hook = free_hook;
+#endif
+}
+
+static inline void ofi_set_mem_realloc_hook(ofi_mem_realloc_hook realloc_hook)
+{
+#ifdef __INTEL_COMPILER /* ICC */
+# pragma warning push
+# pragma warning disable 1478
+	__realloc_hook = realloc_hook;
+# pragma warning pop
+#elif defined __clang__ /* Clang */
+# pragma clang diagnostic push
+# pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	__realloc_hook = realloc_hook;
+# pragma clang diagnostic pop
+#elif __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6) /* GCC >= 4.6 */
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+	__realloc_hook = realloc_hook;
+# pragma GCC diagnostic pop
+#else /* others */
+	__realloc_hook = realloc_hook;
+#endif
+}
+
+static inline ofi_mem_free_hook ofi_get_mem_free_hook(void)
+{
+#ifdef __INTEL_COMPILER /* ICC */
+# pragma warning push
+# pragma warning disable 1478
+	return __free_hook;
+# pragma warning pop
+#elif defined __clang__ /* Clang */
+# pragma clang diagnostic push
+# pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	return __free_hook;
+# pragma clang diagnostic pop
+#elif __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6) /* GCC >= 4.6 */
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+	return __free_hook;
+# pragma GCC diagnostic pop
+#else /* others */
+	return __free_hook;
+#endif
+}
+
+static inline ofi_mem_realloc_hook ofi_get_mem_realloc_hook(void)
+{
+#ifdef __INTEL_COMPILER /* ICC */
+# pragma warning push
+# pragma warning disable 1478
+	return __realloc_hook;
+# pragma warning pop
+#elif defined __clang__ /* Clang */
+# pragma clang diagnostic push
+# pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	return __realloc_hook;
+# pragma clang diagnostic pop
+#elif __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6) /* GCC >= 4.6 */
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+	return __realloc_hook;
+# pragma GCC diagnostic pop
+#else /* others */
+	return __realloc_hook;
+#endif
+}
+
+#else /* !HAVE_GLIBC_MALLOC_HOOKS */
+
+static inline void ofi_set_mem_free_hook(ofi_mem_free_hook free_hook)
+{
+	OFI_UNUSED(free_hook);
+}
+
+static inline void ofi_set_mem_realloc_hook(ofi_mem_realloc_hook realloc_hook)
+{
+	OFI_UNUSED(realloc_hook);
+}
+
+static inline ofi_mem_free_hook ofi_get_mem_free_hook(void)
+{
+	return NULL;
+}
+
+static inline ofi_mem_realloc_hook ofi_get_mem_realloc_hook(void)
+{
+	return NULL;
+}
+
+#endif /* HAVE_GLIBC_MALLOC_HOOKS */
 
 #endif /* _FI_UNIX_OSD_H_ */

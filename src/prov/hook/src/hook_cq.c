@@ -31,7 +31,7 @@
  */
 
 #include <stdlib.h>
-#include "hook.h"
+#include "hook_prov.h"
 
 
 static ssize_t hook_cq_read(struct fid_cq *cq, void *buf, size_t count)
@@ -82,7 +82,7 @@ static int hook_cq_signal(struct fid_cq *cq)
 	return fi_cq_signal(mycq->hcq);
 }
 
-static const char *
+const char *
 hook_cq_strerror(struct fid_cq *cq, int prov_errno,
 		 const void *err_data, char *buf, size_t len)
 {
@@ -107,18 +107,32 @@ int hook_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 {
 	struct hook_domain *dom = container_of(domain, struct hook_domain, domain);
 	struct hook_cq *mycq;
+	struct fi_cq_attr hattr;
 	int ret;
 
 	mycq = calloc(1, sizeof *mycq);
 	if (!mycq)
 		return -FI_ENOMEM;
 
+	mycq->domain = dom;
 	mycq->cq.fid.fclass = FI_CLASS_CQ;
 	mycq->cq.fid.context = context;
 	mycq->cq.fid.ops = &hook_fid_ops;
-	mycq->cq.ops = &hook_cq_ops;
 
-	ret = fi_cq_open(dom->hdomain, attr, &mycq->hcq, &mycq->cq.fid);
+	switch (dom->fabric->hclass) {
+	case HOOK_PERF:
+		mycq->cq.ops = &perf_cq_ops;
+		break;
+	default:
+		mycq->cq.ops = &hook_cq_ops;
+		break;
+	}
+
+	hattr = *attr;
+	if (attr->wait_obj == FI_WAIT_SET)
+		hattr.wait_set = hook_to_hwait(attr->wait_set);
+
+	ret = fi_cq_open(dom->hdomain, &hattr, &mycq->hcq, &mycq->cq.fid);
 	if (ret)
 		free(mycq);
 	else

@@ -28,6 +28,9 @@
 /* Set to 1 to use built-in intrincics atomics */
 #undef HAVE_BUILTIN_ATOMICS
 
+/* Set to 1 to use built-in intrinsics memory model aware atomics */
+#undef HAVE_BUILTIN_MM_ATOMICS
+
 /* Set to 1 to to use cpuid */
 #undef HAVE_CPUID
 
@@ -92,6 +95,12 @@
 /* mlx provider is built as DSO */
 #undef HAVE_MLX_DL
 
+/* mrail provider is built */
+#undef HAVE_MRAIL
+
+/* mrail provider is built as DSO */
+#undef HAVE_MRAIL_DL
+
 /* Define to 1 if you have the <netlink/netlink.h> header file. */
 #undef HAVE_NETLINK_NETLINK_H
 
@@ -100,6 +109,12 @@
 
 /* Define to 1 if you have the <numa.h> header file. */
 #undef HAVE_NUMA_H
+
+/* perf provider is built */
+#undef HAVE_PERF
+
+/* perf provider is built as DSO */
+#undef HAVE_PERF_DL
 
 /* psm provider is built */
 #undef HAVE_PSM
@@ -116,6 +131,15 @@
 /* Define to 1 if you have the <psm2.h> header file. */
 #undef HAVE_PSM2_H
 
+/* psm2_info_query function is present */
+#undef HAVE_PSM2_INFO_QUERY
+
+/* psm2_mq_fp_msg function is present */
+#undef HAVE_PSM2_MQ_FP_MSG
+
+/* psm2_mq_ipeek_dequeue_multi function is present */
+#undef HAVE_PSM2_MQ_REQ_USER
+
 /* PSM2 source is built-in */
 #undef HAVE_PSM2_SRC
 
@@ -127,6 +151,12 @@
 
 /* Define to 1 if you have the <rdma/rdma_cma.h> header file. */
 #undef HAVE_RDMA_RDMA_CMA_H
+
+/* rstream provider is built */
+#undef HAVE_RSTREAM
+
+/* rstream provider is built as DSO */
+#undef HAVE_RSTREAM_DL
 
 /* rxd provider is built */
 #undef HAVE_RXD
@@ -250,6 +280,9 @@
 
 /* Whether to build the fake usNIC verbs provider or not */
 #undef USNIC_BUILD_FAKE_VERBS_DRIVER
+
+/* Whether infiniband/verbs.h has XRC support or not */
+#undef VERBS_HAVE_XRC
 
 /* Version number of package */
 #undef VERSION

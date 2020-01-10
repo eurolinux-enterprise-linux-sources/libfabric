@@ -41,18 +41,18 @@
 int smr_tx_comp(struct smr_ep *ep, void *context, uint64_t flags, uint64_t err)
 {
 	struct fi_cq_tagged_entry *comp;
-	struct util_cq_err_entry *entry;
+	struct util_cq_oflow_err_entry *entry;
 
 	comp = ofi_cirque_tail(ep->util_ep.tx_cq->cirq);
 	if (err) {
 		if (!(entry = calloc(1, sizeof(*entry))))
 			return -FI_ENOMEM;
-		entry->err_entry.op_context = context;
-		entry->err_entry.flags = flags;
-		entry->err_entry.err = err;
-		entry->err_entry.prov_errno = -err;
+		entry->comp.op_context = context;
+		entry->comp.flags = flags;
+		entry->comp.err = err;
+		entry->comp.prov_errno = -err;
 		slist_insert_tail(&entry->list_entry,
-				  &ep->util_ep.tx_cq->err_list);
+				  &ep->util_ep.tx_cq->oflow_err_list);
 		comp->flags = UTIL_FLAG_ERROR;
 	} else {
 		comp->op_context = context;
@@ -82,19 +82,19 @@ int smr_rx_comp(struct smr_ep *ep, void *context, uint64_t flags, size_t len,
 		uint64_t err)
 {
 	struct fi_cq_tagged_entry *comp;
-	struct util_cq_err_entry *entry;
+	struct util_cq_oflow_err_entry *entry;
 
 	comp = ofi_cirque_tail(ep->util_ep.rx_cq->cirq);
 	if (err) {
 		if (!(entry = calloc(1, sizeof(*entry))))
 			return -FI_ENOMEM;
-		entry->err_entry.op_context = context;
-		entry->err_entry.flags = flags;
-		entry->err_entry.tag = tag;
-		entry->err_entry.err = err;
-		entry->err_entry.prov_errno = -err;
+		entry->comp.op_context = context;
+		entry->comp.flags = flags;
+		entry->comp.tag = tag;
+		entry->comp.err = err;
+		entry->comp.prov_errno = -err;
 		slist_insert_tail(&entry->list_entry,
-				  &ep->util_ep.rx_cq->err_list);
+				  &ep->util_ep.rx_cq->oflow_err_list);
 		comp->flags = UTIL_FLAG_ERROR;
 	} else {
 		comp->op_context = context;
@@ -144,57 +144,14 @@ int smr_rx_src_comp_signal(struct smr_ep *ep, void *context, uint64_t flags,
 
 }
 
-static const uint64_t smr_tx_flags[] = {
-	[ofi_op_msg] = FI_SEND,
-	[ofi_op_tagged] = FI_SEND | FI_TAGGED,
-	[ofi_op_read_req] = FI_RMA | FI_READ,
-	[ofi_op_write] = FI_RMA | FI_WRITE,
-	[ofi_op_atomic] = FI_ATOMIC | FI_WRITE,
-	[ofi_op_atomic_fetch] = FI_ATOMIC | FI_WRITE | FI_READ,
-	[ofi_op_atomic_compare] = FI_ATOMIC | FI_WRITE | FI_READ,
-};
-
-uint64_t smr_tx_comp_flags(uint32_t op)
-{
-	return smr_tx_flags[op];
-}
-
-static const uint64_t smr_rx_flags[] = {
-	[ofi_op_msg] = FI_RECV,
-	[ofi_op_tagged] = FI_RECV | FI_TAGGED,
-	[ofi_op_read_req] = FI_RMA | FI_REMOTE_READ,
-	[ofi_op_write] = FI_RMA | FI_REMOTE_WRITE,
-	[ofi_op_atomic] = FI_ATOMIC | FI_REMOTE_WRITE,
-	[ofi_op_atomic_fetch] = FI_ATOMIC | FI_REMOTE_WRITE | FI_REMOTE_READ,
-	[ofi_op_atomic_compare] = FI_ATOMIC | FI_REMOTE_WRITE | FI_REMOTE_READ,
-};
-
-uint64_t smr_rx_comp_flags(uint32_t op, uint16_t op_flags)
+uint64_t smr_rx_cq_flags(uint32_t op, uint16_t op_flags)
 {
 	uint64_t flags;
 
-	flags = smr_rx_flags[op];
+	flags = ofi_rx_cq_flags(op);
 
 	if (op_flags & SMR_REMOTE_CQ_DATA)
 		flags |= FI_REMOTE_CQ_DATA;
 
 	return flags;
-}
-
-static const uint64_t smr_mr_flags[] = {
-	[ofi_op_msg] = FI_RECV,
-	[ofi_op_tagged] = FI_RECV,
-	[ofi_op_read_req] = FI_REMOTE_READ,
-	[ofi_op_write] = FI_REMOTE_WRITE,
-	[ofi_op_atomic] = FI_REMOTE_WRITE,
-	[ofi_op_atomic_fetch] =  FI_REMOTE_WRITE | FI_REMOTE_READ,
-	[ofi_op_atomic_compare] = FI_REMOTE_WRITE | FI_REMOTE_READ,
-};
-
-uint64_t smr_mr_reg_flags(uint32_t op, uint16_t atomic_op)
-{
-	if (atomic_op == FI_ATOMIC_READ)
-		return FI_REMOTE_READ;
-
-	return smr_mr_flags[op];
 }

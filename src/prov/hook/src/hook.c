@@ -33,7 +33,15 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <stdio.h>
-#include "hook.h"
+#include <ofi.h>
+#include <shared/ofi_str.h>
+
+#include "ofi_hook.h"
+#include "ofi_prov.h"
+
+
+static char **hooks;
+static size_t hook_cnt;
 
 
 struct fid *hook_to_hfid(const struct fid *fid)
@@ -80,12 +88,17 @@ struct fid *hook_to_hfid(const struct fid *fid)
 		return &(container_of(fid, struct hook_mr, mr.fid)->
 			 hmr->fid);
 	default:
-		assert(0);
 		return NULL;
 	}
 }
 
-static int hook_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
+struct fid_wait *hook_to_hwait(const struct fid_wait *wait)
+{
+	return container_of(wait, struct hook_wait, wait)->hwait;
+}
+
+
+int hook_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 {
 	struct fid *hfid, *hbfid;
 
@@ -97,7 +110,7 @@ static int hook_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 	return hfid->ops->bind(hfid, hbfid, flags);
 }
 
-static int hook_control(struct fid *fid, int command, void *arg)
+int hook_control(struct fid *fid, int command, void *arg)
 {
 	struct fid *hfid;
 
@@ -108,7 +121,7 @@ static int hook_control(struct fid *fid, int command, void *arg)
 	return hfid->ops->control(hfid, command, arg);
 }
 
-static int hook_ops_open(struct fid *fid, const char *name,
+int hook_ops_open(struct fid *fid, const char *name,
 			 uint64_t flags, void **ops, void *context)
 {
 	struct fid *hfid;
@@ -120,7 +133,7 @@ static int hook_ops_open(struct fid *fid, const char *name,
 	return hfid->ops->ops_open(hfid, name, flags, ops, context);
 }
 
-static int hook_close(struct fid *fid)
+int hook_close(struct fid *fid)
 {
 	struct fid *hfid;
 	int ret;
@@ -135,7 +148,16 @@ static int hook_close(struct fid *fid)
 	return ret;
 }
 
+
 struct fi_ops hook_fid_ops = {
+	.size = sizeof(struct fi_ops),
+	.close = hook_close,
+	.bind = hook_bind,
+	.control = hook_control,
+	.ops_open = hook_ops_open,
+};
+
+static struct fi_ops hook_fabric_fid_ops = {
 	.size = sizeof(struct fi_ops),
 	.close = hook_close,
 	.bind = hook_bind,
@@ -152,22 +174,104 @@ static struct fi_ops_fabric hook_fabric_ops = {
 	.trywait = hook_trywait,
 };
 
-int hook_fabric(struct fid_fabric *hfabric, struct fid_fabric **fabric)
+void hook_fabric_init(struct hook_fabric *fabric, enum ofi_hook_class hclass,
+		      struct fid_fabric *hfabric, struct fi_provider *hprov,
+		      struct fi_ops *f_ops)
 {
+	fabric->hclass = hclass;
+	fabric->hfabric = hfabric;
+	fabric->prov = hprov;
+	fabric->fabric.fid.fclass = FI_CLASS_FABRIC;
+	fabric->fabric.fid.context = hfabric->fid.context;
+	fabric->fabric.fid.ops = f_ops;
+	fabric->fabric.api_version = hfabric->api_version;
+	fabric->fabric.ops = &hook_fabric_ops;
+
+	hfabric->fid.context = fabric;
+}
+
+static int noop_hook_fabric(struct fi_fabric_attr *attr,
+			    struct fid_fabric **fabric, void *context)
+{
+	struct fi_provider *hprov = context;
 	struct hook_fabric *fab;
 
+	FI_TRACE(hprov, FI_LOG_FABRIC, "Installing noop hook\n");
 	fab = calloc(1, sizeof *fab);
 	if (!fab)
 		return -FI_ENOMEM;
 
-	fab->fabric.fid.fclass = FI_CLASS_FABRIC;
-	fab->fabric.fid.context = hfabric->fid.context;
-	fab->fabric.fid.ops = &hook_fid_ops;
-	fab->fabric.api_version = hfabric->api_version;
-	fab->fabric.ops = &hook_fabric_ops;
-
-	hfabric->fid.context = fab;
+	hook_fabric_init(fab, HOOK_NOOP, attr->fabric, hprov,
+			 &hook_fabric_fid_ops);
 	*fabric = &fab->fabric;
-
 	return 0;
+}
+
+struct fi_provider noop_hook_prov = {
+	.version = FI_VERSION(1,0),
+	/* We're a pass-through provider, so the fi_version is always the latest */
+	.fi_version = FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION),
+	.name = "ofi_noop_hook",
+	.getinfo = NULL,
+	.fabric = noop_hook_fabric,
+	.cleanup = NULL,
+};
+
+NOOP_HOOK_INI
+{
+	return &noop_hook_prov;
+}
+
+/*
+ * Call the fabric() interface of the hooking provider.  We pass in the
+ * fabric being hooked via the fabric attributes and the corresponding
+ * fi_provider structure as the context.
+ */
+void ofi_hook_install(struct fid_fabric *hfabric, struct fid_fabric **fabric,
+		      struct fi_provider *prov)
+{
+	struct fi_provider *hook_prov;
+	struct fi_fabric_attr attr;
+	int i, ret;
+
+	*fabric = hfabric;
+	if (!hook_cnt || !hooks)
+		return;
+
+	memset(&attr, 0, sizeof attr);
+
+	for (i = 0; i < hook_cnt; i++) {
+		hook_prov = ofi_get_hook(hooks[i]);
+		if (!hook_prov)
+			continue;
+
+		attr.fabric = hfabric;
+		ret = hook_prov->fabric(&attr, fabric, prov);
+		if (ret)
+			continue;
+
+		hfabric = *fabric;
+	}
+}
+
+void ofi_hook_init(void)
+{
+	char *param_val = NULL;
+
+	fi_param_define(NULL, "hook", FI_PARAM_STRING,
+			"Intercept calls to underlying provider and apply "
+			"the specified functionality to them.  Hook option: "
+			"perf (gather performance data)");
+	fi_param_get_str(NULL, "hook", &param_val);
+
+	if (!param_val)
+		return;
+
+	hooks = ofi_split_and_alloc(param_val, ";", &hook_cnt);
+}
+
+void ofi_hook_fini(void)
+{
+	if (hooks)
+		ofi_free_string_array(hooks);
 }

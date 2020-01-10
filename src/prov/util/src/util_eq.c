@@ -36,12 +36,43 @@
 #include <ofi_enosys.h>
 #include <ofi_util.h>
 
+void ofi_eq_handle_err_entry(uint32_t api_version, uint64_t flags,
+			     struct fi_eq_err_entry *err_entry,
+			     struct fi_eq_err_entry *user_err_entry)
+{
+	if ((FI_VERSION_GE(api_version, FI_VERSION(1, 5)))
+	    && user_err_entry->err_data && user_err_entry->err_data_size) {
+		void *err_data = user_err_entry->err_data;
+		size_t err_data_size = MIN(err_entry->err_data_size,
+					   user_err_entry->err_data_size);
 
-static ssize_t util_eq_read(struct fid_eq *eq_fid, uint32_t *event,
-			    void *buf, size_t len, uint64_t flags)
+		memcpy(err_data, err_entry->err_data, err_data_size);
+
+		*user_err_entry = *err_entry;
+		user_err_entry->err_data = err_data;
+		user_err_entry->err_data_size = err_data_size;
+
+		if (!(flags & FI_PEEK)) {
+			free(err_entry->err_data);
+			err_entry->err_data = NULL;
+			err_entry->err_data_size = 0;
+		}
+	} else {
+		*user_err_entry = *err_entry;
+	}
+
+	if (!(flags & FI_PEEK)) {
+		err_entry->err = 0;
+		err_entry->prov_errno = 0;
+	}
+}
+
+ssize_t ofi_eq_read(struct fid_eq *eq_fid, uint32_t *event,
+		    void *buf, size_t len, uint64_t flags)
 {
 	struct util_eq *eq;
 	struct util_event *entry;
+	struct fi_eq_err_entry *err_entry;
 	ssize_t ret;
 
 	eq = container_of(eq_fid, struct util_eq, eq_fid);
@@ -64,8 +95,23 @@ static ssize_t util_eq_read(struct fid_eq *eq_fid, uint32_t *event,
 	if (event)
 		*event = entry->event;
 	if (buf) {
-		ret = MIN(len, (size_t)entry->size);
-		memcpy(buf, entry->data, ret);
+		if (flags & UTIL_FLAG_ERROR) {
+			free(eq->saved_err_data);
+			eq->saved_err_data = NULL;
+
+			assert((size_t) entry->size == sizeof(*err_entry));
+			err_entry = (struct fi_eq_err_entry *) entry->data;
+
+			ofi_eq_handle_err_entry(eq->fabric->fabric_fid.api_version,
+						flags, err_entry, buf);
+			ret = (ssize_t) entry->size;
+
+			if (!(flags & FI_PEEK))
+				eq->saved_err_data = err_entry->err_data;
+		} else {
+			ret = MIN(len, (size_t)entry->size);
+			memcpy(buf, entry->data, ret);
+		}
 	}  else {
 		ret = 0;
 	}
@@ -79,22 +125,21 @@ out:
 	return ret;
 }
 
-static ssize_t util_eq_readerr(struct fid_eq *eq_fid, struct fi_eq_err_entry *buf,
-			       uint64_t flags)
+ssize_t ofi_eq_readerr(struct fid_eq *eq_fid, struct fi_eq_err_entry *buf,
+		       uint64_t flags)
 {
-
-	return util_eq_read(eq_fid, NULL, buf, sizeof(*buf),
-			    flags | UTIL_FLAG_ERROR);
+	return fi_eq_read(eq_fid, NULL, buf, sizeof(*buf),
+			  flags | UTIL_FLAG_ERROR);
 }
 
-static ssize_t util_eq_write(struct fid_eq *eq_fid, uint32_t event,
-			     const void *buf, size_t len, uint64_t flags)
+ssize_t ofi_eq_write(struct fid_eq *eq_fid, uint32_t event,
+		     const void *buf, size_t len, uint64_t flags)
 {
 	struct util_eq *eq;
 	struct util_event *entry;
 
 	eq = container_of(eq_fid, struct util_eq, eq_fid);
-	entry = malloc(sizeof(*entry) + len);
+	entry = calloc(1, sizeof(*entry) + len);
 	if (!entry)
 		return -FI_ENOMEM;
 
@@ -113,8 +158,8 @@ static ssize_t util_eq_write(struct fid_eq *eq_fid, uint32_t event,
 	return len;
 }
 
-static ssize_t util_eq_sread(struct fid_eq *eq_fid, uint32_t *event, void *buf,
-			     size_t len, int timeout, uint64_t flags)
+ssize_t ofi_eq_sread(struct fid_eq *eq_fid, uint32_t *event, void *buf,
+		     size_t len, int timeout, uint64_t flags)
 {
 	struct util_eq *eq;
 
@@ -128,8 +173,8 @@ static ssize_t util_eq_sread(struct fid_eq *eq_fid, uint32_t *event, void *buf,
 	return fi_eq_read(eq_fid, event, buf, len, flags);
 }
 
-static const char *util_eq_strerror(struct fid_eq *eq_fid, int prov_errno,
-				    const void *err_data, char *buf, size_t len)
+const char *ofi_eq_strerror(struct fid_eq *eq_fid, int prov_errno,
+			    const void *err_data, char *buf, size_t len)
 {
 	return (buf && len) ? strncpy(buf, strerror(prov_errno), len) :
 			      fi_strerror(prov_errno);
@@ -185,11 +230,11 @@ static int util_eq_close(struct fid *fid)
 
 static struct fi_ops_eq util_eq_ops = {
 	.size = sizeof(struct fi_ops_eq),
-	.read = util_eq_read,
-	.readerr = util_eq_readerr,
-	.sread = util_eq_sread,
-	.write = util_eq_write,
-	.strerror = util_eq_strerror,
+	.read = ofi_eq_read,
+	.readerr = ofi_eq_readerr,
+	.sread = ofi_eq_sread,
+	.write = ofi_eq_write,
+	.strerror = ofi_eq_strerror,
 };
 
 static struct fi_ops util_eq_fi_ops = {
@@ -318,4 +363,3 @@ int ofi_eq_create(struct fid_fabric *fabric_fid, struct fi_eq_attr *attr,
 	*eq_fid = &eq->eq_fid;
 	return 0;
 }
-

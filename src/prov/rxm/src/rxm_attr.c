@@ -32,9 +32,9 @@
 
 #include "rxm.h"
 
-#define RXM_EP_CAPS (FI_MSG | FI_RMA | FI_TAGGED | FI_DIRECTED_RECV |	\
-		     FI_READ | FI_WRITE | FI_RECV | FI_SEND |		\
-		     FI_REMOTE_READ | FI_REMOTE_WRITE | FI_SOURCE)
+#define RXM_EP_CAPS (FI_MSG | FI_RMA | FI_TAGGED | FI_ATOMIC |		\
+		     FI_DIRECTED_RECV |	FI_READ | FI_WRITE | FI_RECV |	\
+		     FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE | FI_SOURCE)
 
 #define RXM_DOMAIN_CAPS (FI_LOCAL_COMM | FI_REMOTE_COMM)
 
@@ -46,15 +46,16 @@
 struct fi_tx_attr rxm_tx_attr = {
 	.caps = RXM_EP_CAPS,
 	.msg_order = ~0x0ULL,
-	.comp_order = ~0x0ULL,
-	.size = SIZE_MAX,
+	.comp_order = FI_ORDER_NONE,
+	.size = 1024,
 	.iov_limit = RXM_IOV_LIMIT,
+	.rma_iov_limit = RXM_IOV_LIMIT,
 };
 
 struct fi_rx_attr rxm_rx_attr = {
 	.caps = RXM_EP_CAPS | FI_MULTI_RECV,
 	.msg_order = ~0x0ULL,
-	.comp_order = FI_ORDER_STRICT | FI_ORDER_DATA,
+	.comp_order = FI_ORDER_NONE,
 	.size = 1024,
 	.iov_limit= RXM_IOV_LIMIT,
 };

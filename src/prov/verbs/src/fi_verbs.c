@@ -35,7 +35,6 @@
 #include <ofi_mem.h>
 
 #include "fi_verbs.h"
-#include "ep_rdm/verbs_rdm.h"
 
 static void fi_ibv_fini(void);
 
@@ -61,26 +60,33 @@ struct fi_ibv_gl_data fi_ibv_gl_data = {
 	.mr_max_cached_cnt	= 4096,
 	.mr_max_cached_size	= ULONG_MAX,
 	.mr_cache_merge_regions	= 0,
-
-	.rdm			= {
-		.buffer_num		= FI_IBV_RDM_TAGGED_DFLT_BUFFER_NUM,
-		.buffer_size		= FI_IBV_RDM_DFLT_BUFFERED_SIZE,
-		.rndv_seg_size		= FI_IBV_RDM_SEG_MAXSIZE,
-		.thread_timeout		= FI_IBV_RDM_CM_THREAD_TIMEOUT,
-		.eager_send_opcode	= "IBV_WR_SEND",
-		.cm_thread_affinity	= NULL,
-	},
-
 	.dgram			= {
 		.use_name_server	= 1,
 		.name_server_port	= 5678,
+	},
+
+	.msg			= {
+		/* Disabled by default. Use XRC transport for message
+		 * endpoint only if it is explicitly requested */
+		.prefer_xrc		= 0,
+		.xrcd_filename		= "/tmp/verbs_xrcd",
+	},
+};
+
+struct fi_ibv_dev_preset {
+	int		max_inline_data;
+	const char	*dev_name_prefix;
+} verbs_dev_presets[] = {
+	{
+		.max_inline_data = 48,
+		.dev_name_prefix = "i40iw",
 	},
 };
 
 struct fi_provider fi_ibv_prov = {
 	.name = VERBS_PROV_NAME,
 	.version = VERBS_PROV_VERS,
-	.fi_version = FI_VERSION(1, 6),
+	.fi_version = FI_VERSION(1, 7),
 	.getinfo = fi_ibv_getinfo,
 	.fabric = fi_ibv_fabric,
 	.cleanup = fi_ibv_fini
@@ -102,50 +108,6 @@ int fi_ibv_sockaddr_len(struct sockaddr *addr)
 		return ofi_sizeofaddr(addr);
 }
 
-int fi_ibv_rdm_cm_bind_ep(struct fi_ibv_rdm_cm *cm, struct fi_ibv_rdm_ep *ep)
-{
-	char my_ipoib_addr_str[INET6_ADDRSTRLEN];
-
-	assert(cm->ec && cm->listener);
-
-	if (ep->info->src_addr) {
-		memcpy(&ep->my_addr, ep->info->src_addr, sizeof(ep->my_addr));
-
-		inet_ntop(ep->my_addr.sin_family,
-			  &ep->my_addr.sin_addr.s_addr,
-			  my_ipoib_addr_str, INET_ADDRSTRLEN);
-	} else {
-		strcpy(my_ipoib_addr_str, "undefined");
-	}
-
-	VERBS_INFO(FI_LOG_EP_CTRL, "My IPoIB: %s\n", my_ipoib_addr_str);
-
-	if (!cm->is_bound) {
-		if (rdma_bind_addr(cm->listener, (struct sockaddr *)&ep->my_addr)) {
-			VERBS_INFO(FI_LOG_EP_CTRL,
-				"Failed to bind cm listener to my IPoIB addr %s: %s\n",
-				my_ipoib_addr_str, strerror(errno));
-			return -FI_EOTHER;
-		}
-		if (rdma_listen(cm->listener, 1024)) {
-			VERBS_INFO(FI_LOG_EP_CTRL, "rdma_listen failed: %s\n",
-				strerror(errno));
-			return -FI_EOTHER;
-		}
-		cm->is_bound = 1;
-	}
-
-	if (!ep->my_addr.sin_port) {
-		ep->my_addr.sin_port = rdma_get_src_port(cm->listener);
-	}
-	assert(ep->my_addr.sin_family == AF_INET);
-
-	VERBS_INFO(FI_LOG_EP_CTRL, "My ep_addr: %s:%u\n",
-		inet_ntoa(ep->my_addr.sin_addr), ntohs(ep->my_addr.sin_port));
-
-	return FI_SUCCESS;
-}
-
 int fi_ibv_get_rdma_rai(const char *node, const char *service, uint64_t flags,
 		   const struct fi_info *hints, struct rdma_addrinfo **rai)
 {
@@ -157,11 +119,8 @@ int fi_ibv_get_rdma_rai(const char *node, const char *service, uint64_t flags,
 		goto out;
 
 	if (!node && !rai_hints.ai_dst_addr) {
-		if ((!rai_hints.ai_src_addr && !service) ||
-		    (!rai_hints.ai_src_addr && FI_IBV_EP_TYPE_IS_RDM(hints)))
-		{
+		if (!rai_hints.ai_src_addr && !service)
 			node = local_node;
-		}
 		rai_hints.ai_flags |= RAI_PASSIVE;
 	}
 
@@ -201,6 +160,50 @@ out:
 		free(rai_hints.ai_src_addr);
 	if (rai_hints.ai_dst_addr)
 		free(rai_hints.ai_dst_addr);
+	return ret;
+}
+
+int fi_ibv_get_rai_id(const char *node, const char *service, uint64_t flags,
+		      const struct fi_info *hints, struct rdma_addrinfo **rai,
+		      struct rdma_cm_id **id)
+{
+	int ret;
+
+	// TODO create a similar function that won't require pruning ib_rai
+	ret = fi_ibv_get_rdma_rai(node, service, flags, hints, rai);
+	if (ret)
+		return ret;
+
+	ret = rdma_create_id(NULL, id, NULL, RDMA_PS_TCP);
+	if (ret) {
+		VERBS_INFO_ERRNO(FI_LOG_FABRIC, "rdma_create_id", errno);
+		ret = -errno;
+		goto err1;
+	}
+
+	if ((*rai)->ai_flags & RAI_PASSIVE) {
+		ret = rdma_bind_addr(*id, (*rai)->ai_src_addr);
+		if (ret) {
+			VERBS_INFO_ERRNO(FI_LOG_FABRIC, "rdma_bind_addr", errno);
+			ret = -errno;
+			goto err2;
+		}
+		return 0;
+	}
+
+	ret = rdma_resolve_addr(*id, (*rai)->ai_src_addr,
+				(*rai)->ai_dst_addr, 2000);
+	if (ret) {
+		VERBS_INFO_ERRNO(FI_LOG_FABRIC, "rdma_resolve_addr", errno);
+		ret = -errno;
+		goto err2;
+	}
+	return 0;
+err2:
+	if (rdma_destroy_id(*id))
+		VERBS_INFO_ERRNO(FI_LOG_FABRIC, "rdma_destroy_id", errno);
+err1:
+	rdma_freeaddrinfo(*rai);
 	return ret;
 }
 
@@ -359,23 +362,35 @@ int fi_ibv_set_rnr_timer(struct ibv_qp *qp)
 }
 
 int fi_ibv_find_max_inline(struct ibv_pd *pd, struct ibv_context *context,
-                           enum ibv_qp_type qp_type)
+			   enum ibv_qp_type qp_type)
 {
 	struct ibv_qp_init_attr qp_attr;
 	struct ibv_qp *qp = NULL;
-	struct ibv_cq *cq = ibv_create_cq(context, 1, NULL, NULL, 0);
-	assert(cq);
+	struct ibv_cq *cq;
 	int max_inline = 2;
 	int rst = 0;
+	const char *dev_name = ibv_get_device_name(context->device);
+	uint8_t i;
+
+	for (i = 0; i < count_of(verbs_dev_presets); i++) {
+		if (!strncmp(dev_name, verbs_dev_presets[i].dev_name_prefix,
+			     strlen(verbs_dev_presets[i].dev_name_prefix)))
+			return verbs_dev_presets[i].max_inline_data;
+	}
+
+	cq = ibv_create_cq(context, 1, NULL, NULL, 0);
+	assert(cq);
 
 	memset(&qp_attr, 0, sizeof(qp_attr));
 	qp_attr.send_cq = cq;
-	qp_attr.recv_cq = cq;
 	qp_attr.qp_type = qp_type;
 	qp_attr.cap.max_send_wr = 1;
-	qp_attr.cap.max_recv_wr = 1;
 	qp_attr.cap.max_send_sge = 1;
-	qp_attr.cap.max_recv_sge = 1;
+	if (!fi_ibv_is_xrc_send_qp(qp_type)) {
+		qp_attr.recv_cq = cq;
+		qp_attr.cap.max_recv_wr = 1;
+		qp_attr.cap.max_recv_sge = 1;
+	}
 	qp_attr.sq_sig_all = 1;
 
 	do {
@@ -575,6 +590,22 @@ static int fi_ibv_read_params(void)
 			   "Invalid value of use_odp\n");
 		return -FI_EINVAL;
 	}
+
+	if (fi_ibv_get_param_bool("prefer_xrc", "Order XRC transport fi_infos"
+				  "ahead of RC. Default orders RC first.",
+				  &fi_ibv_gl_data.msg.prefer_xrc)) {
+		VERBS_WARN(FI_LOG_CORE,
+			   "Invalid value of prefer_xrc\n");
+		return -FI_EINVAL;
+	}
+
+	if (fi_ibv_get_param_str("xrcd_filename", "A file to "
+				 "associate with the XRC domain.",
+				 &fi_ibv_gl_data.msg.xrcd_filename)) {
+		VERBS_WARN(FI_LOG_CORE,
+			   "Invalid value of xrcd_filename\n");
+		return -FI_EINVAL;
+	}
 	if (fi_ibv_get_param_int("cqread_bunch_size", "The number of entries to "
 				 "be read from the verbs completion queue at a time",
 				 &fi_ibv_gl_data.cqread_bunch_size) ||
@@ -618,61 +649,6 @@ static int fi_ibv_read_params(void)
 				  &fi_ibv_gl_data.mr_cache_merge_regions)) {
 		VERBS_WARN(FI_LOG_CORE,
 			   "Invalid value of mr_cache_merge_regions\n");
-		return -FI_EINVAL;
-	}
-
-	/* RDM-specific parameters */
-	if (fi_ibv_get_param_int("rdm_buffer_num", "The number of pre-registered "
-				 "buffers for buffered operations between "
-				 "the endpoints, must be a power of 2",
-				 &fi_ibv_gl_data.rdm.buffer_num) ||
-	    (fi_ibv_gl_data.rdm.buffer_num & (fi_ibv_gl_data.rdm.buffer_num - 1))) {
-		VERBS_WARN(FI_LOG_CORE,
-			   "Invalid value of rdm_buffer_num\n");
-		return -FI_EINVAL;
-	}
-	if (fi_ibv_get_param_int("rdm_buffer_size", "The maximum size of a "
-				 "buffered operation (bytes)",
-				 &fi_ibv_gl_data.rdm.buffer_size) ||
-	    (fi_ibv_gl_data.rdm.buffer_size < sizeof(struct fi_ibv_rdm_rndv_header))) {
-		VERBS_WARN(FI_LOG_CORE,
-			   "rdm_buffer_size should be greater than %"PRIu64"\n",
-			   sizeof(struct fi_ibv_rdm_rndv_header));
-		return -FI_EINVAL;
-	}
-	if (fi_ibv_get_param_int("rdm_rndv_seg_size", "The segment size for "
-				 "zero copy protocols (bytes)",
-				 &fi_ibv_gl_data.rdm.rndv_seg_size) ||
-	    (fi_ibv_gl_data.rdm.rndv_seg_size <= 0)) {
-		VERBS_WARN(FI_LOG_CORE,
-			   "Invalid value of rdm_rndv_seg_size\n");
-		return -FI_EINVAL;
-	}
-	if (fi_ibv_get_param_int("rdm_thread_timeout", "The wake up timeout of "
-				 "the helper thread (usec)",
-				 &fi_ibv_gl_data.rdm.thread_timeout) ||
-	    (fi_ibv_gl_data.rdm.thread_timeout < 0)) {
-		VERBS_WARN(FI_LOG_CORE,
-			   "Invalid value of rdm_thread_timeout\n");
-		return -FI_EINVAL;
-	}
-	if (fi_ibv_get_param_str("rdm_eager_send_opcode", "The operation code that "
-				 "will be used for eager messaging. Only IBV_WR_SEND "
-				 "and IBV_WR_RDMA_WRITE_WITH_IMM are supported. "
-				 "The last one is not applicable for iWarp.",
-				 &fi_ibv_gl_data.rdm.eager_send_opcode)) {
-		VERBS_WARN(FI_LOG_CORE,
-			   "Invalid value of rdm_eager_send_opcode\n");
-		return -FI_EINVAL;
-	}
-	if (fi_ibv_get_param_str("rdm_cm_thread_affinity",
-				 "If specified, bind the CM thread to the indicated "
-				 "range(s) of Linux virtual processor ID(s). "
-				 "This option is currently not supported on OS X. "
-				 "Usage: id_start[-id_end[:stride]][,]",
-				 &fi_ibv_gl_data.rdm.cm_thread_affinity)) {
-		VERBS_WARN(FI_LOG_CORE,
-			   "Invalid thread affinity range provided in the rdm_cm_thread_affinity\n");
 		return -FI_EINVAL;
 	}
 

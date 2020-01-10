@@ -32,7 +32,6 @@
 
 #include <ofi_util.h>
 #include "fi_verbs.h"
-#include "verbs_rdm.h"
 
 #define FI_IBV_DEFINE_MR_REG_OPS(type)							\
 											\
@@ -180,13 +179,6 @@ fi_ibv_mr_ofi2ibv_access(uint64_t ofi_access, struct fi_ibv_domain *domain)
 {
 	int ibv_access = 0;
 
-	/* Enable local write access by default for FI_EP_RDM which hides local
-	 * registration requirements. This allows to avoid buffering or double
-	 * registration */
-	if (!(domain->info->caps & FI_LOCAL_MR) &&
-	    !(domain->info->domain_attr->mr_mode & FI_MR_LOCAL))
-		ibv_access |= IBV_ACCESS_LOCAL_WRITE;
-
 	/* Local read access to an MR is enabled by default in verbs */
 	if (ofi_access & FI_RECV)
 		ibv_access |= IBV_ACCESS_LOCAL_WRITE;
@@ -258,38 +250,6 @@ int fi_ibv_mr_internal_dereg(struct fi_ibv_mem_desc *md)
 {
 	int ret = fi_ibv_mr_dereg_ibv_mr(md->mr);
 	md->mr = NULL;
-	return ret;
-}
-
-int fi_ibv_rdm_alloc_and_reg(struct fi_ibv_rdm_ep *ep,
-			     void **buf, size_t size,
-			     struct fi_ibv_mem_desc *md)
-{
-	if (!*buf) {
-		if (ofi_memalign((void **)buf,
-				 FI_IBV_BUF_ALIGNMENT, size))
-			return -FI_ENOMEM;
-	}
-
-	memset(*buf, 0, size);
-	return fi_ibv_mr_internal_reg(ep->domain, *buf, size,
-				      FI_WRITE | FI_REMOTE_WRITE, md);
-}
-
-ssize_t fi_ibv_rdm_dereg_and_free(struct fi_ibv_mem_desc *md,
-				  char **buff)
-{
-	ssize_t ret = FI_SUCCESS;
-	ret = fi_ibv_mr_internal_dereg(md);
-	if (ret)
-		VERBS_WARN(FI_LOG_AV,
-			   "Unable to deregister MR, ret = %"PRId64"\n", ret);
-
-	if (buff && *buff) {
-		ofi_freealign(*buff);
-		*buff = NULL;
-	}
-
 	return ret;
 }
 
@@ -376,86 +336,102 @@ static struct fi_ops fi_ibv_mr_cache_ops = {
 	.ops_open = fi_no_ops_open,
 };
 
-int fi_ibv_monitor_subscribe(struct ofi_mem_monitor *notifier, void *addr,
-			     size_t len, struct ofi_subscription *subscription)
+int fi_ibv_monitor_subscribe(struct ofi_mem_monitor *notifier,
+			     struct ofi_subscription *subscription)
 {
 	struct fi_ibv_domain *domain =
 		container_of(notifier, struct fi_ibv_domain, monitor);
-	struct fi_ibv_mem_ptr_entry *entry;
 	int ret = FI_SUCCESS;
+	RbtStatus rbt_ret;
+	RbtIterator iter;
+	struct iovec *key;
+	struct fi_ibv_subscr_entry *subscr_entry;
+	struct fi_ibv_monitor_entry *entry =
+		calloc(1, sizeof(*entry));
+	if (OFI_UNLIKELY(!entry))
+		return -FI_ENOMEM;
 
 	pthread_mutex_lock(&domain->notifier->lock);
-	fi_ibv_mem_notifier_set_free_hook(domain->notifier->prev_free_hook);
-	fi_ibv_mem_notifier_set_realloc_hook(domain->notifier->prev_realloc_hook);
+	ofi_set_mem_free_hook(domain->notifier->prev_free_hook);
+	ofi_set_mem_realloc_hook(domain->notifier->prev_realloc_hook);
 
-	entry = util_buf_alloc(domain->notifier->mem_ptrs_ent_pool);
-	if (OFI_UNLIKELY(!entry)) {
-		ret = -FI_ENOMEM;
-		goto fn;
+	entry->iov = subscription->iov;
+	dlist_init(&entry->subscription_list);
+
+	rbt_ret = rbtInsert(domain->notifier->subscr_storage,
+			    (void *)&entry->iov, (void *)entry);
+	switch (rbt_ret) {
+	case RBT_STATUS_DUPLICATE_KEY:
+		free(entry);
+		iter = rbtFind(domain->notifier->subscr_storage,
+			       (void *)&subscription->iov);
+		assert(iter);
+		rbtKeyValue(domain->notifier->subscr_storage, iter,
+			    (void *)&key, (void *)&entry);
+		/* fall through */
+	case RBT_STATUS_OK:
+		subscr_entry = calloc(1, sizeof(*subscr_entry));
+		if (OFI_LIKELY(subscr_entry != NULL)) {
+			subscr_entry->subscription = subscription;
+			dlist_insert_tail(&subscr_entry->entry, &entry->subscription_list);
+			break;
+		}
+		/* Do not free monitor entry in case of diplicate key */
+		if (rbt_ret == RBT_STATUS_OK) {
+			iter = rbtFind(domain->notifier->subscr_storage,
+				       (void *)&subscription->iov);
+			assert(iter);
+			rbtErase(domain->notifier->subscr_storage, iter);
+			free(entry);
+		}
+		/* fall through */
+	default:
+		ret = -FI_EAVAIL;
+		break;
 	}
 
-	entry->addr = addr;
-	entry->subscription = subscription;
-	dlist_init(&entry->entry);
-	HASH_ADD(hh, domain->notifier->mem_ptrs_hash, addr, sizeof(void *), entry);
-
-fn:
-	fi_ibv_mem_notifier_set_free_hook(fi_ibv_mem_notifier_free_hook);
-	fi_ibv_mem_notifier_set_realloc_hook(fi_ibv_mem_notifier_realloc_hook);
+	ofi_set_mem_free_hook(fi_ibv_mem_notifier_free_hook);
+	ofi_set_mem_realloc_hook(fi_ibv_mem_notifier_realloc_hook);
 	pthread_mutex_unlock(&domain->notifier->lock);
 	return ret;
 }
 
-void fi_ibv_monitor_unsubscribe(struct ofi_mem_monitor *notifier, void *addr,
-				size_t len, struct ofi_subscription *subscription)
+void fi_ibv_monitor_unsubscribe(struct ofi_mem_monitor *notifier,
+				struct ofi_subscription *subscription)
 {
 	struct fi_ibv_domain *domain =
 		container_of(notifier, struct fi_ibv_domain, monitor);
-	struct fi_ibv_mem_ptr_entry *entry;
+	RbtIterator iter;
+	struct fi_ibv_subscr_entry *subscr_entry;
+	struct fi_ibv_monitor_entry *entry;
+	struct iovec *key;
 
 	pthread_mutex_lock(&domain->notifier->lock);
-	fi_ibv_mem_notifier_set_free_hook(domain->notifier->prev_free_hook);
-	fi_ibv_mem_notifier_set_realloc_hook(domain->notifier->prev_realloc_hook);
+	ofi_set_mem_free_hook(domain->notifier->prev_free_hook);
+	ofi_set_mem_realloc_hook(domain->notifier->prev_realloc_hook);
 
-	HASH_FIND(hh, domain->notifier->mem_ptrs_hash, &addr, sizeof(void *), entry);
-	assert(entry);
-
-	HASH_DEL(domain->notifier->mem_ptrs_hash, entry);
-
-	if (!dlist_empty(&entry->entry))
-		dlist_remove_init(&entry->entry);
-
-	util_buf_release(domain->notifier->mem_ptrs_ent_pool, entry);
-
-	fi_ibv_mem_notifier_set_realloc_hook(fi_ibv_mem_notifier_realloc_hook);
-	fi_ibv_mem_notifier_set_free_hook(fi_ibv_mem_notifier_free_hook);
-	pthread_mutex_unlock(&domain->notifier->lock);
-}
-
-struct ofi_subscription *
-fi_ibv_monitor_get_event(struct ofi_mem_monitor *notifier)
-{
-	struct fi_ibv_domain *domain =
-		container_of(notifier, struct fi_ibv_domain, monitor);
-	struct fi_ibv_mem_ptr_entry *entry;
-
-	pthread_mutex_lock(&domain->notifier->lock);
-	if (!dlist_empty(&domain->notifier->event_list)) {
-		dlist_pop_front(&domain->notifier->event_list,
-				struct fi_ibv_mem_ptr_entry,
-				entry, entry);
-		VERBS_DBG(FI_LOG_MR,
-			  "Retrieve %p (entry %p) from event list\n",
-			  entry->addr, entry);
-		/* needed to protect against double insertions */
-		dlist_init(&entry->entry);
-
-		pthread_mutex_unlock(&domain->notifier->lock);
-		return entry->subscription;
-	} else {
-		pthread_mutex_unlock(&domain->notifier->lock);
-		return NULL;
+	iter = rbtFind(domain->notifier->subscr_storage,
+		       (void *)&subscription->iov);
+	assert(iter);
+	rbtKeyValue(domain->notifier->subscr_storage, iter,
+		    (void *)&key, (void *)&entry);
+	dlist_foreach_container(&entry->subscription_list, struct fi_ibv_subscr_entry,
+				subscr_entry, entry) {
+		if (subscr_entry->subscription == subscription) {
+			dlist_remove(&subscr_entry->entry);
+			free(subscr_entry);
+			break;
+		}
 	}
+
+	if (dlist_empty(&entry->subscription_list)) {
+		rbtErase(domain->notifier->subscr_storage, iter);
+		free(entry);
+	}
+
+	ofi_set_mem_realloc_hook(fi_ibv_mem_notifier_realloc_hook);
+	ofi_set_mem_free_hook(fi_ibv_mem_notifier_free_hook);
+	pthread_mutex_unlock(&domain->notifier->lock);
 }
 
 int fi_ibv_mr_cache_entry_reg(struct ofi_mr_cache *cache,

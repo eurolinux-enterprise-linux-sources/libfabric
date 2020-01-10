@@ -1,6 +1,7 @@
 #
 # Copyright (c) 2016 Cisco Systems, Inc.  All rights reserved.
-# Copyright (c) 2017 Intel Corporation, Inc. All right reserved.
+# Copyright (c) 2017-2018 Intel Corporation, Inc. All right reserved.
+# Copyright (c) 2018 Amazon.com, Inc. or its affiliates. All rights reserved.
 #
 # Makefile.am for libfabric
 
@@ -41,10 +42,12 @@ common_srcs =				\
 	src/common.c			\
 	src/enosys.c			\
 	src/rbtree.c			\
+	src/tree.c			\
 	src/fasthash.c			\
 	src/indexer.c			\
 	src/mem.c			\
 	src/iov.c			\
+	src/shared/ofi_str.c		\
 	prov/util/src/util_atomic.c	\
 	prov/util/src/util_attr.c	\
 	prov/util/src/util_av.c		\
@@ -63,17 +66,7 @@ common_srcs =				\
 	prov/util/src/util_ns.c		\
 	prov/util/src/util_shm.c	\
 	prov/util/src/util_mem_monitor.c\
-	prov/util/src/util_mr_cache.c	\
-	prov/hook/src/hook.c		\
-	prov/hook/src/hook_av.c		\
-	prov/hook/src/hook_cm.c		\
-	prov/hook/src/hook_cntr.c	\
-	prov/hook/src/hook_cq.c		\
-	prov/hook/src/hook_domain.c	\
-	prov/hook/src/hook_ep.c		\
-	prov/hook/src/hook_eq.c		\
-	prov/hook/src/hook_wait.c	\
-	prov/hook/src/hook_xfer.c
+	prov/util/src/util_mr_cache.c
 
 
 if MACOS
@@ -90,6 +83,7 @@ endif
 
 if LINUX
 common_srcs += src/unix/osd.c
+common_srcs += src/linux/osd.c
 if HAVE_LINUX_PERF_RDPMC
 common_srcs += src/linux/rdpmc.c
 endif
@@ -127,16 +121,21 @@ src_libfabric_la_SOURCES =			\
 	include/ofi_atom.h			\
 	include/ofi_enosys.h			\
 	include/ofi_file.h			\
+	include/ofi_hook.h			\
 	include/ofi_indexer.h			\
 	include/ofi_iov.h			\
 	include/ofi_list.h			\
+	include/shared/ofi_str.h		\
 	include/ofi_lock.h			\
 	include/ofi_mem.h			\
 	include/ofi_osd.h			\
 	include/ofi_proto.h			\
+	include/ofi_recvwin.h			\
 	include/ofi_rbuf.h			\
 	include/ofi_shm.h			\
 	include/ofi_signal.h			\
+	include/ofi_epoll.h			\
+	include/ofi_tree.h			\
 	include/ofi_util.h			\
 	include/ofi_atomic.h			\
 	include/ofi_mr.h			\
@@ -146,7 +145,6 @@ src_libfabric_la_SOURCES =			\
 	include/rbtree.h			\
 	include/uthash.h			\
 	include/ofi_prov.h			\
-	prov/hook/src/hook.h			\
 	include/rdma/providers/fi_log.h		\
 	include/rdma/providers/fi_prov.h	\
 	src/fabric.c				\
@@ -155,6 +153,16 @@ src_libfabric_la_SOURCES =			\
 	src/log.c				\
 	src/var.c				\
 	src/abi_1_0.c				\
+	prov/hook/src/hook.c			\
+	prov/hook/src/hook_av.c			\
+	prov/hook/src/hook_cm.c			\
+	prov/hook/src/hook_cntr.c		\
+	prov/hook/src/hook_cq.c			\
+	prov/hook/src/hook_domain.c		\
+	prov/hook/src/hook_ep.c			\
+	prov/hook/src/hook_eq.c			\
+	prov/hook/src/hook_wait.c		\
+	prov/hook/src/hook_xfer.c		\
 	$(common_srcs)
 
 src_libfabric_la_CPPFLAGS = $(AM_CPPFLAGS)
@@ -163,7 +171,7 @@ src_libfabric_la_LIBADD =
 src_libfabric_la_DEPENDENCIES = libfabric.map
 
 if !EMBEDDED
-src_libfabric_la_LDFLAGS += -version-info 10:14:9
+src_libfabric_la_LDFLAGS += -version-info 11:0:10
 endif
 src_libfabric_la_LDFLAGS += -export-dynamic \
 			   $(libfabric_version_script)
@@ -214,12 +222,14 @@ real_man_pages = \
         man/man3/fi_getinfo.3 \
         man/man3/fi_mr.3 \
         man/man3/fi_msg.3 \
+	man/man3/fi_nic.3 \
         man/man3/fi_poll.3 \
         man/man3/fi_rma.3 \
         man/man3/fi_tagged.3 \
         man/man3/fi_trigger.3 \
         man/man3/fi_version.3 \
         man/man7/fabric.7 \
+	man/man7/fi_hook.7 \
         man/man7/fi_provider.7 \
         man/man7/fi_direct.7
 
@@ -369,11 +379,15 @@ include prov/psm/Makefile.include
 include prov/psm2/Makefile.include
 include prov/gni/Makefile.include
 include prov/rxm/Makefile.include
+include prov/mrail/Makefile.include
 include prov/rxd/Makefile.include
 include prov/bgq/Makefile.include
 include prov/mlx/Makefile.include
 include prov/shm/Makefile.include
 include prov/tcp/Makefile.include
+include prov/rstream/Makefile.include
+include prov/hook/Makefile.include
+include prov/hook/perf/Makefile.include
 
 man_MANS = $(real_man_pages) $(prov_install_man_pages) $(dummy_man_pages)
 

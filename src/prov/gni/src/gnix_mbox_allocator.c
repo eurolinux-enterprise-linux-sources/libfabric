@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2015-2016 Los Alamos National Security, LLC.
  *                         All rights reserved.
- * Copyright (c) 2015,2017 Cray Inc.  All rights reserved.
+ * Copyright (c) 2015,2017-2018 Cray Inc.  All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -39,6 +39,7 @@
 
 #include "gnix_mbox_allocator.h"
 #include "gnix_nic.h"
+#include "fi_ext_gni.h"
 
 /**
  * Will attempt to find a directory in the hugetlbfs with the given page size.
@@ -299,6 +300,7 @@ static int __create_slab(struct gnix_mbox_alloc_handle *handle)
 	int vmdh_index = -1;
 	int flags = GNI_MEM_READWRITE;
 	struct gnix_auth_key *info;
+	struct fi_gni_auth_key key;
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
@@ -343,8 +345,10 @@ static int __create_slab(struct gnix_mbox_alloc_handle *handle)
 
 	COND_ACQUIRE(handle->nic_handle->requires_lock, &handle->nic_handle->lock);
 	if (handle->nic_handle->using_vmdh) {
-		info = _gnix_auth_key_lookup(GNIX_PROV_DEFAULT_AUTH_KEY,
-				GNIX_PROV_DEFAULT_AUTH_KEYLEN);
+		key.type = GNIX_AKT_RAW;
+		key.raw.protection_key = handle->nic_handle->cookie;
+
+		info = _gnix_auth_key_lookup((uint8_t *) &key, sizeof(key));
 		assert(info);
 
 		if (!handle->nic_handle->mdd_resources_set) {
@@ -553,6 +557,11 @@ static int __fill_mbox(struct gnix_mbox_alloc_handle *handle,
 		ret = -FI_EINVAL;
 		goto err_invalid;
 	}
+
+	/* On some systems, the page may not be zero'd from first use.
+		Memset it here */
+	memset((void *) ((uint64_t) out->base + out->offset),
+		0x0, handle->mbox_size);
 
 	ret = _gnix_test_and_set_bit(slab->used, position);
 	if (ret != 0) {

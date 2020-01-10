@@ -51,10 +51,23 @@
 
 /* FI_LOCAL_MR is valid in pre-libfaric-1.5 and can be valid in
  * post-libfabric-1.5 */
-#define OFI_CHECK_MR_LOCAL(info)						\
-	((info->domain_attr->mr_mode & FI_MR_LOCAL) ||				\
-	 (!(info->domain_attr->mr_mode & ~(FI_MR_BASIC | FI_MR_SCALABLE)) &&	\
-	  (info->mode & FI_LOCAL_MR)))
+static inline int ofi_mr_local(const struct fi_info *info)
+{
+	if (!info)
+		return 0;
+
+	if (!info->domain_attr)
+		goto check_local_mr;
+
+	if (info->domain_attr->mr_mode & FI_MR_LOCAL)
+		return 1;
+
+	if (info->domain_attr->mr_mode & ~(FI_MR_BASIC | FI_MR_SCALABLE))
+		return 0;
+
+check_local_mr:
+	return (info->mode & FI_LOCAL_MR) ? 1 : 0;
+}
 
 #define OFI_MR_MODE_RMA_TARGET (FI_MR_RAW | FI_MR_VIRT_ADDR |			\
 				 FI_MR_PROV_KEY | FI_MR_RMA_EVENT)
@@ -88,11 +101,10 @@ struct ofi_notification_queue;
 struct ofi_mem_monitor {
 	ofi_atomic32_t			refcnt;
 
-	int (*subscribe)(struct ofi_mem_monitor *notifier, void *addr,
-			 size_t len, struct ofi_subscription *subscription);
-	void (*unsubscribe)(struct ofi_mem_monitor *notifier, void *addr,
-			    size_t len, struct ofi_subscription *subscription);
-	struct ofi_subscription *(*get_event)(struct ofi_mem_monitor *notifier);
+	int (*subscribe)(struct ofi_mem_monitor *notifier,
+			 struct ofi_subscription *subscription);
+	void (*unsubscribe)(struct ofi_mem_monitor *notifier,
+			    struct ofi_subscription *subscription);
 };
 
 struct ofi_notification_queue {
@@ -105,8 +117,7 @@ struct ofi_notification_queue {
 struct ofi_subscription {
 	struct ofi_notification_queue	*nq;
 	struct dlist_entry		entry;
-	void				*addr;
-	size_t				len;
+	struct iovec			iov;
 };
 
 void ofi_monitor_init(struct ofi_mem_monitor *monitor);
@@ -120,7 +131,19 @@ int ofi_monitor_subscribe(struct ofi_notification_queue *nq,
 			  struct ofi_subscription *subscription);
 void ofi_monitor_unsubscribe(struct ofi_subscription *subscription);
 struct ofi_subscription *ofi_monitor_get_event(struct ofi_notification_queue *nq);
-
+static inline void
+ofi_monitor_add_event_to_nq(struct ofi_subscription *subscription)
+{
+	FI_DBG(&core_prov, FI_LOG_MR,
+	       "Add event to NQ, context=%p, addr=%p, len=%"PRIu64" nq=%p\n",
+	       subscription, subscription->iov.iov_base,
+	       subscription->iov.iov_len, subscription->nq);
+	fastlock_acquire(&subscription->nq->lock);
+	if (dlist_empty(&subscription->entry))
+		dlist_insert_tail(&subscription->entry,
+				  &subscription->nq->list);
+	fastlock_release(&subscription->nq->lock);
+}
 
 /*
  * MR map
@@ -181,6 +204,32 @@ struct ofi_mr_entry {
 	uint8_t				data[];
 };
 
+struct ofi_mr_storage;
+
+typedef void (*ofi_mr_destroy_t)(struct ofi_mr_storage *storage);
+typedef struct ofi_mr_entry *(*ofi_mr_find_t)(struct ofi_mr_storage *storage,
+					      const struct iovec *key);
+typedef int (*ofi_mr_insert_t)(struct ofi_mr_storage *storage,
+			       struct iovec *key,
+			       struct ofi_mr_entry *entry);
+typedef int (*ofi_mr_erase_t)(struct ofi_mr_storage *storage,
+			      struct ofi_mr_entry *entry);
+
+enum ofi_mr_storage_type {
+	OFI_MR_STORAGE_DEFAULT = 0,
+	OFI_MR_STORAGE_RBT,
+	OFI_MR_STORAGE_USER,
+};
+
+struct ofi_mr_storage {
+	enum ofi_mr_storage_type type;
+	void *storage;
+	ofi_mr_destroy_t destroy;
+	ofi_mr_find_t find;
+	ofi_mr_insert_t insert;
+	ofi_mr_erase_t erase;
+};
+
 struct ofi_mr_cache {
 	struct util_domain		*domain;
 	struct ofi_notification_queue	nq;
@@ -189,7 +238,7 @@ struct ofi_mr_cache {
 	int				merge_regions;
 	size_t				entry_data_size;
 
-	RbtHandle			mr_tree;
+	struct ofi_mr_storage		mr_storage;
 	struct dlist_entry		lru_list;
 
 	size_t				cached_cnt;
@@ -197,6 +246,7 @@ struct ofi_mr_cache {
 	size_t				search_cnt;
 	size_t				delete_cnt;
 	size_t				hit_cnt;
+	struct util_buf_pool		*entry_pool;
 
 	int				(*add_region)(struct ofi_mr_cache *cache,
 						      struct ofi_mr_entry *entry);
