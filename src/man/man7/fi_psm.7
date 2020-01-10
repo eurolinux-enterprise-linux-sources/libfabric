@@ -1,7 +1,7 @@
-.TH "fi_psm" "7" "2016\-02\-28" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.5.3"
+.TH "fi_psm" "7" "2018\-02\-13" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.6.1"
 .SH NAME
 .PP
-The PSM Fabric Provider
+fi_psm \- The PSM Fabric Provider
 .SH OVERVIEW
 .PP
 The \f[I]psm\f[] provider runs over the PSM 1.x interface that is
@@ -90,21 +90,20 @@ The default UUID is 0FFF0FFF\-0000\-0000\-0000\-0FFF0FFF0FFF.
 built\-in name server that can be used to resolve an IP address or host
 name into a transport address needed by the \f[I]fi_av_insert\f[] call.
 The main purpose of this name server is to allow simple client\-server
-type applications (such as those in \f[I]fabtest\f[]) to be written
+type applications (such as those in \f[I]fabtests\f[]) to be written
 purely with libfabric, without using any out\-of\-band communication
 mechanism.
-For such applications, the server would run first, and the client would
+For such applications, the server would run first to allow endpoints be
+created and registered with the name server, and then the client would
 call \f[I]fi_getinfo\f[] with the \f[I]node\f[] parameter set to the IP
 address or host name of the server.
 The resulting \f[I]fi_info\f[] structure would have the transport
-address of the server in the \f[I]dest_addr\f[] field.
-.PP
-The name server won\[aq]t work properly if there are more than one
-processes from the same job (i.e.
-with the same UUID) running on the same node and acting as servers.
-For such scenario it is recommended to have each process getting local
-transport address with \f[I]fi_getname\f[] and exchanging the addresses
-with out\-of\-band mechanism.
+address of the endpoint created by the server in the \f[I]dest_addr\f[]
+field.
+Optionally the \f[I]service\f[] parameter can be used in addition to
+\f[I]node\f[].
+Notice that the \f[I]service\f[] number is interpreted by the provider
+and is not a TCP/IP port number.
 .PP
 The name server is on by default.
 It can be turned off by setting the variable to 0.
@@ -156,7 +155,7 @@ the hints to \f[I]fi_getinfo\f[]), a progress thread is created to make
 progress calls from time to time.
 This option set the interval (microseconds) between progress calls.
 .PP
-The default setting is 1 if affininty is set, or 1000 if not.
+The default setting is 1 if affinity is set, or 1000 if not.
 See \f[I]FI_PSM_PROG_AFFINITY\f[].
 .PP
 \f[I]FI_PSM_PROG_AFFINITY\f[] : When set, specify the set of CPU cores

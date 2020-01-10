@@ -52,8 +52,8 @@
 #include "sock.h"
 #include "sock_util.h"
 
-#include "fi_osd.h"
-#include "fi_util.h"
+#include "ofi_osd.h"
+#include "ofi_util.h"
 
 #define SOCK_LOG_DBG(...) _SOCK_LOG_DBG(FI_LOG_AV, __VA_ARGS__)
 #define SOCK_LOG_ERROR(...) _SOCK_LOG_ERROR(FI_LOG_AV, __VA_ARGS__)
@@ -403,14 +403,11 @@ static int sock_av_remove(struct fid_av *av, fi_addr_t *fi_addr, size_t count,
         		idx = fi_addr[i] & sock_ep->attr->av->mask;
 			conn = ofi_idm_lookup(&sock_ep->attr->av_idm, idx);
 			if (conn) {
-				/*
-				 * check for conn either in connection progress or
-				 * already closed.
+				/* A peer may be using the connection, so leave
+				 * it operational, just dissociate it from AV.
 				 */
-				if((conn != SOCK_CM_CONN_IN_PROGRESS)  &&
-					(conn->sock_fd != -1)) {
-					sock_ep_remove_conn(sock_ep->attr, conn);
-				}
+				if (conn->av_index == idx)
+					conn->av_index = FI_ADDR_NOTAVAIL;
 				ofi_idm_clear(&sock_ep->attr->av_idm, idx);
 			}
 		}
@@ -465,12 +462,13 @@ static int sock_av_close(struct fid *fid)
 	if (ofi_atomic_get32(&av->ref))
 		return -FI_EBUSY;
 
-	if (!av->shared)
+	if (!av->shared) {
 		free(av->table_hdr);
-	else {
+	} else {
 		ret = ofi_shm_unmap(&av->shm);
 		if (ret)
-			SOCK_LOG_ERROR("unmap failed: %s\n", strerror(errno));
+			SOCK_LOG_ERROR("unmap failed: %s\n",
+				       strerror(ofi_syserr()));
 	}
 
 	ofi_atomic_dec32(&av->domain->ref);

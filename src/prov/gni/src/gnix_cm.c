@@ -264,7 +264,7 @@ DIRECT_FN STATIC int gnix_getname(fid_t fid, void *addr, size_t *addrlen)
 	struct gnix_ep_name *ep_name;
 	int ret;
 
-	if (unlikely(addrlen == NULL)) {
+	if (OFI_UNLIKELY(addrlen == NULL)) {
 		GNIX_INFO(FI_LOG_EP_CTRL, "parameter \"addrlen\" is NULL in "
 			"gnix_getname\n");
 		return -FI_EINVAL;
@@ -297,7 +297,7 @@ DIRECT_FN STATIC int gnix_getname(fid_t fid, void *addr, size_t *addrlen)
 	is_fi_addr_str = info->addr_format == FI_ADDR_STR;
 
 	if (!addr) {
-		if (unlikely(is_fi_addr_str)) {
+		if (OFI_UNLIKELY(is_fi_addr_str)) {
 			*addrlen = GNIX_FI_ADDR_STR_LEN;
 		} else {
 			*addrlen = sizeof(struct gnix_ep_name);
@@ -306,7 +306,7 @@ DIRECT_FN STATIC int gnix_getname(fid_t fid, void *addr, size_t *addrlen)
 		return -FI_ETOOSMALL;
 	}
 
-	if (unlikely(is_fi_addr_str)) {
+	if (OFI_UNLIKELY(is_fi_addr_str)) {
 		ret = _gnix_ep_name_to_str(ep_name, (char **) &addr);
 
 		if (ret)
@@ -334,7 +334,7 @@ DIRECT_FN STATIC int gnix_setname(fid_t fid, void *addr, size_t addrlen)
 	size_t len;
 	int ret;
 
-	if (unlikely(addr == NULL)) {
+	if (OFI_UNLIKELY(addr == NULL)) {
 		GNIX_INFO(FI_LOG_EP_CTRL, "parameter \"addr\" is NULL in "
 			"gnix_setname\n");
 		return -FI_EINVAL;
@@ -366,7 +366,7 @@ DIRECT_FN STATIC int gnix_setname(fid_t fid, void *addr, size_t addrlen)
 		return -FI_EINVAL;
 	}
 
-	if (unlikely(info->addr_format == FI_ADDR_STR)) {
+	if (OFI_UNLIKELY(info->addr_format == FI_ADDR_STR)) {
 		len = GNIX_FI_ADDR_STR_LEN;
 
 		if (addrlen != len)
@@ -399,7 +399,7 @@ DIRECT_FN STATIC int gnix_getpeer(struct fid_ep *ep, void *addr,
 	struct fi_info *info = NULL;
 	int ret;
 
-	if (unlikely(addrlen == NULL || addr == NULL)) {
+	if (OFI_UNLIKELY(addrlen == NULL || addr == NULL)) {
 		GNIX_INFO(FI_LOG_EP_CTRL,
 			  "parameter is NULL in gnix_getpeer\n");
 		return -FI_EINVAL;
@@ -473,6 +473,7 @@ static int __gnix_ep_connresp(struct gnix_fid_ep *ep,
 	switch (resp->cmd) {
 	case GNIX_PEP_SOCK_RESP_ACCEPT:
 		ep->vc->peer_caps = resp->peer_caps;
+		ep->vc->peer_key_offset = resp->key_offset;
 		ep->vc->peer_id = resp->vc_id;
 
 		/* Initialize the GNI connection. */
@@ -696,6 +697,7 @@ DIRECT_FN STATIC int gnix_connect(struct fid_ep *ep, const void *addr,
 	req.vc_mbox_attr.msg_maxsize = ep_priv->domain->params.mbox_msg_maxsize;
 	req.cq_irq_mdh = ep_priv->nic->irq_mem_hndl;
 	req.peer_caps = ep_priv->caps;
+	req.key_offset = ep_priv->auth_key->key_offset;
 
 	req.cm_data_len = paramlen;
 	if (paramlen) {
@@ -778,6 +780,7 @@ DIRECT_FN STATIC int gnix_accept(struct fid_ep *ep, const void *param,
 	}
 	ep_priv->vc = vc;
 	ep_priv->vc->peer_caps = conn->req.peer_caps;
+	ep_priv->vc->peer_key_offset = conn->req.key_offset;
 	ep_priv->vc->peer_id = conn->req.vc_id;
 
 	ret = _gnix_mbox_alloc(vc->ep->nic->mbox_hndl, &mbox);
@@ -816,6 +819,7 @@ DIRECT_FN STATIC int gnix_accept(struct fid_ep *ep, const void *param,
 			ep_priv->domain->params.mbox_msg_maxsize;
 	resp.cq_irq_mdh = ep_priv->nic->irq_mem_hndl;
 	resp.peer_caps = ep_priv->caps;
+	resp.key_offset = ep_priv->auth_key->key_offset;
 
 	resp.cm_data_len = paramlen;
 	if (paramlen) {

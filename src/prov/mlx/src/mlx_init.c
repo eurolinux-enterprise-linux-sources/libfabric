@@ -32,15 +32,17 @@
 #include "mlx.h"
 
 
-int mlx_errcode_translation_table[(-UCS_ERR_LAST)+2];
+int mlx_errcode_translation_table[(-UCS_ERR_LAST)+2] = { -FI_EOTHER };
 
 struct mlx_global_descriptor mlx_descriptor = {
 	.config = NULL,
+	.use_ns = 0,
+	.ns_port = FI_MLX_DEFAULT_NS_PORT,
+	.localhost = NULL,
 };
 
 static int mlx_init_errcodes()
 {
-	memset(mlx_errcode_translation_table, -FI_EOTHER, (-UCS_ERR_LAST)+2);
 	MLX_TRANSLATE_ERRCODE (UCS_OK)                  = -FI_SUCCESS;
 	MLX_TRANSLATE_ERRCODE (UCS_INPROGRESS)          = -FI_EINPROGRESS;
 	MLX_TRANSLATE_ERRCODE (UCS_ERR_NO_MESSAGE)      = -FI_ENOMSG;
@@ -83,7 +85,7 @@ struct fi_domain_attr mlx_domain_attrs = {
 	.rx_ctx_cnt = 1,
 	.max_ep_tx_ctx = 1,
 	.max_ep_rx_ctx = 1,
-	.mr_cnt = FI_MLX_DEF_MR_CNT;
+	.mr_cnt = FI_MLX_DEF_MR_CNT,
 };
 
 struct fi_rx_attr mlx_rx_attrs = {
@@ -111,7 +113,6 @@ struct fi_tx_attr mlx_tx_attrs = {
 
 struct fi_fabric_attr mlx_fabric_attrs = {
 	.name = FI_MLX_FABRIC_NAME,
-	.prov_name = FI_MLX_FABRIC_NAME,
 	.prov_version = FI_MLX_VERSION,
 	.fabric = NULL
 };
@@ -119,7 +120,13 @@ struct fi_fabric_attr mlx_fabric_attrs = {
 struct fi_ep_attr mlx_ep_attrs = {
 	.type = FI_EP_RDM,
 	.protocol = FI_PROTO_MLX,
-	.protocol_version = UCP_API_RELEASE,
+#if defined(UCP_API_RELEASE) && (UCP_API_RELEASE <= 2947)
+#warning "HPCX 1.9.7 have an issue with UCP_API_VERSION macro"
+	.protocol_version = (((UCP_API_MAJOR) << UCP_VERSION_MAJOR_SHIFT)|
+			((UCP_API_MINOR) << UCP_VERSION_MINOR_SHIFT)),
+#else
+	.protocol_version = (UCP_API_VERSION),
+#endif
 	.max_msg_size = 0xFFFFFFFF,
 	.mem_tag_format = 0x0,
 	.tx_ctx_cnt = 1,
@@ -143,28 +150,27 @@ struct fi_info mlx_info = {
 struct util_prov mlx_util_prov = {
 	.prov = &mlx_prov,
 	.info = &mlx_info,
-	.flags = 0
+	.flags = 0,
 };
 
 
 static int mlx_getinfo (
 			uint32_t version, const char *node,
 			const char *service, uint64_t flags,
-			struct fi_info *hints, struct fi_info **info)
+			const struct fi_info *hints, struct fi_info **info)
 {
 	int status = -ENODATA;
-	FI_INFO(&mlx_prov, FI_LOG_CORE,"\n");
-
 	char *configfile_name = NULL;
-	mlx_descriptor.config=NULL;
-	int inject_thresh =-1;
+	int inject_thresh = -1;
+
+	mlx_descriptor.config = NULL;
 
 	status = fi_param_get( &mlx_prov,
 				"mlx_tinject_limit",
 				&inject_thresh);
-	if (!status) {
+	if (!status)
 		inject_thresh = FI_MLX_DEFAULT_INJECT_SIZE;
-	}
+
 	FI_INFO( &mlx_prov, FI_LOG_CORE,
 		"used inlect size = %d \n", inject_thresh);
 
@@ -173,9 +179,23 @@ static int mlx_getinfo (
 		configfile_name = NULL;
 	}
 
+	/* NS is disabled by default */
+	status = fi_param_get( &mlx_prov, "mlx_ns_enable",
+			&mlx_descriptor.use_ns);
+	if (!status) {
+		mlx_descriptor.use_ns = 0;
+	}
+	status = fi_param_get( &mlx_prov, "mlx_ns_port",
+			&mlx_descriptor.ns_port);
+	if (!status) {
+		mlx_descriptor.ns_port = FI_MLX_DEFAULT_NS_PORT;
+	}
+
+
+
 	status = ucp_config_read( NULL,
-				status? NULL: configfile_name,
-				&mlx_descriptor.config);
+			status? NULL: configfile_name,
+			&mlx_descriptor.config);
 	if (status != UCS_OK) {
 		FI_WARN( &mlx_prov, FI_LOG_CORE,
 			"MLX error: invalid config file\n\t%d (%s)\n",
@@ -183,7 +203,7 @@ static int mlx_getinfo (
 	}
 
 	/*Setup some presets*/
-	status = ucm_config_modify("MLX_MEM_MALLOC_HOOKS", "no");
+	status = ucm_config_modify("MALLOC_HOOKS", "no");
 	if (status != UCS_OK) {
 		FI_WARN( &mlx_prov, FI_LOG_CORE,
 			"MLX error: failed to switch off UCM memory hooks:\t%d (%s)\n",
@@ -198,18 +218,31 @@ static int mlx_getinfo (
 	if (mlx_descriptor.config &&
 			fi_log_enabled( &mlx_prov, FI_LOG_INFO, FI_LOG_CORE)) {
 		ucp_config_print( mlx_descriptor.config,
-				stderr, "Used MLX configuration", (1<<4)-1);
+			stderr, "Used MLX configuration", (1<<4)-1);
 	}
 #endif
 
 	*info = NULL;
 	if (node || service) {
 		FI_WARN(&mlx_prov, FI_LOG_CORE,
-		"fi_getinfo with \"node != NULL \" or \"service != NULL \" is not supported\n");
+		"fi_getinfo with \"node != NULL \" or \"service != NULL \" is temporary not supported\n");
+		node = service = NULL;
+		flags = 0;
 	}
 
+	/* Only Pure MLX address and IPv4 are supported */
+	if (hints) {
+		if (hints->addr_format <= FI_SOCKADDR_IN) {
+			mlx_descriptor.use_ns = 1;
+			mlx_info.addr_format = FI_SOCKADDR_IN;
+		} else {
+			mlx_info.addr_format = FI_ADDR_MLX;
+		}
+	}
+	
+
 	status = util_getinfo( &mlx_util_prov, version,
-				NULL, NULL, 0, hints, info);
+				service, node, flags, hints, info);
 
 	return status;
 }
@@ -227,7 +260,7 @@ void mlx_cleanup(void)
 struct fi_provider mlx_prov = {
 	.name = FI_MLX_FABRIC_NAME,
 	.version = FI_MLX_VERSION,
-	.fi_version = FI_VERSION(1, 3),
+	.fi_version = FI_VERSION(1, 6),
 	.getinfo = mlx_getinfo,
 	.fabric = mlx_fabric_open,
 	.cleanup = mlx_cleanup,
@@ -245,6 +278,16 @@ MLX_INI
 			"mlx_tinject_limit", FI_PARAM_INT,
 			"Maximal tinject message size");
 
+	fi_param_define(&mlx_prov,
+			"mlx_ns_port", FI_PARAM_INT,
+			"MLX Name server port");
 
+	fi_param_define(&mlx_prov,
+			"mlx_ns_enable",FI_PARAM_BOOL,
+			"Enforce usage of name server for MLX provider");
+
+	fi_param_define(&mlx_prov,
+			"mlx_ns_iface",FI_PARAM_STRING,
+			"Specify IPv4 network interface for MLX provider's name server'");
 	return &mlx_prov;
 }

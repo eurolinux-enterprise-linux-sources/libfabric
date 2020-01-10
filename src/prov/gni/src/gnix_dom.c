@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
+ * Copyright (c) 2015-2018 Los Alamos National Security, LLC.
  *                         All rights reserved.
  * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
  *
@@ -45,6 +45,7 @@
 #include "gnix_xpmem.h"
 #include "gnix_hashtable.h"
 #include "gnix_auth_key.h"
+#include "gnix_smrn.h"
 
 #define GNIX_MR_MODE_DEFAULT FI_MR_BASIC
 #define GNIX_NUM_PTAGS 256
@@ -88,8 +89,9 @@ static void __domain_destruct(void *obj)
 					"registration cache\n");
 	}
 
-	/* TODO: known issue of multiple consumers of notifier notifications */
-	ret = _gnix_notifier_close(domain->mr_cache_attr.notifier);
+	free(domain->mr_cache_info);
+
+	ret = _gnix_smrn_close(domain->mr_cache_attr.smrn);
 	if (ret != FI_SUCCESS)
 		GNIX_FATAL(FI_LOG_MR, "failed to close MR notifier\n");
 
@@ -102,7 +104,6 @@ static void __domain_destruct(void *obj)
 
 	memset(domain, 0, sizeof *domain);
 	free(domain);
-
 }
 
 static void __stx_destruct(void *obj)
@@ -573,6 +574,7 @@ DIRECT_FN int gnix_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 	struct gnix_fid_fabric *fabric_priv;
 	struct gnix_auth_key *auth_key = NULL;
 	int i;
+	int requesting_vmdh = 0;
 
 	GNIX_TRACE(FI_LOG_DOMAIN, "\n");
 
@@ -582,14 +584,27 @@ DIRECT_FN int gnix_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 		(info->domain_attr->auth_key_size || info->domain_attr->auth_key))
 			return -FI_EINVAL;
 
+	requesting_vmdh = !(info->domain_attr->mr_mode &
+			(FI_MR_BASIC | FI_MR_VIRT_ADDR));
+
 	auth_key = GNIX_GET_AUTH_KEY(info->domain_attr->auth_key,
-			info->domain_attr->auth_key_size);
+			info->domain_attr->auth_key_size, requesting_vmdh);
 	if (!auth_key)
 		return -FI_EINVAL;
 
 	GNIX_INFO(FI_LOG_DOMAIN,
 		  "authorization key=%p ptag %u cookie 0x%x\n",
 		  auth_key, auth_key->ptag, auth_key->cookie);
+
+	if (auth_key->using_vmdh != requesting_vmdh) {
+		GNIX_WARN(FI_LOG_DOMAIN,
+			"GNIX provider cannot support multiple "
+			"FI_MR_BASIC and FI_MR_SCALABLE for the same ptag. "
+			"ptag=%d current_mode=%x requested_mode=%x\n",
+			auth_key->ptag,
+			auth_key->using_vmdh, info->domain_attr->mr_mode);
+		return -FI_EINVAL;
+	}
 
 	domain = calloc(1, sizeof *domain);
 	if (domain == NULL) {
@@ -611,7 +626,7 @@ DIRECT_FN int gnix_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 	domain->mr_cache_attr.dereg_context = NULL;
 	domain->mr_cache_attr.destruct_context = NULL;
 
-	ret = _gnix_notifier_open(&domain->mr_cache_attr.notifier);
+	ret = _gnix_smrn_open(&domain->mr_cache_attr.smrn);
 	if (ret != FI_SUCCESS)
 		goto err;
 
@@ -622,7 +637,11 @@ DIRECT_FN int gnix_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 		fastlock_init(&domain->mr_cache_info[i].mr_cache_lock);
 	}
 
-	domain->udreg_reg_limit = 4096;
+	/*
+	 * we are likely sharing udreg entries with Craypich if we're using udreg
+	 * cache, so ask for only half the entries by default.
+	 */
+	domain->udreg_reg_limit = 2048;
 
 	dlist_init(&domain->nic_list);
 	dlist_init(&domain->list);
@@ -675,7 +694,18 @@ DIRECT_FN int gnix_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 
 	fastlock_init(&domain->cm_nic_lock);
 
-	_gnix_open_cache(domain, GNIX_DEFAULT_CACHE_TYPE);
+	domain->using_vmdh = requesting_vmdh;
+
+	auth_key->using_vmdh = domain->using_vmdh;
+	_gnix_auth_key_enable(auth_key);
+	domain->auth_key = auth_key;
+
+	if (!requesting_vmdh) {
+		_gnix_open_cache(domain, GNIX_DEFAULT_CACHE_TYPE);
+	} else {
+		domain->mr_cache_type = GNIX_MR_TYPE_NONE;
+		_gnix_open_cache(domain, GNIX_MR_TYPE_NONE);
+	}
 
 	*dom = &domain->domain_fid;
 	return FI_SUCCESS;

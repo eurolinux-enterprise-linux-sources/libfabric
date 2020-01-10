@@ -76,7 +76,14 @@ int mlx_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 	ucs_status_t status = UCS_OK;
 	int ofi_status;
 	struct mlx_domain* domain;
-	ucp_params_t params;
+	const ucp_params_t params = {
+		.features = UCP_FEATURE_TAG,
+		.request_size = sizeof(struct mlx_request),
+		.request_init = NULL,
+		.request_cleanup = NULL,
+		.field_mask = UCP_PARAM_FIELD_FEATURES |
+			      UCP_PARAM_FIELD_REQUEST_SIZE,
+	};
 
 	if (!info->domain_attr->name ||
 	    strcmp(info->domain_attr->name, FI_MLX_FABRIC_NAME)) {
@@ -101,28 +108,20 @@ int mlx_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 		goto domain_free;
 	}
 
-	params.features = UCP_FEATURE_TAG;
-	params.request_size = sizeof(struct mlx_request);
-	params.request_init = NULL;
-	params.request_cleanup = NULL;
-
-	status = ucp_init(
-			(const ucp_params_t *)&params,
-			mlx_descriptor.config,
-			&(domain->context));
+	status = ucp_init(&params, mlx_descriptor.config,
+			  &(domain->context));
 	if (status != UCS_OK) {
 		ofi_status = MLX_TRANSLATE_ERRCODE(status);
 		goto destroy_domain;
 	}
 	fastlock_init(&(domain->fpp_lock));
 
-	domain->fast_path_pool = util_buf_pool_create(
-						sizeof(struct mlx_request),
-						16, 0, 1024 );
-	if (!domain->fast_path_pool) {
-		ofi_status = -ENOMEM;
+	ofi_status = util_buf_pool_create(
+			&domain->fast_path_pool,
+			sizeof(struct mlx_request),
+			16, 0, 1024 );
+	if (ofi_status)
 		goto cleanup_mlx;
-	}
 
 	domain->u_domain.domain_fid.fid.ops = &mlx_fi_ops;
 	domain->u_domain.domain_fid.ops = &mlx_domain_ops;

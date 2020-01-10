@@ -36,7 +36,7 @@
 #include <netdb.h>
 #include <ctype.h>
 
-#include "fi.h"
+#include "ofi.h"
 
 #include "verbs_rdm.h"
 
@@ -50,14 +50,14 @@ fi_ibv_rdm_start_connection(struct fi_ibv_rdm_ep *ep,
 	struct rdma_cm_id *id = NULL;
 	assert(ep->domain->rdm_cm->listener);
 
-	if (conn->state != FI_VERBS_CONN_ALLOCATED) {
+	if (conn->state != FI_VERBS_CONN_ALLOCATED)
 		return FI_SUCCESS;
-	}
 
 	if (ep->is_closing) {
-		VERBS_INFO(FI_LOG_AV, "Attempt to start connection with addr %s:%u when ep is closing\n",
-			inet_ntoa(conn->addr.sin_addr),
-			ntohs(conn->addr.sin_port));
+		VERBS_INFO(FI_LOG_AV,
+			   "Attempt start connection with %s:%u when ep is closing\n",
+			   inet_ntoa(conn->addr.sin_addr),
+			   ntohs(conn->addr.sin_port));
 		return -FI_EOTHER;
 	}
 
@@ -71,9 +71,7 @@ fi_ibv_rdm_start_connection(struct fi_ibv_rdm_ep *ep,
 
 	if (conn->cm_role == FI_VERBS_CM_ACTIVE || 
 	    conn->cm_role == FI_VERBS_CM_SELF)
-	{
 		conn->id[0] = id;
-	}
 
 	if (rdma_resolve_addr(id, NULL, (struct sockaddr *)&conn->addr, 30000)) {
 		VERBS_INFO_ERRNO(FI_LOG_AV, "rdma_resolve_addr\n", errno);
@@ -82,8 +80,8 @@ fi_ibv_rdm_start_connection(struct fi_ibv_rdm_ep *ep,
 	return FI_SUCCESS;
 }
 
-ssize_t
-fi_ibv_rdm_start_overall_disconnection(struct fi_ibv_rdm_av_entry *av_entry)
+/* Must call with `rdm_cm::cm_lock` held */
+ssize_t fi_ibv_rdm_start_overall_disconnection(struct fi_ibv_rdm_av_entry *av_entry)
 {
 	struct fi_ibv_rdm_conn *conn = NULL, *tmp = NULL;
 	ssize_t ret = FI_SUCCESS;
@@ -93,10 +91,14 @@ fi_ibv_rdm_start_overall_disconnection(struct fi_ibv_rdm_av_entry *av_entry)
 		ret = fi_ibv_rdm_start_disconnection(conn);
 		if (ret) {
 			VERBS_INFO(FI_LOG_AV, "Disconnection failed "
-				   "(%d) for %p\n", ret, conn);
+				   "(%zd) for %p\n", ret, conn);
 			err = ret;
 		}
-		HASH_DEL(av_entry->conn_hash, conn);
+		/*
+		 * do NOT remove entry of connection from HASH.
+		 * We will refer to the connection during
+		 * cleanup of the connections.
+		 */
 	}
 
 	return err;
@@ -105,7 +107,6 @@ fi_ibv_rdm_start_overall_disconnection(struct fi_ibv_rdm_av_entry *av_entry)
 ssize_t fi_ibv_rdm_start_disconnection(struct fi_ibv_rdm_conn *conn)
 {
 	ssize_t ret = FI_SUCCESS;
-	ssize_t err = FI_SUCCESS;
 
 	VERBS_INFO(FI_LOG_AV, "Closing connection %p, state %d\n",
 		   conn, conn->state);
@@ -118,17 +119,18 @@ ssize_t fi_ibv_rdm_start_disconnection(struct fi_ibv_rdm_conn *conn)
 	}
 
 	switch (conn->state) {
-	case FI_VERBS_CONN_ALLOCATED:
-	case FI_VERBS_CONN_REMOTE_DISCONNECT:
-		ret = (ret == FI_SUCCESS) ? err : ret;
-		break;
 	case FI_VERBS_CONN_ESTABLISHED:
 		conn->state = FI_VERBS_CONN_LOCAL_DISCONNECT;
 		break;
 	case FI_VERBS_CONN_REJECTED:
 		conn->state = FI_VERBS_CONN_CLOSED;
 		break;
+	case FI_VERBS_CONN_ALLOCATED:
+	case FI_VERBS_CONN_CLOSED:
+		break;
 	default:
+		VERBS_WARN(FI_LOG_EP_CTRL, "Unknown connection state: %d\n",
+			  (int)conn->state);
 		ret = -FI_EOTHER;
 	}
 
@@ -140,6 +142,24 @@ static inline int fi_ibv_rdm_av_is_valid_address(struct sockaddr_in *addr)
 	return addr->sin_family == AF_INET ? 1 : 0;
 }
 
+int fi_ibv_av_entry_alloc(struct fi_ibv_domain *domain,
+			  struct fi_ibv_rdm_av_entry **av_entry,
+			  void *addr)
+{
+	int ret = ofi_memalign((void**)av_entry,
+			       FI_IBV_MEM_ALIGNMENT,
+			       sizeof (**av_entry));
+	if (ret)
+		return -ret;
+	memset((*av_entry), 0, sizeof(**av_entry));
+	memcpy(&(*av_entry)->addr, addr, FI_IBV_RDM_DFLT_ADDRLEN);
+	HASH_ADD(hh, domain->rdm_cm->av_hash, addr,
+		 FI_IBV_RDM_DFLT_ADDRLEN, (*av_entry));
+	(*av_entry)->sends_outgoing = 0;
+	(*av_entry)->recv_preposted = 0;
+
+	return ret;
+}
 
 static int fi_ibv_rdm_av_insert(struct fid_av *av_fid, const void *addr,
                                 size_t count, fi_addr_t * fi_addr,
@@ -191,7 +211,7 @@ static int fi_ibv_rdm_av_insert(struct fid_av *av_fid, const void *addr,
 				fi_addr[i] = FI_ADDR_NOTAVAIL;
 
 			VERBS_INFO(FI_LOG_AV,
-				   "fi_av_insert: bad addr #%i\n", i);
+				   "fi_av_insert: bad addr #%zu\n", i);
 
 			if (av->flags & FI_EVENT) {
 				/* due to limited functionality of
@@ -206,11 +226,11 @@ static int fi_ibv_rdm_av_insert(struct fid_av *av_fid, const void *addr,
 					.prov_errno = FI_EINVAL
 				};
 				av->eq->err = err;
-				failed++;
 			} else if (flags & FI_SYNC_ERR) {
 				fi_errors[i] = -FI_EADDRNOTAVAIL;
 			}
 
+			failed++;
 			continue;
 		}
 
@@ -222,15 +242,9 @@ static int fi_ibv_rdm_av_insert(struct fid_av *av_fid, const void *addr,
 			 * It could be found if the connection was initiated
 			 * by the remote side.
 			 */
-			ret = -ofi_memalign((void**)&av_entry,
-					    FI_IBV_RDM_MEM_ALIGNMENT,
-					    sizeof *av_entry);
+			ret = fi_ibv_av_entry_alloc(av->domain, &av_entry, addr_i);
 			if (ret)
 				goto out;
-			memset(av_entry, 0, sizeof *av_entry);
-			memcpy(&av_entry->addr, addr_i, FI_IBV_RDM_DFLT_ADDRLEN);
-			HASH_ADD(hh, av->domain->rdm_cm->av_hash, addr,
-				 FI_IBV_RDM_DFLT_ADDRLEN, av_entry);
 		}
 
 		switch (av->type) {
@@ -254,8 +268,8 @@ static int fi_ibv_rdm_av_insert(struct fid_av *av_fid, const void *addr,
 			   ntohs(av_entry->addr.sin_port), av_entry);
 
 		av->used++;
-		ret++;
 	}
+	ret = count - failed;
 
 	if (av->flags & FI_EVENT) {
 		struct fi_eq_entry entry = {
@@ -269,7 +283,7 @@ static int fi_ibv_rdm_av_insert(struct fid_av *av_fid, const void *addr,
 
 out:
 	pthread_mutex_unlock(&av->domain->rdm_cm->cm_lock);
-	return (av->flags & FI_EVENT) ? FI_SUCCESS : (ret - failed);
+	return (av->flags & FI_EVENT) ? FI_SUCCESS : ret;
 }
 
 static int fi_ibv_rdm_av_insertsvc(struct fid_av *av_fid, const char *node,
@@ -429,7 +443,6 @@ static int fi_ibv_rdm_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 		return -FI_EINVAL;
 
 	pthread_mutex_lock(&av->domain->rdm_cm->cm_lock);
-
 	for (i = 0; i < count; i++) {
 
 		if (fi_addr[i] == FI_ADDR_NOTAVAIL)
@@ -455,7 +468,6 @@ static int fi_ibv_rdm_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 		slist_insert_tail(&av_entry->removed_next,
 				  &av->domain->rdm_cm->av_removed_entry_head);
 	}
-
 	pthread_mutex_unlock(&av->domain->rdm_cm->cm_lock);
 	return ret;
 }
@@ -547,64 +559,71 @@ fi_ibv_rdm_conn_to_av_map_addr(struct fi_ibv_rdm_ep *ep,
     return fi_ibv_rdm_av_entry_to_av_map_addr(ep, conn->av_entry);
 }
 
+/* Must call with `rdm_cm::cm_lock` held */
+static inline struct fi_ibv_rdm_conn *
+fi_ibv_rdm_conn_entry_alloc(struct fi_ibv_rdm_av_entry *av_entry,
+			    struct fi_ibv_rdm_ep *ep)
+{
+	struct fi_ibv_rdm_conn *conn;
+
+	if (ofi_memalign((void**) &conn,
+			 FI_IBV_MEM_ALIGNMENT,
+			 sizeof(*conn)))
+		return NULL;
+	memset(conn, 0, sizeof(*conn));
+	memcpy(&conn->addr, &av_entry->addr,
+	       FI_IBV_RDM_DFLT_ADDRLEN);
+	conn->ep = ep;
+	conn->av_entry = av_entry;
+	conn->state = FI_VERBS_CONN_ALLOCATED;
+	dlist_init(&conn->postponed_requests_head);
+	HASH_ADD(hh, av_entry->conn_hash, ep,
+		 sizeof(struct fi_ibv_rdm_ep *), conn);
+
+	/* Initiates connection to the peer */
+	fi_ibv_rdm_start_connection(ep, conn);
+
+	return conn;
+}
+
 static inline struct fi_ibv_rdm_conn *
 fi_ibv_rdm_av_map_addr_to_conn_add_new_conn(struct fi_ibv_rdm_ep *ep,
 					    fi_addr_t addr)
 {
-	struct fi_ibv_rdm_conn *conn = NULL;
 	struct fi_ibv_rdm_av_entry *av_entry =
 		fi_ibv_rdm_av_map_addr_to_av_entry(ep, addr);
 	if (av_entry) {
+		struct fi_ibv_rdm_conn *conn;
+		pthread_mutex_lock(&ep->domain->rdm_cm->cm_lock);
 		HASH_FIND(hh, av_entry->conn_hash,
 			  &ep, sizeof(struct fi_ibv_rdm_ep *), conn);
-		if (!conn) {
-			if (ofi_memalign((void**)&conn,
-					 FI_IBV_RDM_MEM_ALIGNMENT,
-					 sizeof(*conn)))
-				return NULL;
-			memset(conn, 0, sizeof(*conn));
-		    	memcpy(&conn->addr, &av_entry->addr,
-			       FI_IBV_RDM_DFLT_ADDRLEN);
-			conn->ep = ep;
-			conn->av_entry = av_entry;
-			conn->state = FI_VERBS_CONN_ALLOCATED;
-			dlist_init(&conn->postponed_requests_head);
-			HASH_ADD(hh, av_entry->conn_hash, ep,
-				 sizeof(struct fi_ibv_rdm_ep *), conn);
-		}
+		if (OFI_UNLIKELY(!conn))
+			conn = fi_ibv_rdm_conn_entry_alloc(av_entry, ep);
+		pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
+		return conn;
 	}
 
-	return conn;
+	return NULL;
 }
 
 static inline struct fi_ibv_rdm_conn *
 fi_ibv_rdm_av_tbl_idx_to_conn_add_new_conn(struct fi_ibv_rdm_ep *ep,
 					   fi_addr_t addr)
 {
-	struct fi_ibv_rdm_conn *conn = NULL;
 	struct fi_ibv_rdm_av_entry *av_entry =
 		fi_ibv_rdm_av_tbl_idx_to_av_entry(ep, addr);
 	if (av_entry) {
+		struct fi_ibv_rdm_conn *conn;
+		pthread_mutex_lock(&ep->domain->rdm_cm->cm_lock);
 		HASH_FIND(hh, av_entry->conn_hash,
 			  &ep, sizeof(struct fi_ibv_rdm_ep *), conn);
-		if (!conn) {
-			if (ofi_memalign((void**)&conn,
-					 FI_IBV_RDM_MEM_ALIGNMENT,
-					 sizeof(*conn)))
-				return NULL;
-			memset(conn, 0, sizeof(*conn));
-		    	memcpy(&conn->addr, &av_entry->addr,
-			       FI_IBV_RDM_DFLT_ADDRLEN);
-			conn->ep = ep;
-			conn->av_entry = av_entry;
-			conn->state = FI_VERBS_CONN_ALLOCATED;
-			dlist_init(&conn->postponed_requests_head);
-			HASH_ADD(hh, av_entry->conn_hash, ep,
-				 sizeof(struct fi_ibv_rdm_ep *), conn);
-		}
+		if (OFI_UNLIKELY(!conn))
+			conn = fi_ibv_rdm_conn_entry_alloc(av_entry, ep);
+		pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
+		return conn;
 	}
 
-	return conn;
+	return NULL;
 }
 
 int fi_ibv_rdm_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
@@ -614,7 +633,7 @@ int fi_ibv_rdm_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 	struct fi_ibv_av *av;
 	size_t count = 64;
 
-	fid_domain = container_of(domain, struct fi_ibv_domain, domain_fid);
+	fid_domain = container_of(domain, struct fi_ibv_domain, util_domain.domain_fid);
 
 	if (!attr)
 		return -FI_EINVAL;
@@ -642,7 +661,7 @@ int fi_ibv_rdm_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 	if (!av)
 		return -ENOMEM;
 
-	assert(fid_domain->rdm);
+	assert(fid_domain->ep_type == FI_EP_RDM);
 	av->domain = fid_domain;
 	av->type = attr->type;
 	av->count = count;

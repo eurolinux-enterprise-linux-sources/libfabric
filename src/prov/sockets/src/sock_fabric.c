@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2014 Intel Corporation, Inc.  All rights reserved.
  * Copyright (c) 2016 Cisco Systems, Inc.  All rights reserved.
+ * Copyright (c) 2017 DataDirect Networks, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -46,8 +47,8 @@
 #include <ifaddrs.h>
 #endif
 
-#include "prov.h"
-#include "fi_osd.h"
+#include "ofi_prov.h"
+#include "ofi_osd.h"
 
 #include "sock.h"
 #include "sock_util.h"
@@ -64,10 +65,21 @@ int sock_cm_def_map_sz = SOCK_CMAP_DEF_SZ;
 int sock_av_def_sz = SOCK_AV_DEF_SZ;
 int sock_cq_def_sz = SOCK_CQ_DEF_SZ;
 int sock_eq_def_sz = SOCK_EQ_DEF_SZ;
-char *sock_pe_affinity_str = NULL;
 #if ENABLE_DEBUG
 int sock_dgram_drop_rate = 0;
 #endif
+int sock_keepalive_enable;
+int sock_keepalive_time = INT_MAX;
+int sock_keepalive_intvl = INT_MAX;
+int sock_keepalive_probes = INT_MAX;
+
+char *sock_interface_name = NULL;
+
+uint64_t SOCK_EP_RDM_SEC_CAP = SOCK_EP_RDM_SEC_CAP_BASE;
+uint64_t SOCK_EP_RDM_CAP = SOCK_EP_RDM_CAP_BASE;
+uint64_t SOCK_EP_MSG_SEC_CAP = SOCK_EP_MSG_SEC_CAP_BASE;
+uint64_t SOCK_EP_MSG_CAP = SOCK_EP_MSG_CAP_BASE;
+
 
 const struct fi_fabric_attr sock_fabric_attr = {
 	.fabric = NULL,
@@ -79,6 +91,7 @@ const struct fi_fabric_attr sock_fabric_attr = {
 static struct dlist_entry sock_fab_list;
 static struct dlist_entry sock_dom_list;
 static fastlock_t sock_list_lock;
+static struct slist sock_addr_list;
 static int read_default_params;
 
 void sock_dom_add_to_list(struct sock_domain *domain)
@@ -202,7 +215,7 @@ struct sock_fabric *sock_fab_list_head(void)
 	return fabric;
 }
 
-int sock_verify_fabric_attr(struct fi_fabric_attr *attr)
+int sock_verify_fabric_attr(const struct fi_fabric_attr *attr)
 {
 	if (!attr)
 		return 0;
@@ -216,7 +229,7 @@ int sock_verify_fabric_attr(struct fi_fabric_attr *attr)
 	return 0;
 }
 
-int sock_verify_info(uint32_t version, struct fi_info *hints)
+int sock_verify_info(uint32_t version, const struct fi_info *hints)
 {
 	uint64_t caps;
 	enum fi_ep_type ep_type;
@@ -277,7 +290,7 @@ int sock_verify_info(uint32_t version, struct fi_info *hints)
 			return -FI_ENODATA;
 		}
 	}
-	ret = sock_verify_domain_attr(version, hints->domain_attr);
+	ret = sock_verify_domain_attr(version, hints);
 	if (ret)
 		return ret;
 
@@ -341,11 +354,14 @@ static void sock_read_default_params()
 		fi_param_get_int(&sock_prov, "def_av_sz", &sock_av_def_sz);
 		fi_param_get_int(&sock_prov, "def_cq_sz", &sock_cq_def_sz);
 		fi_param_get_int(&sock_prov, "def_eq_sz", &sock_eq_def_sz);
-		if (fi_param_get_str(&sock_prov, "pe_affinity", &sock_pe_affinity_str) != FI_SUCCESS)
-			sock_pe_affinity_str = NULL;
 #if ENABLE_DEBUG
 		fi_param_get_int(&sock_prov, "dgram_drop_rate", &sock_dgram_drop_rate);
 #endif
+		fi_param_get_bool(&sock_prov, "keepalive_enable", &sock_keepalive_enable);
+		fi_param_get_int(&sock_prov, "keepalive_time", &sock_keepalive_time);
+		fi_param_get_int(&sock_prov, "keepalive_intvl", &sock_keepalive_intvl);
+		fi_param_get_int(&sock_prov, "keepalive_probes", &sock_keepalive_probes);
+
 		read_default_params = 1;
 	}
 }
@@ -385,7 +401,7 @@ int sock_get_src_addr(struct sockaddr_in *dest_addr,
 
 	sock = ofi_socket(AF_INET, SOCK_DGRAM, 0);
 	if (sock < 0)
-		return -errno;
+		return -ofi_sockerr();
 
 	len = sizeof(*dest_addr);
 	ret = connect(sock, (struct sockaddr *) dest_addr, len);
@@ -399,14 +415,15 @@ int sock_get_src_addr(struct sockaddr_in *dest_addr,
 	src_addr->sin_port = 0;
 	if (ret) {
 		SOCK_LOG_DBG("getsockname failed\n");
-		ret = -errno;
+		ret = -ofi_sockerr();
 	}
 out:
 	ofi_close_socket(sock);
 	return ret;
 }
 
-static int sock_fi_checkinfo(struct fi_info *info, struct fi_info *hints)
+static int sock_fi_checkinfo(const struct fi_info *info,
+			     const struct fi_info *hints)
 {
 	if (hints && hints->domain_attr && hints->domain_attr->name &&
              strcmp(info->domain_attr->name, hints->domain_attr->name))
@@ -421,7 +438,7 @@ static int sock_fi_checkinfo(struct fi_info *info, struct fi_info *hints)
 
 static int sock_ep_getinfo(uint32_t version, const char *node,
 			   const char *service, uint64_t flags,
-			   struct fi_info *hints, enum fi_ep_type ep_type,
+			   const struct fi_info *hints, enum fi_ep_type ep_type,
 			   struct fi_info **info)
 {
 	struct addrinfo ai, *rai = NULL;
@@ -501,6 +518,8 @@ void sock_insert_loopback_addr(struct slist *addr_list)
 	struct sock_host_list_entry *addr_entry;
 
 	addr_entry = calloc(1, sizeof(struct sock_host_list_entry));
+	if (!addr_entry)
+		return;
 	strncpy(addr_entry->hostname, "127.0.0.1", sizeof(addr_entry->hostname));
 	slist_insert_tail(&addr_entry->entry, addr_list);
 }
@@ -512,15 +531,38 @@ void sock_get_list_of_addr(struct slist *addr_list)
 	struct sock_host_list_entry *addr_entry;
 	struct ifaddrs *ifaddrs, *ifa;
 
+	fi_param_get_str(&sock_prov, "interface_name", &sock_interface_name);
+
 	ret = ofi_getifaddrs(&ifaddrs);
 	if (!ret) {
+		if (sock_interface_name) {
+			for (ifa = ifaddrs; ifa != NULL; ifa = ifa->ifa_next) {
+				if (strncmp(sock_interface_name, ifa->ifa_name,
+					    strlen(sock_interface_name)) == 0) {
+					break;
+				}
+			}
+			if (ifa == NULL) {
+				FI_INFO(&sock_prov, FI_LOG_CORE,
+					"Can't set filter to unknown interface: (%s)\n",
+					sock_interface_name);
+				sock_interface_name = NULL;
+			}
+		}
 		for (ifa = ifaddrs; ifa != NULL; ifa = ifa->ifa_next) {
 			if (ifa->ifa_addr == NULL || !(ifa->ifa_flags & IFF_UP) ||
 			     (ifa->ifa_addr->sa_family != AF_INET) ||
 			     !strcmp(ifa->ifa_name, "lo"))
 				continue;
-
+			if (sock_interface_name &&
+			    strncmp(sock_interface_name, ifa->ifa_name,
+				    strlen(sock_interface_name)) != 0) {
+				SOCK_LOG_DBG("Skip (%s) interface\n", ifa->ifa_name);
+				continue;
+			}
 			addr_entry = calloc(1, sizeof(struct sock_host_list_entry));
+			if (!addr_entry)
+				continue;
 			ret = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
 					  addr_entry->hostname, sizeof(addr_entry->hostname),
 					  NULL, 0, NI_NUMERICHOST);
@@ -550,7 +592,7 @@ void sock_get_list_of_addr(struct slist *addr_list)
 #endif
 
 int sock_node_getinfo(uint32_t version, const char *node, const char *service,
-		      uint64_t flags, struct fi_info *hints, struct fi_info **info,
+		      uint64_t flags, const struct fi_info *hints, struct fi_info **info,
 		      struct fi_info **tail)
 {
 	enum fi_ep_type ep_type;
@@ -574,8 +616,7 @@ int sock_node_getinfo(uint32_t version, const char *node, const char *service,
 				*info = cur;
 			else
 				(*tail)->next = cur;
-			for (*tail = cur; (*tail)->next; *tail = (*tail)->next)
-				;
+			(*tail) = cur;
 			return 0;
 		default:
 			break;
@@ -594,8 +635,7 @@ int sock_node_getinfo(uint32_t version, const char *node, const char *service,
 			*info = cur;
 		else
 			(*tail)->next = cur;
-		for (*tail = cur; (*tail)->next; *tail = (*tail)->next)
-			;
+		(*tail) = cur;
 	}
 	if (!*info) {
 		ret = -FI_ENODATA;
@@ -634,16 +674,13 @@ static int sock_addr_matches_interface(struct slist *addr_list, struct sockaddr_
 
 static int sock_node_matches_interface(struct slist *addr_list, const char *node)
 {
-	struct addrinfo ai, *rai = NULL;
-	struct sockaddr_in addr;
-	int ret;
+	struct sockaddr_in addr = { 0 };
+	struct addrinfo *rai = NULL, ai = {
+		.ai_family = AF_INET,
+		.ai_socktype = SOCK_STREAM,
+	};
 
-	memset(&ai, 0, sizeof(ai));
-	ai.ai_family = AF_INET;
-	ai.ai_socktype = SOCK_STREAM;
-
-	ret = getaddrinfo(node, 0, &ai, &rai);
-	if (ret) {
+	if (getaddrinfo(node, 0, &ai, &rai)) {
 		SOCK_LOG_DBG("getaddrinfo failed!\n");
 		return -FI_EINVAL;
 	}
@@ -667,12 +704,11 @@ static void sock_free_addr_list(struct slist *addr_list)
 }
 
 static int sock_getinfo(uint32_t version, const char *node, const char *service,
-			uint64_t flags, struct fi_info *hints,
+			uint64_t flags, const struct fi_info *hints,
 			struct fi_info **info)
 {
 	int ret = 0;
-	struct slist addr_list;
-	struct slist_entry *entry;
+	struct slist_entry *entry, *prev;
 	struct sock_host_list_entry *host_entry;
 	struct fi_info *tail;
 
@@ -689,16 +725,12 @@ static int sock_getinfo(uint32_t version, const char *node, const char *service,
 	if (ret)
 		return ret;
 
-	slist_init(&addr_list);
-	/* Returns loopback address if no other interfaces are available */
-	sock_get_list_of_addr(&addr_list);
-
 	ret = 1;
-	if (flags & FI_SOURCE) {
-		if (node)
-			ret = sock_node_matches_interface(&addr_list, node);
+	if ((flags & FI_SOURCE) && node) {
+		ret = sock_node_matches_interface(&sock_addr_list, node);
 	} else if (hints && hints->src_addr) {
-		ret = sock_addr_matches_interface(&addr_list, (struct sockaddr_in *)hints->src_addr);
+		ret = sock_addr_matches_interface(&sock_addr_list,
+						  (struct sockaddr_in *)hints->src_addr);
 	}
 	if (!ret) {
 		SOCK_LOG_ERROR("Couldn't find a match with local interfaces\n");
@@ -708,22 +740,19 @@ static int sock_getinfo(uint32_t version, const char *node, const char *service,
 	*info = tail = NULL;
 	if (node ||
 	     (!(flags & FI_SOURCE) && hints && hints->src_addr) ||
-	     (!(flags & FI_SOURCE) && hints && hints->dest_addr)) {
-		sock_free_addr_list(&addr_list);
-		return sock_node_getinfo(version, node, service, flags, hints, info, &tail);
-	}
+	     (!(flags & FI_SOURCE) && hints && hints->dest_addr))
+		return sock_node_getinfo(version, node, service, flags,
+					 hints, info, &tail);
 
-	while (!slist_empty(&addr_list)) {
-		entry = slist_remove_head(&addr_list);
+	(void) prev; /* Makes compiler happy */
+	slist_foreach(&sock_addr_list, entry, prev) {
 		host_entry = container_of(entry, struct sock_host_list_entry, entry);
 		node = host_entry->hostname;
 		flags |= FI_SOURCE;
 		ret = sock_node_getinfo(version, node, service, flags, hints, info, &tail);
-		free(host_entry);
 		if (ret) {
 			if (ret == -FI_ENODATA)
 				continue;
-			sock_free_addr_list(&addr_list);
 			return ret;
 		}
 	}
@@ -733,13 +762,14 @@ static int sock_getinfo(uint32_t version, const char *node, const char *service,
 
 static void fi_sockets_fini(void)
 {
+	sock_free_addr_list(&sock_addr_list);
 	fastlock_destroy(&sock_list_lock);
 }
 
 struct fi_provider sock_prov = {
 	.name = sock_prov_name,
 	.version = FI_VERSION(SOCK_MAJOR_VERSION, SOCK_MINOR_VERSION),
-	.fi_version = FI_VERSION(1, 5),
+	.fi_version = FI_VERSION(1, 6),
 	.getinfo = sock_getinfo,
 	.fabric = sock_fabric,
 	.cleanup = fi_sockets_fini
@@ -747,6 +777,10 @@ struct fi_provider sock_prov = {
 
 SOCKETS_INI
 {
+#if HAVE_SOCKETS_DL
+	ofi_pmem_init();
+#endif
+
 	fi_param_define(&sock_prov, "pe_waittime", FI_PARAM_INT,
 			"How many milliseconds to spin while waiting for progress");
 
@@ -767,11 +801,33 @@ SOCKETS_INI
 
 	fi_param_define(&sock_prov, "pe_affinity", FI_PARAM_STRING,
 			"If specified, bind the progress thread to the indicated range(s) of Linux virtual processor ID(s). "
-			"This option is currently not supported on OS X. Usage: id_start[-id_end[:stride]][,]");
+			"This option is currently not supported on OS X and Windows. Usage: id_start[-id_end[:stride]][,]");
+
+	fi_param_define(&sock_prov, "keepalive_enable", FI_PARAM_BOOL,
+			"Enable keepalive support");
+
+	fi_param_define(&sock_prov, "keepalive_time", FI_PARAM_INT,
+			"Idle time in seconds before sending the first keepalive probe");
+
+	fi_param_define(&sock_prov, "keepalive_intvl", FI_PARAM_INT,
+			"Time in seconds between individual keepalive probes");
+
+	fi_param_define(&sock_prov, "keepalive_probes", FI_PARAM_INT,
+			"Maximum number of keepalive probes sent before dropping the connection");
+
+	fi_param_define(&sock_prov, "interface_name", FI_PARAM_STRING,
+			"Specify interface name");
 
 	fastlock_init(&sock_list_lock);
 	dlist_init(&sock_fab_list);
 	dlist_init(&sock_dom_list);
+	slist_init(&sock_addr_list);
+	SOCK_EP_RDM_SEC_CAP |= OFI_RMA_PMEM;
+	SOCK_EP_RDM_CAP |= OFI_RMA_PMEM;
+	SOCK_EP_MSG_SEC_CAP |= OFI_RMA_PMEM;
+	SOCK_EP_MSG_CAP |= OFI_RMA_PMEM;
+	/* Returns loopback address if no other interfaces are available */
+	sock_get_list_of_addr(&sock_addr_list);
 #if ENABLE_DEBUG
 	fi_param_define(&sock_prov, "dgram_drop_rate", FI_PARAM_INT,
 			"Drop every Nth dgram frame (debug only)");

@@ -1,12 +1,12 @@
 Name: libfabric
-Version: 1.5.3
-Release: 1%{?dist}
+Version: 1.6.1
+Release: 2%{?dist}
 Summary: User-space RDMA Fabric Interfaces
 Group: System Environment/Libraries
 License: GPLv2 or BSD
 Url: http://www.github.com/ofiwg/libfabric
 Source: %{name}-%{version}.tar.gz
-Patch2: 0001-prov-verbs-Add-support-of-different-CQ-formats-for-t.patch
+Patch1: 0001-Revert-prov-psm2-Avoid-long-delay-in-psm2_ep_close.patch
 
 BuildRequires: librdmacm-devel
 BuildRequires: libibverbs-devel >= 1.2.0
@@ -42,7 +42,7 @@ Development files for the libfabric library.
 
 %prep
 %setup -q
-%patch2 -p1
+%patch1 -p1
 
 %build
 
@@ -79,6 +79,14 @@ rm -f %{buildroot}%{_libdir}/*.la
 %{_mandir}/man7/*
 
 %changelog
+* Sat Sep 22 2018 Honggang Li <honli@redhat.com> - 1.6.1-2
+- Revert a psm2 commit to avoid sporadic assertion failures
+- Resolves: bz1631874
+
+* Tue Jun  5 2018 Honggang Li <honli@redhat.com> - 1.6.1-1
+- Rebase to latest release 1.6.1
+- Resolves: bz1483568
+
 * Wed Jan 10 2018 Honggang Li <honli@redhat.com> - 1.5.3-1
 - Rebase to latest release 1.5.3
 - Resolves: bz1533293

@@ -1,4 +1,4 @@
-.TH "fi_mr" "3" "2017\-06\-06" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.5.3"
+.TH "fi_mr" "3" "2018\-02\-13" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.6.1"
 .SH NAME
 .PP
 fi_mr \- Memory region operations
@@ -238,7 +238,7 @@ FI_MR_BASIC is maintained for backwards compatibility (libfabric version
 The behavior of basic registration is equivalent to setting the
 following mr_mode bits to one: FI_MR_VIRT_ADDR, FI_MR_ALLOCATED, and
 FI_MR_PROV_KEY.
-Additionally, providers that support basic registation usually required
+Additionally, providers that support basic registration usually required
 FI_MR_LOCAL.
 FI_MR_BASIC must either be set alone, or in conjunction with
 FI_MR_LOCAL.
@@ -365,7 +365,7 @@ region.
 .PP
 A raw key must be mapped by a peer before it can be used in data
 transfer operations.
-See fi_mr_map_key below.
+See fi_mr_map_raw below.
 .SS fi_mr_map_raw
 .PP
 Raw protection keys must be mapped to a usable key value before they can
@@ -411,8 +411,7 @@ with the region may have been modified, and the provider should verify
 and update the registered region accordingly.
 The iov parameter is optional and may be used to specify which portions
 of the registered region requires updating.
-If provider, providers are only guaranteed to update the specified
-address ranges.
+Providers are only guaranteed to update the specified address ranges.
 .PP
 The refresh operation has the effect of disabling and re\-enabling
 access to the registered region.
@@ -552,6 +551,12 @@ The follow flag may be specified to any memory registration call.
 \f[I]FI_RMA_EVENT\f[] : This flag indicates that the specified memory
 region will be associated with a completion counter used to count RMA
 operations that access the MR.
+.PP
+\f[I]FI_RMA_PMEM\f[] : This flag indicates that the underlying memory
+region is backed by persistent memory and will be used in RMA
+operations.
+It must be specified if persistent completion semantics or persistent
+data transfers are required when accessing the registered region.
 .SH RETURN VALUES
 .PP
 Returns 0 on success.

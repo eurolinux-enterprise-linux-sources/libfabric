@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
- * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
+ * Copyright (c) 2015-2018 Los Alamos National Security, LLC.
  *                         All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -182,7 +182,7 @@ static struct gnix_vc *__gnix_vc_lookup_unmapped(struct gnix_fid_ep *ep,
 			  vc, vc->peer_addr, vc->peer_fi_addr);
 
 		ret = _gnix_ep_vc_store(ep, vc, dest_addr);
-		if (unlikely(ret != FI_SUCCESS)) {
+		if (OFI_UNLIKELY(ret != FI_SUCCESS)) {
 			GNIX_WARN(FI_LOG_EP_DATA,
 				  "_gnix_ep_vc_store returned %s\n",
 				  fi_strerror(-ret));
@@ -215,14 +215,14 @@ static int __gnix_vc_get_vc_by_fi_addr(struct gnix_fid_ep *ep, fi_addr_t dest_ad
 	struct gnix_av_addr_entry av_entry;
 	struct gnix_vc *vc;
 
-	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
+	GNIX_DBG_TRACE(FI_LOG_EP_CTRL, "\n");
 
 	GNIX_DEBUG(FI_LOG_EP_CTRL,
 		   "ep->vc_table = %p, ep->vc_table->vector = %p\n",
 		   ep->vc_table, ep->vc_table->vector);
 
 	av = ep->av;
-	if (unlikely(av == NULL)) {
+	if (OFI_UNLIKELY(av == NULL)) {
 		GNIX_WARN(FI_LOG_EP_CTRL, "av field NULL for ep %p\n", ep);
 		return -FI_EINVAL;
 	}
@@ -268,7 +268,7 @@ static int __gnix_vc_get_vc_by_fi_addr(struct gnix_fid_ep *ep, fi_addr_t dest_ad
 
 	/* Map new VC through the EP connection table. */
 	ret = _gnix_ep_vc_store(ep, vc, dest_addr);
-	if (unlikely(ret != FI_SUCCESS)) {
+	if (OFI_UNLIKELY(ret != FI_SUCCESS)) {
 		GNIX_WARN(FI_LOG_EP_DATA,
 			  "_gnix_ep_vc_store returned %s\n",
 			  fi_strerror(-ret));
@@ -319,7 +319,8 @@ static void __gnix_vc_pack_conn_req(char *sbuf,
 				    uint64_t caps,
 				    xpmem_segid_t my_segid,
 				    uint8_t name_type,
-				    uint8_t rx_ctx_cnt)
+				    uint8_t rx_ctx_cnt,
+					uint32_t key_offset)
 {
 	size_t __attribute__((unused)) len;
 	char *cptr = sbuf;
@@ -339,7 +340,8 @@ static void __gnix_vc_pack_conn_req(char *sbuf,
 	      sizeof(gni_mem_handle_t) +
 	      sizeof(xpmem_segid_t) +
 	      sizeof(name_type) +
-	      sizeof(rx_ctx_cnt);
+	      sizeof(rx_ctx_cnt) +
+		  sizeof(key_offset);
 
 	assert(len <= GNIX_CM_NIC_MAX_MSG_SIZE);
 
@@ -358,12 +360,14 @@ static void __gnix_vc_pack_conn_req(char *sbuf,
 	memcpy(cptr, src_irq_cq_mhdl, sizeof(gni_mem_handle_t));
 	cptr += sizeof(gni_mem_handle_t);
 	memcpy(cptr, &caps, sizeof(uint64_t));
-	cptr += sizeof(xpmem_segid_t);
+	cptr += sizeof(uint64_t);
 	memcpy(cptr, &my_segid, sizeof(xpmem_segid_t));
-	cptr += sizeof(name_type);
+	cptr += sizeof(xpmem_segid_t);
 	memcpy(cptr, &name_type, sizeof(name_type));
-	cptr += sizeof(rx_ctx_cnt);
+	cptr += sizeof(name_type);
 	memcpy(cptr, &rx_ctx_cnt, sizeof(rx_ctx_cnt));
+	cptr += sizeof(rx_ctx_cnt);
+	memcpy(cptr, &key_offset, sizeof(key_offset));
 }
 
 /*
@@ -379,7 +383,8 @@ static void __gnix_vc_unpack_conn_req(char *rbuf,
 				      uint64_t *caps,
 				      xpmem_segid_t *peer_segid,
 				      uint8_t *name_type,
-				      uint8_t *rx_ctx_cnt)
+				      uint8_t *rx_ctx_cnt,
+					  uint32_t *key_offset)
 {
 	size_t __attribute__((unused)) len;
 	char *cptr = rbuf;
@@ -406,11 +411,12 @@ static void __gnix_vc_unpack_conn_req(char *rbuf,
 	memcpy(caps, cptr, sizeof(uint64_t));
 	cptr += sizeof(uint64_t);
 	memcpy(peer_segid, cptr, sizeof(xpmem_segid_t));
-	cptr += sizeof(uint8_t);
+	cptr += sizeof(xpmem_segid_t);
 	memcpy(name_type, cptr, sizeof(*name_type));
-	cptr += sizeof(uint8_t);
+	cptr += sizeof(*name_type);
 	memcpy(rx_ctx_cnt, cptr, sizeof(*rx_ctx_cnt));
-
+	cptr += sizeof(*rx_ctx_cnt);
+	memcpy(key_offset, cptr, sizeof(*key_offset));
 }
 
 /*
@@ -431,7 +437,8 @@ static void __gnix_vc_pack_conn_resp(char *sbuf,
 				     gni_smsg_attr_t *resp_smsg_attr,
 				     gni_mem_handle_t *resp_irq_cq_mhndl,
 				     uint64_t caps,
-				     xpmem_segid_t my_segid)
+				     xpmem_segid_t my_segid,
+					 uint32_t key_offset)
 {
 	size_t __attribute__((unused)) len;
 	char *cptr = sbuf;
@@ -448,7 +455,8 @@ static void __gnix_vc_pack_conn_resp(char *sbuf,
 	      sizeof(int) +
 	      sizeof(gni_smsg_attr_t) +
 	      sizeof(gni_mem_handle_t) +
-	      sizeof(xpmem_segid_t);
+	      sizeof(xpmem_segid_t) +
+		  sizeof(uint32_t);
 	assert(len <= GNIX_CM_NIC_MAX_MSG_SIZE);
 
 	memcpy(cptr, &rtype, sizeof(rtype));
@@ -466,6 +474,8 @@ static void __gnix_vc_pack_conn_resp(char *sbuf,
 	memcpy(cptr, &caps, sizeof(uint64_t));
 	cptr += sizeof(uint64_t);
 	memcpy(cptr, &my_segid, sizeof(xpmem_segid_t));
+	cptr += sizeof(xpmem_segid_t);
+	memcpy(cptr, &key_offset, sizeof(uint32_t));
 }
 
 /*
@@ -478,7 +488,8 @@ static void __gnix_vc_unpack_resp(char *rbuf,
 				  gni_smsg_attr_t *resp_smsg_attr,
 				  gni_mem_handle_t *resp_irq_cq_mhndl,
 				  uint64_t *caps,
-				  xpmem_segid_t *peer_segid)
+				  xpmem_segid_t *peer_segid,
+				  uint32_t *key_offset)
 {
 	char *cptr = rbuf;
 
@@ -497,6 +508,8 @@ static void __gnix_vc_unpack_resp(char *rbuf,
 	memcpy(caps, cptr, sizeof(uint64_t));
 	cptr += sizeof(uint64_t);
 	memcpy(peer_segid, cptr, sizeof(xpmem_segid_t));
+	cptr += sizeof(xpmem_segid_t);
+	memcpy(key_offset, cptr, sizeof(uint32_t));
 }
 
 static void __gnix_vc_get_msg_type(char *rbuf,
@@ -680,6 +693,7 @@ static int __gnix_vc_connect_to_self(struct gnix_vc *vc)
 	vc->peer_id = vc->vc_id;
 	vc->peer_irq_mem_hndl = ep->nic->irq_mem_hndl;
 	vc->peer_caps = ep->caps;
+	vc->peer_key_offset = ep->auth_key->key_offset;
 	vc->conn_state = GNIX_VC_CONNECTED;
 
 	ret = _gnix_vc_sched_new_conn(vc);
@@ -716,6 +730,7 @@ static int __gnix_vc_hndl_conn_resp(struct gnix_cm_nic *cm_nic,
 	uint64_t peer_caps;
 	xpmem_segid_t peer_segid;
 	xpmem_apid_t peer_apid;
+	uint32_t peer_key_offset;
 	bool accessible;
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
@@ -731,7 +746,8 @@ static int __gnix_vc_hndl_conn_resp(struct gnix_cm_nic *cm_nic,
 			      &peer_smsg_attr,
 			      &tmp_mem_hndl,
 			      &peer_caps,
-			      &peer_segid);
+			      &peer_segid,
+				  &peer_key_offset);
 
 	GNIX_DEBUG(FI_LOG_EP_CTRL,
 		"resp rx: (From Aries 0x%x Id %d src vc %p peer vc addr 0x%lx)\n",
@@ -791,6 +807,7 @@ static int __gnix_vc_hndl_conn_resp(struct gnix_cm_nic *cm_nic,
 	 */
 
 	vc->peer_caps = peer_caps;
+	vc->peer_key_offset = peer_key_offset;
 	vc->peer_id = peer_id;
 	vc->conn_state = GNIX_VC_CONNECTED;
 	GNIX_DEBUG(FI_LOG_EP_CTRL,
@@ -838,6 +855,7 @@ static int __gnix_vc_hndl_conn_req(struct gnix_cm_nic *cm_nic,
 	bool accessible;
 	ssize_t __attribute__((unused)) len;
 	struct gnix_ep_name *error_data;
+	uint32_t key_offset;
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
@@ -855,8 +873,8 @@ static int __gnix_vc_hndl_conn_req(struct gnix_cm_nic *cm_nic,
 				  &peer_caps,
 				  &peer_segid,
 				  &name_type,
-				  &rx_ctx_cnt);
-
+				  &rx_ctx_cnt,
+				  &key_offset);
 
 	GNIX_DEBUG(FI_LOG_EP_CTRL,
 		"conn req rx: (From Aries addr 0x%x Id %d to Aries 0x%x Id %d src vc 0x%lx )\n",
@@ -919,13 +937,14 @@ static int __gnix_vc_hndl_conn_req(struct gnix_cm_nic *cm_nic,
 			}
 
 			vc->conn_state = GNIX_VC_CONNECTING;
+			vc->peer_key_offset = key_offset;
 
 			if (src_mapped) {
 				/* We have an AV which maps the incoming
 				 * address.  Store the new VC in our VC lookup
 				 * table. */
 				ret = _gnix_ep_vc_store(ep, vc, fi_addr);
-				if (unlikely(ret != FI_SUCCESS)) {
+				if (OFI_UNLIKELY(ret != FI_SUCCESS)) {
 					_gnix_vc_destroy(vc);
 					GNIX_WARN(FI_LOG_EP_DATA,
 						  "_gnix_ep_vc_store returned %s\n",
@@ -967,6 +986,7 @@ static int __gnix_vc_hndl_conn_req(struct gnix_cm_nic *cm_nic,
 		}
 
 		vc->peer_caps = peer_caps;
+		vc->peer_key_offset = key_offset;
 		/*
 		 * prepare a work request to
 		 * initiate an request response
@@ -1043,6 +1063,7 @@ static int __gnix_vc_hndl_conn_req(struct gnix_cm_nic *cm_nic,
 		}
 
 		vc->peer_caps = peer_caps;
+		vc->peer_key_offset = key_offset;
 		vc->peer_id = src_vc_id;
 		vc->conn_state = GNIX_VC_CONNECTED;
 		GNIX_DEBUG(FI_LOG_EP_CTRL, "moving vc %p state to connected\n",
@@ -1198,7 +1219,8 @@ static int __gnix_vc_conn_ack_prog_fn(void *data, int *complete_ptr)
 				 &smsg_mbox_attr,
 				 &ep->nic->irq_mem_hndl,
 				 ep->caps,
-				 my_segid);
+				 my_segid,
+				 ep->auth_key->key_offset);
 
 	/*
 	 * try to send the message, if it succeeds,
@@ -1276,6 +1298,7 @@ static int __gnix_vc_conn_req_prog_fn(void *data, int *complete_ptr)
 	struct gnix_cm_nic *cm_nic = NULL;
 	xpmem_segid_t my_segid;
 	char sbuf[GNIX_CM_NIC_MAX_MSG_SIZE] = {0};
+	struct gnix_auth_key *auth_key;
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
@@ -1290,6 +1313,12 @@ static int __gnix_vc_conn_req_prog_fn(void *data, int *complete_ptr)
 	cm_nic = ep->cm_nic;
 	if (cm_nic == NULL)
 		return -FI_EINVAL;
+
+	auth_key = ep->auth_key;
+	if (auth_key == NULL)
+		return -FI_EINVAL;
+
+	assert(auth_key->enabled);
 
 	COND_ACQUIRE(ep->requires_lock, &ep->vc_lock);
 
@@ -1357,7 +1386,8 @@ static int __gnix_vc_conn_req_prog_fn(void *data, int *complete_ptr)
 				ep->caps,
 				my_segid,
 				ep->src_addr.name_type,
-				ep->src_addr.rx_ctx_cnt);
+				ep->src_addr.rx_ctx_cnt,
+				auth_key->key_offset);
 
 	/*
 	 * try to send the message, if -FI_EAGAIN is returned, okay,
@@ -1464,7 +1494,7 @@ int _gnix_vc_alloc(struct gnix_fid_ep *ep_priv,
 	dlist_init(&vc_ptr->list);
 
 	ofi_atomic_initialize32(&vc_ptr->outstanding_tx_reqs, 0);
-	ret = _gnix_alloc_bitmap(&vc_ptr->flags, 1);
+	ret = _gnix_alloc_bitmap(&vc_ptr->flags, 1, NULL);
 	assert(!ret);
 
 	/*
@@ -1924,7 +1954,7 @@ int _gnix_vc_queue_tx_req(struct gnix_fab_req *req)
 			  req);
 	}
 
-	if (unlikely(queue_tx)) {
+	if (OFI_UNLIKELY(queue_tx)) {
 		dlist_insert_tail(&req->dlist, &vc->tx_queue);
 		_gnix_vc_tx_schedule(vc);
 	}
@@ -2128,7 +2158,7 @@ int _gnix_vc_ep_get_vc(struct gnix_fid_ep *ep, fi_addr_t dest_addr,
 
 	if (GNIX_EP_RDM_DGM(ep->type)) {
 		ret = __gnix_vc_get_vc_by_fi_addr(ep, dest_addr, vc_ptr);
-		if (unlikely(ret != FI_SUCCESS)) {
+		if (OFI_UNLIKELY(ret != FI_SUCCESS)) {
 			GNIX_WARN(FI_LOG_EP_DATA,
 				  "__gnix_vc_get_vc_by_fi_addr returned %s\n",
 				   fi_strerror(-ret));

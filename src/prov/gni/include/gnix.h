@@ -56,12 +56,12 @@
 #include <rdma/fi_tagged.h>
 #include <rdma/fi_trigger.h>
 
-#include <fi.h>
+#include <ofi.h>
 #include <ofi_atomic.h>
-#include <fi_enosys.h>
-#include <fi_rbuf.h>
-#include <fi_list.h>
-#include <fi_file.h>
+#include <ofi_enosys.h>
+#include <ofi_rbuf.h>
+#include <ofi_list.h>
+#include <ofi_file.h>
 
 #ifdef HAVE_UDREG
 #include <udreg_pub.h>
@@ -85,13 +85,6 @@
 /*
  * useful macros
  */
-#ifndef likely
-#define likely(x) __builtin_expect((x), 1)
-#endif
-#ifndef unlikely
-#define unlikely(x) __builtin_expect((x), 0)
-#endif
-
 #ifndef FLOOR
 #define FLOOR(a, b) ((long long)(a) - (((long long)(a)) % (b)))
 #endif
@@ -318,7 +311,8 @@ struct gnix_ep_name {
 	};
 	struct {
 		uint32_t rx_ctx_cnt : 8;
-		uint32_t unused1 : 24;
+		uint32_t key_offset : 12;
+		uint32_t unused1 : 12;
 		uint32_t unused2;
 	};
 	uint64_t reserved[3];
@@ -417,6 +411,7 @@ struct gnix_fid_domain {
 	int mr_iov_limit;
 	int udreg_reg_limit;
 	struct gnix_auth_key *auth_key;
+	int using_vmdh;
 #ifdef HAVE_UDREG
 	udreg_cache_handle_t udreg_cache;
 #endif
@@ -893,7 +888,7 @@ static inline int gnix_ops_allowed(struct gnix_fid_ep *ep,
 		   ep->caps, fi_tostr(&ep->caps, FI_TYPE_CAPS));
 
 	if ((flags & FI_RMA) && (flags & FI_READ)) {
-		if (unlikely(!ep->ep_ops.rma_read_allowed)) {
+		if (OFI_UNLIKELY(!ep->ep_ops.rma_read_allowed)) {
 			/* check if read initiate capabilities are allowed */
 			if (caps & FI_RMA) {
 				if (caps & FI_READ) {
@@ -915,7 +910,7 @@ static inline int gnix_ops_allowed(struct gnix_fid_ep *ep,
 		}
 		return 1;
 	} else if ((flags & FI_RMA) && (flags & FI_WRITE)) {
-		if (unlikely(!ep->ep_ops.rma_write_allowed)) {
+		if (OFI_UNLIKELY(!ep->ep_ops.rma_write_allowed)) {
 			/* check if write initiate capabilities are allowed */
 			if (caps & FI_RMA) {
 				if (caps & FI_WRITE) {
@@ -937,7 +932,7 @@ static inline int gnix_ops_allowed(struct gnix_fid_ep *ep,
 		}
 		return 1;
 	} else if ((flags & FI_ATOMICS) && (flags & FI_READ)) {
-		if (unlikely(!ep->ep_ops.atomic_read_allowed)) {
+		if (OFI_UNLIKELY(!ep->ep_ops.atomic_read_allowed)) {
 			/* check if read initiate capabilities are allowed */
 			if (caps & FI_ATOMICS) {
 				if (caps & FI_READ) {
@@ -959,7 +954,7 @@ static inline int gnix_ops_allowed(struct gnix_fid_ep *ep,
 		}
 		return 1;
 	} else if ((flags & FI_ATOMICS) && (flags & FI_WRITE)) {
-		if (unlikely(!ep->ep_ops.atomic_write_allowed)) {
+		if (OFI_UNLIKELY(!ep->ep_ops.atomic_write_allowed)) {
 			/* check if write initiate capabilities are allowed */
 			if (caps & FI_ATOMICS) {
 				if (caps & FI_WRITE) {
@@ -1070,7 +1065,7 @@ static inline int _gnix_req_inject_err(struct gnix_fab_req *req)
 {
 	int err_cnt = req->gnix_ep->domain->params.err_inject_count;
 
-	if (likely(!err_cnt)) {
+	if (OFI_LIKELY(!err_cnt)) {
 		return 0;
 	} else if (err_cnt > 0) {
 		return req->tx_failures < err_cnt;
@@ -1084,7 +1079,7 @@ static inline int _gnix_req_inject_smsg_err(struct gnix_fab_req *req)
 	int err_cnt = req->gnix_ep->domain->params.err_inject_count;
 	int retrans_cnt = req->gnix_ep->domain->params.max_retransmits;
 
-	if (likely(!err_cnt)) {
+	if (OFI_LIKELY(!err_cnt)) {
 		return 0;
 	} else if (retrans_cnt <= err_cnt) {
 		return 1;

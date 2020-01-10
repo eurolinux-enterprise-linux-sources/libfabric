@@ -1,4 +1,4 @@
-.TH "fi_endpoint" "3" "2017\-06\-29" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.5.3"
+.TH "fi_endpoint" "3" "2018\-02\-13" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.6.1"
 .SH NAME
 .PP
 fi_endpoint \- Fabric endpoint operations
@@ -197,6 +197,11 @@ An endpoint that will generate asynchronous completions, either through
 data transfer operations or communication establishment events, must be
 bound to the appropriate completion queues or event queues,
 respectively, before being enabled.
+Additionally, endpoints that use manual progress must be associated with
+relevant completion queues or event queues in order to drive progress.
+For endpoints that are only used as the target of RMA or atomic
+operations, this means binding the endpoint to a completion queue
+associated with receive processing.
 Unconnected endpoints must be bound to an address vector.
 .PP
 Once an endpoint has been activated, it may be associated with an
@@ -354,7 +359,7 @@ completions for all non\-fi_inject calls:
 \f[]
 .fi
 .PP
-An endpoint may also, or instead, be bound to a fabric counter.
+An endpoint may also be bound to a fabric counter.
 When binding an endpoint to a counter, the following flags may be
 specified.
 .PP
@@ -433,12 +438,18 @@ fi_cancel attempts to cancel an outstanding asynchronous operation.
 Canceling an operation causes the fabric provider to search for the
 operation and, if it is still pending, complete it as having been
 canceled.
-An error queue entry will be available in the the associated error queue
+An error queue entry will be available in the associated error queue
 with error code FI_ECANCELED.
 On the other hand, if the operation completed before the call to
 fi_cancel, then the completion status of that operation will be
 available in the associated completion queue.
 No specific entry related to fi_cancel itself will be posted.
+.PP
+Cancel uses the context parameter associated with an operation to
+identify the request to cancel.
+Operations posted without a valid context parameter \-\- either no
+context parameter is specified or the context value was ignored by the
+provider \-\- cannot be canceled.
 If multiple outstanding operations match the context parameter, only one
 will be canceled.
 In this case, the operation which is canceled is provider specific.
@@ -666,6 +677,35 @@ communicate with a remote peer that is using Berkeley
 \f[I]SOCK_DGRAM\f[] sockets using \f[I]IPPROTO_UDP\f[].
 .PP
 \f[I]FI_PROTO_SOCK_TCP\f[] : The protocol is layered over TCP packets.
+.PP
+\f[I]FI_PROTO_IWARP_RDM\f[] : Reliable\-datagram protocol implemented
+over iWarp reliable\-connected queue pairs.
+.PP
+\f[I]FI_PROTO_IB_RDM\f[] : Reliable\-datagram protocol implemented over
+InfiniBand reliable\-connected queue pairs.
+.PP
+\f[I]FI_PROTO_GNI\f[] : Protocol runs over Cray GNI low\-level
+interface.
+.PP
+\f[I]FI_PROTO_RXM\f[] : Reliable\-datagram protocol implemented over
+message endpoints.
+RXM is a libfabric utility component that adds RDM endpoint semantics
+over MSG endpoint semantics.
+.PP
+\f[I]FI_PROTO_RXD\f[] : Reliable\-datagram protocol implemented over
+datagram endpoints.
+RXD is a libfabric utility component that adds RDM endpoint semantics
+over DGRAM endpoint semantics.
+.PP
+\f[I]FI_PROTO_NETWORKDIRECT\f[] : Protocol runs over Microsoft
+NetworkDirect service provider interface.
+This adds reliable\-datagram semantics over the NetworkDirect
+connection\- oriented endpoint semantics.
+.PP
+\f[I]FI_PROTO_PSMX2\f[] : The protocol is based on an Intel proprietary
+protocol known as PSM2, performance scaled messaging version 2.
+PSMX2 is an extended version of the PSM2 protocol to support the
+libfabric interfaces.
 .SS protocol_version \- Protocol Version
 .PP
 Identifies which version of the protocol is employed by the provider.
@@ -1387,6 +1427,16 @@ atomic\-fetch, the source endpoint is also considered a destination
 endpoint.
 This is the default completion mode for such operations.
 .PP
+\f[I]FI_COMMIT_COMPLETE\f[] : Indicates that a completion should not be
+generated (locally or at the peer) until the result of an operation have
+been made persistent.
+A completion guarantees that the result is both available and durable,
+in the case of power failure.
+.PP
+This completion mode applies only to operations that target persistent
+memory regions over reliable endpoints.
+This completion mode is experimental.
+.PP
 \f[I]FI_MULTICAST\f[] : Indicates that data transfers will target
 multicast addresses by default.
 Any fi_addr_t passed into a data transfer operation will be treated as a
@@ -1428,7 +1478,7 @@ However, it can also return provider info structures that exceed
 application requirements.
 As an example, consider an application requesting msg_order as
 FI_ORDER_NONE.
-The resulting output from getinfo may have all the ordering bits set.
+The resulting output from fi_getinfo may have all the ordering bits set.
 The application can reset the ordering bits it does not require before
 creating the endpoint.
 The provider is free to implement a stricter ordering than is required

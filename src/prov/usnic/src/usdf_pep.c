@@ -55,9 +55,9 @@
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-#include "fi.h"
-#include "fi_enosys.h"
-#include "fi_file.h"
+#include "ofi.h"
+#include "ofi_enosys.h"
+#include "ofi_file.h"
 
 #include "fi_ext_usnic.h"
 #include "usnic_direct.h"
@@ -418,8 +418,8 @@ static int usdf_pep_reject(struct fid_pep *fpep, fid_t handle, const void *param
 
 	if (paramlen > USDF_MAX_CONN_DATA) {
 		USDF_WARN_SYS(EP_CTRL,
-				"reject payload size %zu exceeds max %zu\n",
-				paramlen, USDF_MAX_CONN_DATA);
+			      "reject payload size %zu exceeds max %u\n",
+			      paramlen, USDF_MAX_CONN_DATA);
 		return -FI_EINVAL;
 	}
 

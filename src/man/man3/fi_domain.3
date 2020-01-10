@@ -1,5 +1,5 @@
 .\"t
-.TH "fi_domain" "3" "2017\-07\-25" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.5.3"
+.TH "fi_domain" "3" "2018\-02\-13" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.6.1"
 .SH NAME
 .PP
 fi_domain \- Open a fabric access domain
@@ -194,8 +194,8 @@ different data flows.
 intended for providers that make use of manual progress.
 Applications must serialize access to all objects that are associated
 through the use of having a shared completion structure.
-This includes endpoint, completion queue, counter, wait set, and poll
-set objects.
+This includes endpoint, transmit context, receive context, completion
+queue, counter, wait set, and poll set objects.
 .PP
 For example, threads must serialize access to an endpoint and its bound
 completion queue(s) and/or counters.
@@ -231,6 +231,11 @@ progress on data transfer operations.
 This includes message queue, RMA, tagged messaging, and atomic
 operations, along with their completion processing.
 .PP
+Progress frequently requires action being taken at both the transmitting
+and receiving sides of an operation.
+This is often a requirement for reliable transfers, as a result of retry
+and acknowledgement processing.
+.PP
 To balance between performance and ease of use, two progress models are
 defined.
 .PP
@@ -265,6 +270,15 @@ Only wait operations defined by the fabric interface will result in an
 operation progressing.
 Operating system or external wait functions, such as select, poll, or
 pthread routines, cannot.
+.PP
+Manual progress requirements not only apply to endpoints that initiate
+transmit operations, but also to endpoints that may be the target of
+such operations.
+This holds true even if the target endpoint will not generate completion
+events for the operations.
+For example, an endpoint that acts purely as the target of RMA or atomic
+operations that uses manual progress may still need application
+assistance to process received operations.
 .SS Resource Management (resource_mgmt)
 .PP
 Resource management (RM) is provider and protocol support to protect
@@ -574,6 +588,9 @@ a registered memory region may have been updated.
 with completion counters must be explicitly enabled after being bound to
 any counter.
 .PP
+\f[I]FI_MR_ENDPOINT\f[] : Memory registration occurs at the endpoint
+level, rather than domain.
+.PP
 \f[I]FI_MR_UNSPEC\f[] : Defined for compatibility \-\- library versions
 1.4 and earlier.
 Setting mr_mode to 0 indicates that FI_MR_BASIC or FI_MR_SCALABLE are
@@ -747,7 +764,8 @@ This value corresponds to the err_data_size field in struct
 fi_cq_err_entry and struct fi_eq_err_entry.
 .SS Memory Regions Count (mr_cnt)
 .PP
-The optimal number of memory regions supported by the domain.
+The optimal number of memory regions supported by the domain, or
+endpoint if the mr_mode FI_MR_ENDPOINT bit has been set.
 The mr_cnt value may be a fixed value of the maximum number of MRs
 supported by the underlying hardware, or may be a dynamic value, based
 on the default attributes of the domain, such as the supported memory

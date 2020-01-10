@@ -1,4 +1,4 @@
-.TH "fi_msg" "3" "2017\-06\-06" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.5.3"
+.TH "fi_msg" "3" "2018\-01\-08" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.6.1"
 .SH NAME
 .PP
 fi_msg \- Message data transfer operations
@@ -28,7 +28,7 @@ ssize_t\ fi_recvv(struct\ fid_ep\ *ep,\ const\ struct\ iovec\ *iov,\ void\ **des
 ssize_t\ fi_recvmsg(struct\ fid_ep\ *ep,\ const\ struct\ fi_msg\ *msg,
 \ \ \ \ uint64_t\ flags);
 
-ssize_t\ fi_send(struct\ fid_ep\ *ep,\ void\ *buf,\ size_t\ len,
+ssize_t\ fi_send(struct\ fid_ep\ *ep,\ const\ void\ *buf,\ size_t\ len,
 \ \ \ \ void\ *desc,\ fi_addr_t\ dest_addr,\ void\ *context);
 
 ssize_t\ fi_sendv(struct\ fid_ep\ *ep,\ const\ struct\ iovec\ *iov,
@@ -37,13 +37,13 @@ ssize_t\ fi_sendv(struct\ fid_ep\ *ep,\ const\ struct\ iovec\ *iov,
 ssize_t\ fi_sendmsg(struct\ fid_ep\ *ep,\ const\ struct\ fi_msg\ *msg,
 \ \ \ \ uint64_t\ flags);
 
-ssize_t\ fi_inject(struct\ fid_ep\ *ep,\ void\ *buf,\ size_t\ len,
+ssize_t\ fi_inject(struct\ fid_ep\ *ep,\ const\ void\ *buf,\ size_t\ len,
 \ \ \ \ fi_addr_t\ dest_addr);
 
-ssize_t\ fi_senddata(struct\ fid_ep\ *ep,\ void\ *buf,\ size_t\ len,
+ssize_t\ fi_senddata(struct\ fid_ep\ *ep,\ const\ void\ *buf,\ size_t\ len,
 \ \ \ \ void\ *desc,\ uint64_t\ data,\ fi_addr_t\ dest_addr,\ void\ *context);
 
-ssize_t\ fi_injectdata(struct\ fid_ep\ *ep,\ void\ *buf,\ size_t\ len,
+ssize_t\ fi_injectdata(struct\ fid_ep\ *ep,\ const\ void\ *buf,\ size_t\ len,
 \ \ \ \ uint64_t\ data,\ fi_addr_t\ dest_addr);
 \f[]
 .fi
@@ -258,8 +258,15 @@ been processed by the destination.
 .PP
 \f[I]FI_FENCE\f[] : Applies to transmits.
 Indicates that the requested operation, also known as the fenced
-operation, be deferred until all previous operations targeting the same
-target endpoint have completed.
+operation, and any operation posted after the fenced operation will be
+deferred until all previous operations targeting the same peer endpoint
+have completed.
+Operations posted after the fencing will see and/or replace the results
+of any operations initiated prior to the fenced operation.
+.PP
+The ordering of operations starting at the posting of the fenced
+operation (inclusive) to the posting of a subsequent fenced operation
+(exclusive) is controlled by the endpoint\[aq]s ordering semantics.
 .PP
 \f[I]FI_MULTICAST\f[] : Applies to transmits.
 This flag indicates that the address specified as the data transfer

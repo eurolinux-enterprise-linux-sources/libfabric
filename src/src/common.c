@@ -50,11 +50,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include <fi_signal.h>
+#include <ofi_signal.h>
 #include <rdma/providers/fi_prov.h>
 #include <rdma/fi_errno.h>
-#include <fi.h>
-#include <fi_util.h>
+#include <ofi.h>
+#include <ofi_util.h>
 
 struct fi_provider core_prov = {
 	.name = "core",
@@ -75,24 +75,28 @@ int fi_poll_fd(int fd, int timeout)
 	fds.fd = fd;
 	fds.events = POLLIN;
 	ret = poll(&fds, 1, timeout);
-	return ret == -1 ? -errno : ret;
+	return ret == SOCKET_ERROR ? -ofi_sockerr() : ret;
 }
 
-uint64_t fi_tag_bits(uint64_t mem_tag_format)
+uint64_t ofi_max_tag(uint64_t mem_tag_format)
 {
-	return UINT64_MAX >> (ffsll(htonll(mem_tag_format)) -1);
+	return mem_tag_format ? UINT64_MAX >> (64 - ofi_msb(mem_tag_format)) : 0;
 }
 
-uint64_t fi_tag_format(uint64_t tag_bits)
+uint64_t ofi_tag_format(uint64_t max_tag)
 {
-	return FI_TAG_GENERIC >> (ffsll(htonll(tag_bits)) - 1);
+	return max_tag ? FI_TAG_GENERIC >> (64 - ofi_msb(max_tag)) : 0;
 }
 
-int fi_size_bits(uint64_t num)
+uint8_t ofi_msb(uint64_t num)
 {
-	int size_bits = 0;
-	while (num >> ++size_bits);
-	return size_bits;
+	uint8_t msb = 0;
+
+	while (num) {
+		msb++;
+		num >>= 1;
+	}
+	return msb;
 }
 
 int ofi_send_allowed(uint64_t caps)
@@ -186,6 +190,17 @@ int ofi_ep_bind_valid(const struct fi_provider *prov, struct fid *bfid, uint64_t
 	return FI_SUCCESS;
 }
 
+int ofi_check_rx_mode(const struct fi_info *info, uint64_t flags)
+{
+	if (!info)
+		return 0;
+
+	if (info->rx_attr && (info->rx_attr->mode & flags))
+		return 1;
+
+	return (info->mode & flags) ? 1 : 0;
+}
+
 uint64_t fi_gettime_ms(void)
 {
 	struct timeval now;
@@ -270,6 +285,19 @@ sa_sin6:
 	case FI_ADDR_MLX:
 		size = snprintf(buf, *len, "fi_addr_mlx://%p", addr);
 		break;
+	case FI_ADDR_IB_UD:
+		memset(str, 0, sizeof(str));
+		if (!inet_ntop(AF_INET6, addr, str, INET6_ADDRSTRLEN))
+			return NULL;
+		size = snprintf(buf, *len, "fi_addr_ib_ud://"
+				"%s" /* GID */ ":%" PRIx32 /* QPN */
+				"/%" PRIx16 /* LID */ "/%" PRIx16 /* P_Key */
+				"/%" PRIx8 /* SL */,
+				str, *((uint32_t *)addr + 4),
+				*((uint16_t *)addr + 10),
+				*((uint16_t *)addr + 11),
+				*((uint8_t *)addr + 26));
+		break;
 	case FI_ADDR_STR:
 		size = snprintf(buf, *len, "%s", (const char *) addr);
 		break;
@@ -310,6 +338,8 @@ static uint32_t ofi_addr_format(const char *str)
 		return FI_ADDR_BGQ;
 	else if (!strcasecmp(fmt, "fi_addr_mlx"))
 		return FI_ADDR_MLX;
+	else if (!strcasecmp(fmt, "fi_addr_ib_ud"))
+		return FI_ADDR_IB_UD;
 
 	return FI_FORMAT_UNSPEC;
 }
@@ -319,7 +349,8 @@ static int ofi_str_to_psmx(const char *str, void **addr, size_t *len)
 	int ret;
 
 	*len = sizeof(uint64_t);
-	if (!(*addr = calloc(1, *len)))
+	*addr = calloc(1, *len);
+	if (!(*addr))
 		return -FI_ENOMEM;
 
 	ret = sscanf(str, "%*[^:]://%" SCNx64, (uint64_t *) *addr);
@@ -335,13 +366,41 @@ static int ofi_str_to_psmx2(const char *str, void **addr, size_t *len)
 	int ret;
 
 	*len = 2 * sizeof(uint64_t);
-	if (!(*addr = calloc(1, *len)))
+	*addr = calloc(1, *len);
+	if (!(*addr))
 		return -FI_ENOMEM;
 
 	ret = sscanf(str, "%*[^:]://%" SCNx64 ":%" SCNx64,
 		     (uint64_t *) *addr, (uint64_t *) *addr + 1);
 	if (ret == 2)
 		return 0;
+
+	free(*addr);
+	return -FI_EINVAL;
+}
+
+static int ofi_str_to_ib_ud(const char *str, void **addr, size_t *len)
+{
+	int ret;
+	char gid[INET6_ADDRSTRLEN];
+
+	memset(gid, 0, sizeof(gid));
+
+	*len = 32;
+	*addr = calloc(1, *len);
+	if(!(*addr))
+		return -FI_ENOMEM;
+
+	ret = sscanf(str, "%*[^:]://"
+		     "%s" /* GID */ ":%" SCNx32 /* QPN */
+		     ":%" SCNx16 /* LID */ ":%" SCNx16 /* P_Key */
+		     ":%" SCNx8 /* SL */,
+		     gid, (uint32_t *)*addr + 4,
+		     (uint16_t *)*addr + 10,
+		     (uint16_t *)*addr + 11,
+		     (uint8_t *)*addr + 26);
+	if ((ret == 5) && (inet_pton(AF_INET6, gid, *addr) > 0))
+		return FI_SUCCESS;
 
 	free(*addr);
 	return -FI_EINVAL;
@@ -354,7 +413,8 @@ static int ofi_str_to_sin(const char *str, void **addr, size_t *len)
 	int ret;
 
 	*len = sizeof(*sin);
-	if (!(sin = calloc(1, *len)))
+	sin = calloc(1, *len);
+	if (!sin)
 		return -FI_ENOMEM;
 
 	sin->sin_family = AF_INET;
@@ -393,7 +453,8 @@ static int ofi_str_to_sin6(const char *str, void **addr, size_t *len)
 	int ret;
 
 	*len = sizeof(*sin6);
-	if (!(sin6 = calloc(1, *len)))
+	sin6 = calloc(1, *len);
+	if (!sin6)
 		return -FI_ENOMEM;
 
 	sin6->sin6_family = AF_INET6;
@@ -441,6 +502,8 @@ int ofi_str_toaddr(const char *str, uint32_t *addr_format,
 		return ofi_str_to_psmx(str, addr, len);
 	case FI_ADDR_PSMX2:
 		return ofi_str_to_psmx2(str, addr, len);
+	case FI_ADDR_IB_UD:
+		return ofi_str_to_ib_ud(str, addr, len);
 	case FI_SOCKADDR_IB:
 	case FI_ADDR_GNI:
 	case FI_ADDR_BGQ:
@@ -448,8 +511,6 @@ int ofi_str_toaddr(const char *str, uint32_t *addr_format,
 	default:
 		return -FI_ENOSYS;
 	}
-
-	return 0;
 }
 
 const char *ofi_hex_str(const uint8_t *data, size_t len)
@@ -495,6 +556,52 @@ int ofi_addr_cmp(const struct fi_provider *prov, const struct sockaddr *sa1,
 		FI_WARN(prov, FI_LOG_FABRIC, "Invalid address format!\n");
 		assert(0);
 		return 0;
+	}
+}
+
+int ofi_is_only_src_port_set(const char *node, const char *service,
+			     uint64_t flags, const struct fi_info *hints)
+{
+	if (node)
+		return 0;
+
+	if (hints) {
+		if (hints->dest_addr)
+			return 0;
+
+		if (!hints->src_addr)
+			goto out;
+
+		switch (ofi_sa_family(hints->src_addr)) {
+		case AF_INET:
+			return (ofi_ipv4_is_any_addr(hints->src_addr) &&
+				ofi_sin_port(hints->src_addr));
+		case AF_INET6:
+			return (ofi_ipv6_is_any_addr(hints->src_addr) &&
+				ofi_sin6_port(hints->src_addr));
+		default:
+			FI_WARN(&core_prov, FI_LOG_CORE, "Unknown address format\n");
+			return 0;
+		}
+	}
+out:
+	return ((flags & FI_SOURCE) && service) ? 1 : 0;
+}
+
+void ofi_straddr_log_internal(const char *func, int line,
+			      const struct fi_provider *prov,
+			      enum fi_log_level level,
+			      enum fi_log_subsys subsys, char *log_str,
+			      const void *addr)
+{
+	char buf[OFI_ADDRSTRLEN];
+	uint32_t addr_format;
+	size_t len = sizeof(buf);
+
+	if (fi_log_enabled(prov, level, subsys)) {
+		addr_format = ofi_translate_addr_format(ofi_sa_family(addr));
+		fi_log(prov, level, subsys, func, line, "%s: %s\n", log_str,
+		       ofi_straddr(buf, &len, addr_format, addr));
 	}
 }
 
@@ -547,26 +654,31 @@ int fi_epoll_del(struct fi_epoll *ep, int fd)
 	return -FI_EINVAL;
 }
 
-void *fi_epoll_wait(struct fi_epoll *ep, int timeout)
+int fi_epoll_wait(struct fi_epoll *ep, void **contexts, int max_contexts,
+                  int timeout)
 {
 	int i, ret;
+	int found = 0;
 
 	ret = poll(ep->fds, ep->nfds, timeout);
-	if (ret <= 0)
-		return NULL;
+	if (ret == SOCKET_ERROR)
+		return -ofi_sockerr();
+	else if (ret == 0)
+		return 0;
 
-	for (i = ep->index; i < ep->nfds; i++) {
-		if (ep->fds[i].revents)
-			goto found;
+	for (i = ep->index; i < ep->nfds && found < max_contexts; i++) {
+		if (ep->fds[i].revents) {
+			contexts[found++] = ep->context[i];
+			ep->index = i;
+		}
 	}
-	for (i = 0; i < ep->index; i++) {
-		if (ep->fds[i].revents)
-			goto found;
+	for (i = 0; i < ep->index && found < max_contexts; i++) {
+		if (ep->fds[i].revents) {
+			contexts[found++] = ep->context[i];
+			ep->index = i;
+		}
 	}
-	return NULL;
-found:
-	ep->index = i;
-	return ep->context[i];
+	return found;
 }
 
 void fi_epoll_close(struct fi_epoll *ep)
@@ -610,3 +722,15 @@ int ofi_getifaddrs(struct ifaddrs **ifaddr)
 }
 
 #endif
+
+int ofi_cpu_supports(unsigned func, unsigned reg, unsigned bit)
+{
+	unsigned cpuinfo[4] = { 0 };
+
+	ofi_cpuid(0, 0, cpuinfo);
+	if (cpuinfo[0] < func)
+		return 0;
+
+	ofi_cpuid(func, 0, cpuinfo);
+	return cpuinfo[reg] & bit;
+}

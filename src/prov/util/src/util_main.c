@@ -34,8 +34,8 @@
 #include <string.h>
 #include <sys/time.h>
 
-#include <fi_util.h>
-#include <fi.h>
+#include <ofi_util.h>
+#include <ofi.h>
 
 static DEFINE_LIST(fabric_list);
 extern struct ofi_common_locks common_locks;
@@ -124,7 +124,7 @@ void fid_list_remove(struct dlist_entry *fid_list, fastlock_t *lock,
 	}
 }
 
-int util_find_domain(struct dlist_entry *item, const void *arg)
+static int util_find_domain(struct dlist_entry *item, const void *arg)
 {
 	const struct util_domain *domain;
 	const struct fi_info *info = arg;
@@ -140,7 +140,7 @@ int util_find_domain(struct dlist_entry *item, const void *arg)
 
 int util_getinfo(const struct util_prov *util_prov, uint32_t version,
 		 const char *node, const char *service, uint64_t flags,
-		 struct fi_info *hints, struct fi_info **info)
+		 const struct fi_info *hints, struct fi_info **info)
 {
 	struct util_fabric *fabric;
 	struct util_domain *domain;

@@ -56,7 +56,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 
-#include <fi_mem.h>
+#include <ofi_mem.h>
 #include "sock.h"
 #include "sock_util.h"
 
@@ -132,7 +132,7 @@ static inline void sock_pe_discard_field(struct sock_pe_entry *pe_entry)
 	if (!pe_entry->rem)
 		goto out;
 
-	SOCK_LOG_DBG("Remaining for %p: %ld\n", pe_entry, pe_entry->rem);
+	SOCK_LOG_DBG("Remaining for %p: %" PRId64 "\n", pe_entry, pe_entry->rem);
 	ret = sock_comm_discard(pe_entry, pe_entry->rem);
 	SOCK_LOG_DBG("Discarded %ld\n", ret);
 
@@ -192,6 +192,7 @@ static void sock_pe_release_entry(struct sock_pe *pe,
 	pe_entry->flags = 0;
 	pe_entry->context = 0L;
 	pe_entry->mr_checked = 0;
+	pe_entry->completion_reported = 0;
 
 	dlist_remove(&pe_entry->entry);
 	dlist_insert_head(&pe_entry->entry, &pe->free_list);
@@ -256,6 +257,9 @@ static void sock_pe_report_send_completion(struct sock_pe_entry *pe_entry)
 {
 	struct sock_triggered_context *trigger_context;
 
+	if (pe_entry->completion_reported)
+		return;
+
 	if (!(pe_entry->flags & SOCK_TRIGGERED_OP)) {
 		sock_pe_report_send_cq_completion(pe_entry);
 		if (pe_entry->comp->send_cntr)
@@ -264,6 +268,7 @@ static void sock_pe_report_send_completion(struct sock_pe_entry *pe_entry)
 		trigger_context = (void *) (uintptr_t) pe_entry->context;
 		fi_cntr_add(trigger_context->trigger.work.completion_cntr, 1);
 	}
+	pe_entry->completion_reported = 1;
 }
 
 static void sock_pe_report_recv_cq_completion(struct sock_pe_entry *pe_entry)
@@ -292,6 +297,9 @@ static void sock_pe_report_recv_completion(struct sock_pe_entry *pe_entry)
 {
 	struct sock_triggered_context *trigger_context;
 
+	if (pe_entry->completion_reported)
+		return;
+
 	if (!(pe_entry->flags & SOCK_TRIGGERED_OP)) {
 		sock_pe_report_recv_cq_completion(pe_entry);
 		if (pe_entry->comp->recv_cntr)
@@ -300,6 +308,7 @@ static void sock_pe_report_recv_completion(struct sock_pe_entry *pe_entry)
 		trigger_context = (void *) (uintptr_t) pe_entry->context;
 		fi_cntr_add(trigger_context->trigger.work.completion_cntr, 1);
 	}
+	pe_entry->completion_reported = 1;
 }
 
 static void sock_pe_report_mr_completion(struct sock_domain *domain,
@@ -310,7 +319,8 @@ static void sock_pe_report_mr_completion(struct sock_domain *domain,
 
 	for (i = 0; i < pe_entry->msg_hdr.dest_iov_len; i++) {
 		fastlock_acquire(&domain->lock);
-		mr = ofi_mr_get(&domain->mr_map, pe_entry->pe.rx.rx_iov[i].iov.key);
+		mr = ofi_mr_map_get(&domain->mr_map,
+				    pe_entry->pe.rx.rx_iov[i].iov.key);
 		fastlock_release(&domain->lock);
 		if (!mr || (!mr->cq && !mr->cntr))
 			continue;
@@ -345,6 +355,9 @@ static void sock_pe_report_write_completion(struct sock_pe_entry *pe_entry)
 {
 	struct sock_triggered_context *trigger_context;
 
+	if (pe_entry->completion_reported)
+		return;
+
 	if (!(pe_entry->flags & SOCK_NO_COMPLETION))
 		sock_pe_report_send_cq_completion(pe_entry);
 
@@ -355,6 +368,7 @@ static void sock_pe_report_write_completion(struct sock_pe_entry *pe_entry)
 		trigger_context = (void *) (uintptr_t) pe_entry->context;
 		fi_cntr_add(trigger_context->trigger.work.completion_cntr, 1);
 	}
+	pe_entry->completion_reported = 1;
 }
 
 static void sock_pe_report_remote_read(struct sock_rx_ctx *rx_ctx,
@@ -375,6 +389,9 @@ static void sock_pe_report_read_completion(struct sock_pe_entry *pe_entry)
 {
 	struct sock_triggered_context *trigger_context;
 
+	if (pe_entry->completion_reported)
+		return;
+
 	if (!(pe_entry->flags & SOCK_NO_COMPLETION))
 		sock_pe_report_send_cq_completion(pe_entry);
 
@@ -385,44 +402,61 @@ static void sock_pe_report_read_completion(struct sock_pe_entry *pe_entry)
 		trigger_context = (void *) (uintptr_t) pe_entry->context;
 		fi_cntr_add(trigger_context->trigger.work.completion_cntr, 1);
 	}
+	pe_entry->completion_reported = 1;
 }
 
 static void sock_pe_report_rx_error(struct sock_pe_entry *pe_entry, int rem, int err)
 {
+	if (pe_entry->completion_reported)
+		return;
+
 	if (pe_entry->comp->recv_cntr)
 		fi_cntr_adderr(&pe_entry->comp->recv_cntr->cntr_fid, 1);
 	if (pe_entry->comp->recv_cq)
 		sock_cq_report_error(pe_entry->comp->recv_cq, pe_entry, rem,
 				     err, -err, NULL, 0);
+	pe_entry->completion_reported = 1;
 }
 
 static void sock_pe_report_tx_error(struct sock_pe_entry *pe_entry, int rem, int err)
 {
+	if (pe_entry->completion_reported)
+		return;
+
 	if (pe_entry->comp->send_cntr)
 		fi_cntr_adderr(&pe_entry->comp->send_cntr->cntr_fid, 1);
 	if (pe_entry->comp->send_cq)
 		sock_cq_report_error(pe_entry->comp->send_cq, pe_entry, rem,
 				     err, -err, NULL, 0);
+	pe_entry->completion_reported = 1;
 }
 
 static void sock_pe_report_tx_rma_read_err(struct sock_pe_entry *pe_entry,
 						int err)
 {
+	if (pe_entry->completion_reported)
+		return;
+
 	if (pe_entry->comp->read_cntr)
 		fi_cntr_adderr(&pe_entry->comp->read_cntr->cntr_fid, 1);
 	if (pe_entry->comp->send_cq)
 		sock_cq_report_error(pe_entry->comp->send_cq, pe_entry, 0,
 				     err, -err, NULL, 0);
+	pe_entry->completion_reported = 1;
 }
 
 static void sock_pe_report_tx_rma_write_err(struct sock_pe_entry *pe_entry,
 						int err)
 {
+	if (pe_entry->completion_reported)
+		return;
+
 	if (pe_entry->comp->write_cntr)
 		fi_cntr_adderr(&pe_entry->comp->write_cntr->cntr_fid, 1);
 	if (pe_entry->comp->send_cq)
 		sock_cq_report_error(pe_entry->comp->send_cq, pe_entry, 0,
 			 	     err, -err, NULL, 0);
+	pe_entry->completion_reported = 1;
 }
 
 static void sock_pe_progress_pending_ack(struct sock_pe *pe,
@@ -731,7 +765,10 @@ static int sock_pe_process_rx_read(struct sock_pe *pe,
 	pe_entry->buf = pe_entry->pe.rx.rx_iov[0].iov.addr;
 	pe_entry->data_len = data_len;
 	pe_entry->flags |= (FI_RMA | FI_REMOTE_READ);
-	sock_pe_report_remote_read(rx_ctx, pe_entry);
+	if (!pe_entry->completion_reported) {
+		sock_pe_report_remote_read(rx_ctx, pe_entry);
+		pe_entry->completion_reported = 1;
+	}
 	sock_pe_send_response(pe, rx_ctx, pe_entry, data_len,
 			      SOCK_OP_READ_COMPLETE, 0);
 	return 0;
@@ -791,6 +828,12 @@ static int sock_pe_process_rx_write(struct sock_pe *pe,
 	pe_entry->data_len = 0;
 	for (i = 0; i < pe_entry->msg_hdr.dest_iov_len; i++) {
 		pe_entry->data_len += pe_entry->pe.rx.rx_iov[i].iov.len;
+		if ((pe_entry->msg_hdr.flags & FI_COMMIT_COMPLETE) &&
+		    ofi_pmem_commit) {
+			(*ofi_pmem_commit)((const void *) (uintptr_t)
+					   pe_entry->pe.rx.rx_iov[i].iov.addr,
+					   pe_entry->pe.rx.rx_iov[i].iov.len);
+		}
 	}
 
 	/* report error, if any */
@@ -801,8 +844,11 @@ static int sock_pe_process_rx_write(struct sock_pe *pe,
 
 out:
 	pe_entry->flags |= (FI_RMA | FI_REMOTE_WRITE);
-	sock_pe_report_remote_write(rx_ctx, pe_entry);
-	sock_pe_report_mr_completion(rx_ctx->domain, pe_entry);
+	if (!pe_entry->completion_reported) {
+		sock_pe_report_remote_write(rx_ctx, pe_entry);
+		sock_pe_report_mr_completion(rx_ctx->domain, pe_entry);
+		pe_entry->completion_reported = 1;
+	}
 	sock_pe_send_response(pe, rx_ctx, pe_entry, 0,
 			      SOCK_OP_WRITE_COMPLETE, 0);
 	return ret;
@@ -951,8 +997,12 @@ static int sock_pe_process_rx_atomic(struct sock_pe *pe,
 		pe_entry->flags |= FI_REMOTE_READ;
 	else
 		pe_entry->flags |= FI_REMOTE_WRITE;
-	sock_pe_report_remote_write(rx_ctx, pe_entry);
-	sock_pe_report_mr_completion(rx_ctx->domain, pe_entry);
+
+	if (!pe_entry->completion_reported) {
+		sock_pe_report_remote_write(rx_ctx, pe_entry);
+		sock_pe_report_mr_completion(rx_ctx->domain, pe_entry);
+		pe_entry->completion_reported = 1;
+	}
 	sock_pe_send_response(pe, rx_ctx, pe_entry,
 			      pe_entry->pe.rx.rx_op.atomic.res_iov_len ?
 			      entry_len : 0, SOCK_OP_ATOMIC_COMPLETE, 0);
@@ -1164,11 +1214,13 @@ static int sock_pe_progress_buffered_rx(struct sock_rx_ctx *rx_ctx)
 		rem = rx_buffered->iov[0].iov.len;
 		rx_ctx->buffered_len -= rem;
 		used_len = rx_posted->used;
-		pe_entry.data_len = 0;
-		pe_entry.buf = 0L;
+		memset(&pe_entry, 0, sizeof(pe_entry));
 		for (i = 0; i < rx_posted->rx_op.dest_iov_len && rem > 0; i++) {
-			if (used_len >= rx_posted->rx_op.dest_iov_len) {
-				used_len -= rx_posted->rx_op.dest_iov_len;
+			/* Try to find the first iovec entry where the data
+			 * has not been consumed. In the common case, there
+			 * is only one iovec, i.e. a single buffer */
+			if (used_len >= rx_posted->iov[i].iov.len) {
+				used_len -= rx_posted->iov[i].iov.len;
 				continue;
 			}
 
@@ -1226,6 +1278,11 @@ static int sock_pe_progress_buffered_rx(struct sock_rx_ctx *rx_ctx)
 		} else {
 			sock_pe_report_recv_completion(&pe_entry);
 		}
+
+		/* Mark that we are done processing the posted recv buff.
+		 * This allows another thread to grab it when calling
+		 * sock_rx_get_entry() */
+		rx_posted->is_busy = 0;
 
 		dlist_remove(&rx_buffered->entry);
 		sock_rx_release_entry(rx_buffered);
@@ -2013,6 +2070,7 @@ static void sock_pe_new_rx_entry(struct sock_pe *pe, struct sock_rx_ctx *rx_ctx,
 	pe_entry->ep_attr = ep_attr;
 	pe_entry->is_complete = 0;
 	pe_entry->done_len = 0;
+	pe_entry->completion_reported = 0;
 
 	if (ep_attr->ep_type == FI_EP_MSG || !ep_attr->av)
 		pe_entry->addr = FI_ADDR_NOTAVAIL;
@@ -2050,6 +2108,7 @@ static int sock_pe_new_tx_entry(struct sock_pe *pe, struct sock_tx_ctx *tx_ctx)
 	pe_entry->conn = NULL;
 	pe_entry->ep_attr = tx_ctx->ep_attr;
 	pe_entry->pe.tx.tx_ctx = tx_ctx;
+	pe_entry->completion_reported = 0;
 
 	dlist_insert_tail(&pe_entry->ctx_entry, &tx_ctx->pe_entry_list);
 
@@ -2224,17 +2283,16 @@ void sock_pe_signal(struct sock_pe *pe)
 void sock_pe_poll_add(struct sock_pe *pe, int fd)
 {
         fastlock_acquire(&pe->signal_lock);
-        if (sock_epoll_add(&pe->epoll_set, fd))
-                SOCK_LOG_ERROR("failed to add to epoll set: %d, size: %d, used: %d\n", fd, pe->epoll_set.size, pe->epoll_set.used);
+        if (fi_epoll_add(pe->epoll_set, fd, NULL))
+			SOCK_LOG_ERROR("failed to add to epoll set: %d\n", fd);
         fastlock_release(&pe->signal_lock);
 }
 
 void sock_pe_poll_del(struct sock_pe *pe, int fd)
 {
         fastlock_acquire(&pe->signal_lock);
-        if (sock_epoll_del(&pe->epoll_set, fd))
-                SOCK_LOG_DBG("failed to del from epoll set: %d, size: %d, used: %d\n",
-			       fd, pe->epoll_set.size, pe->epoll_set.used);
+        if (fi_epoll_del(pe->epoll_set, fd))
+			SOCK_LOG_DBG("failed to del from epoll set: %d\n", fd);
         fastlock_release(&pe->signal_lock);
 }
 
@@ -2289,32 +2347,42 @@ void sock_pe_remove_rx_ctx(struct sock_rx_ctx *rx_ctx)
 	pthread_mutex_unlock(&rx_ctx->domain->pe->list_lock);
 }
 
-static int sock_pe_progress_rx_ep(struct sock_pe *pe, struct sock_ep_attr *ep_attr,
-					struct sock_rx_ctx *rx_ctx)
+static int sock_pe_progress_rx_ep(struct sock_pe *pe,
+				  struct sock_ep_attr *ep_attr,
+				  struct sock_rx_ctx *rx_ctx)
 {
-	int ret = 0, i, fd, num_fds;
+	int i, num_fds;
 	struct sock_conn *conn;
 	struct sock_conn_map *map;
 
 	map = &ep_attr->cmap;
 
-        if (!map->used)
-                return 0;
+	if (!map->used)
+		return 0;
 
-        num_fds = sock_epoll_wait(&map->epoll_set, 0);
-        if (num_fds < 0 || num_fds == 0) {
-                if (num_fds < 0)
-                        SOCK_LOG_ERROR("poll failed: %s\n", strerror(errno));
-                return num_fds;
-        }
+	if (map->epoll_ctxs_sz < map->used) {
+		uint64_t new_size = map->used * 2;
+		void *ctxs;
+
+		ctxs = realloc(map->epoll_ctxs,
+			       sizeof(*map->epoll_ctxs) * new_size);
+		if (ctxs) {
+			map->epoll_ctxs = ctxs;
+			map->epoll_ctxs_sz = new_size;
+		}
+	}
+
+	num_fds = fi_epoll_wait(map->epoll_set, map->epoll_ctxs,
+	                        MIN(map->used, map->epoll_ctxs_sz), 0);
+	if (num_fds < 0 || num_fds == 0) {
+		if (num_fds < 0)
+			SOCK_LOG_ERROR("epoll failed: %d\n", num_fds);
+		return num_fds;
+	}
 
 	fastlock_acquire(&map->lock);
 	for (i = 0; i < num_fds; i++) {
-		fd = sock_epoll_get_fd_at_index(&map->epoll_set, i);
-		if (fd == -1) /* failed to lookup fd due to connection failures */
-			continue;
-
-		conn = ofi_idm_lookup(&ep_attr->conn_idm, fd);
+		conn = map->epoll_ctxs[i];
 		if (!conn)
 			SOCK_LOG_ERROR("ofi_idm_lookup failed\n");
 
@@ -2323,9 +2391,9 @@ static int sock_pe_progress_rx_ep(struct sock_pe *pe, struct sock_ep_attr *ep_at
 
 		sock_pe_new_rx_entry(pe, rx_ctx, ep_attr, conn);
 	}
-
 	fastlock_release(&map->lock);
-	return ret;
+
+	return 0;
 }
 
 int sock_pe_progress_rx_ctx(struct sock_pe *pe, struct sock_rx_ctx *rx_ctx)
@@ -2371,6 +2439,40 @@ out:
 		SOCK_LOG_ERROR("failed to progress RX ctx\n");
 	fastlock_release(&pe->lock);
 	return ret;
+}
+
+int sock_pe_progress_ep_rx(struct sock_pe *pe, struct sock_ep_attr *ep_attr)
+{
+	struct sock_rx_ctx *rx_ctx;
+	int ret, i;
+
+	for (i = 0; i < ep_attr->ep_attr.rx_ctx_cnt; i++) {
+		rx_ctx = ep_attr->rx_array[i];
+		if (!rx_ctx)
+			continue;
+
+		ret = sock_pe_progress_rx_ctx(pe, rx_ctx);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
+}
+
+int sock_pe_progress_ep_tx(struct sock_pe *pe, struct sock_ep_attr *ep_attr)
+{
+	struct sock_tx_ctx *tx_ctx;
+	int ret, i;
+
+	for (i = 0; i < ep_attr->ep_attr.tx_ctx_cnt; i++) {
+		tx_ctx = ep_attr->tx_array[i];
+		if (!tx_ctx)
+			continue;
+
+		ret = sock_pe_progress_tx_ctx(pe, tx_ctx);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
 }
 
 void sock_pe_progress_rx_ctrl_ctx(struct sock_pe *pe, struct sock_rx_ctx *rx_ctx,
@@ -2479,10 +2581,11 @@ static void sock_pe_wait(struct sock_pe *pe)
 {
 	char tmp;
 	int ret;
+	void *ep_contexts[1];
 
-	ret = sock_epoll_wait(&pe->epoll_set, -1);
-        if (ret < 0)
-                SOCK_LOG_ERROR("poll failed : %s\n", strerror(errno));
+	ret = fi_epoll_wait(pe->epoll_set, ep_contexts, 1, -1);
+	if (ret < 0)
+		SOCK_LOG_ERROR("poll failed : %s\n", strerror(ofi_sockerr()));
 
 	fastlock_acquire(&pe->signal_lock);
 	if (pe->rcnt != pe->wcnt) {
@@ -2495,61 +2598,17 @@ static void sock_pe_wait(struct sock_pe *pe)
 	pe->waittime = fi_gettime_ms();
 }
 
-#if !defined __APPLE__ && !defined _WIN32
-static void sock_thread_set_affinity(char *s)
-{
-	char *saveptra = NULL, *saveptrb = NULL, *saveptrc = NULL;
-	char *a, *b, *c;
-	int j, first, last, stride;
-	cpu_set_t mycpuset;
-	pthread_t mythread;
-
-	mythread = pthread_self();
-	CPU_ZERO(&mycpuset);
-
-	a = strtok_r(s, ",", &saveptra);
-	while (a) {
-		first = last = -1;
-		stride = 1;
-		b = strtok_r(a, "-", &saveptrb);
-		assert(b);
-		first = atoi(b);
-		/* Check for range delimiter */
-		b = strtok_r(NULL, "-", &saveptrb);
-		if (b) {
-			c = strtok_r(b, ":", &saveptrc);
-			assert(c);
-			last = atoi(c);
-			/* Check for stride */
-			c = strtok_r(NULL, ":", &saveptrc);
-			if (c)
-				stride = atoi(c);
-		}
-
-		if (last == -1)
-			last = first;
-
-		for (j = first; j <= last; j += stride)
-			CPU_SET(j, &mycpuset);
-		a =  strtok_r(NULL, ",", &saveptra);
-	}
-
-	j = pthread_setaffinity_np(mythread, sizeof(cpu_set_t), &mycpuset);
-	if (j != 0)
-		SOCK_LOG_ERROR("pthread_setaffinity_np failed\n");
-}
-#endif
-
 static void sock_pe_set_affinity(void)
 {
+	char *sock_pe_affinity_str;
+	if (fi_param_get_str(&sock_prov, "pe_affinity", &sock_pe_affinity_str) != FI_SUCCESS)
+		return;
+
 	if (sock_pe_affinity_str == NULL)
 		return;
 
-#if !defined __APPLE__ && !defined _WIN32
-	sock_thread_set_affinity(sock_pe_affinity_str);
-#else
-	SOCK_LOG_ERROR("*** FI_SOCKETS_PE_AFFINITY is not supported on OS X\n");
-#endif
+	if (ofi_set_thread_affinity(sock_pe_affinity_str) == -FI_ENOSYS)
+		SOCK_LOG_ERROR("FI_SOCKETS_PE_AFFINITY is not supported on OS X and Windows\n");
 }
 
 static void *sock_pe_progress_thread(void *data)
@@ -2630,6 +2689,7 @@ static void sock_pe_init_table(struct sock_pe *pe)
 struct sock_pe *sock_pe_init(struct sock_domain *domain)
 {
 	struct sock_pe *pe;
+	int ret;
 
 	pe = calloc(1, sizeof(*pe));
 	if (!pe)
@@ -2643,30 +2703,36 @@ struct sock_pe *sock_pe_init(struct sock_domain *domain)
 	pthread_mutex_init(&pe->list_lock, NULL);
 	pe->domain = domain;
 
-	pe->pe_rx_pool = util_buf_pool_create(sizeof(struct sock_pe_entry), 16, 0, 1024);
-	if (!pe->pe_rx_pool) {
+	
+	ret = util_buf_pool_create(&pe->pe_rx_pool,
+				   sizeof(struct sock_pe_entry),
+				   16, 0, 1024);
+	if (ret) {
 		SOCK_LOG_ERROR("failed to create buffer pool\n");
 		goto err1;
 	}
 
-	pe->atomic_rx_pool = util_buf_pool_create(SOCK_EP_MAX_ATOMIC_SZ,
-						  16, 0, 32);
-	if (!pe->atomic_rx_pool) {
+	ret = util_buf_pool_create(&pe->atomic_rx_pool,
+				   SOCK_EP_MAX_ATOMIC_SZ,
+				   16, 0, 32);
+	if (ret) {
 		SOCK_LOG_ERROR("failed to create atomic rx buffer pool\n");
 		goto err2;
 	}
 
-	if (sock_epoll_create(&pe->epoll_set, sock_cm_def_map_sz) < 0) {
+	if (fi_epoll_create(&pe->epoll_set) < 0) {
                 SOCK_LOG_ERROR("failed to create epoll set\n");
                 goto err3;
-        }
+	}
 
 	if (domain->progress_mode == FI_PROGRESS_AUTO) {
 		if (socketpair(AF_UNIX, SOCK_STREAM, 0, pe->signal_fds) < 0)
 			goto err4;
 
-		fd_set_nonblock(pe->signal_fds[SOCK_SIGNAL_RD_FD]);
-		sock_epoll_add(&pe->epoll_set, pe->signal_fds[SOCK_SIGNAL_RD_FD]);
+		if (fd_set_nonblock(pe->signal_fds[SOCK_SIGNAL_RD_FD]) ||
+		    fi_epoll_add(pe->epoll_set,
+				 pe->signal_fds[SOCK_SIGNAL_RD_FD], NULL))
+			goto err5;
 
 		pe->do_progress = 1;
 		if (pthread_create(&pe->progress_thread, NULL,
@@ -2682,7 +2748,7 @@ err5:
 	ofi_close_socket(pe->signal_fds[0]);
 	ofi_close_socket(pe->signal_fds[1]);
 err4:
-	sock_epoll_close(&pe->epoll_set);
+	fi_epoll_close(pe->epoll_set);
 err3:
 	util_buf_pool_destroy(pe->atomic_rx_pool);
 err2:
@@ -2729,7 +2795,7 @@ void sock_pe_finalize(struct sock_pe *pe)
 	fastlock_destroy(&pe->lock);
 	fastlock_destroy(&pe->signal_lock);
 	pthread_mutex_destroy(&pe->list_lock);
-	sock_epoll_close(&pe->epoll_set);
+	fi_epoll_close(pe->epoll_set);
 	free(pe);
 	SOCK_LOG_DBG("Progress engine finalize: OK\n");
 }

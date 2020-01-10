@@ -34,7 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-#include <fi_iov.h>
+#include <ofi_iov.h>
 #include "rxd.h"
 
 /*
@@ -141,7 +141,7 @@ static int rxd_cq_write_tagged(struct rxd_cq *cq,
 		return -FI_ENOSPC;
 
 	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL,
-		"report completion: %p\n", cq_entry->tag);
+	       "report completion: %" PRIx64 "\n", cq_entry->tag);
 
 	comp = ofi_cirque_tail(cq->util_cq.cirq);
 	*comp = *cq_entry;
@@ -427,8 +427,8 @@ static void rxd_progress_wait_rx(struct rxd_ep *ep,
 	ctrl.conn_id = rx_entry->peer;
 
 	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL,
-		"rx-entry wait over [%p], credits: %d\n",
-		rx_entry->msg_id, rx_entry->credits);
+	       "rx-entry wait over [%" PRIx64 "], credits: %d\n",
+	       rx_entry->msg_id, rx_entry->credits);
 	rxd_ep_reply_ack(ep, &ctrl, ofi_ctrl_ack, rx_entry->credits,
 		       rx_entry->key, rx_entry->peer_info->conn_data,
 		       ctrl.conn_id);
@@ -512,66 +512,18 @@ struct rxd_trecv_entry *rxd_get_trecv_entry(struct rxd_ep *ep,
 				       (void *)rx_entry);
 	if (!match) {
 		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL,
-			"no matching trecv entry, tag: %p\n",
-			rx_entry->op_hdr.tag);
+		       "no matching trecv entry, tag: %" PRIx64 "\n",
+		       rx_entry->op_hdr.tag);
 		return NULL;
 	}
 
-	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "matched - tag: %p\n",
-		rx_entry->op_hdr.tag);
+	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "matched - tag: %" PRIx64 "\n",
+	       rx_entry->op_hdr.tag);
 
 	dlist_remove(match);
 	trecv_entry = container_of(match, struct rxd_trecv_entry, entry);
 	trecv_entry->rx_entry = rx_entry;
 	return trecv_entry;
-}
-
-void rxd_cq_report_rx_comp(struct rxd_cq *cq, struct rxd_rx_entry *rx_entry)
-{
-	struct fi_cq_tagged_entry cq_entry = {0};
-
-	/* todo: handle FI_COMPLETION */
-	if (rx_entry->op_hdr.flags & OFI_REMOTE_CQ_DATA)
-		cq_entry.flags |= FI_REMOTE_CQ_DATA;
-
-	switch(rx_entry->op_hdr.op) {
-	case ofi_op_msg:
-		cq_entry.flags |= FI_RECV;
-		cq_entry.op_context = rx_entry->recv->msg.context;
-		cq_entry.len = rx_entry->done;
-		cq_entry.buf = rx_entry->recv->iov[0].iov_base;
-		cq_entry.data = rx_entry->op_hdr.data;
-		break;
-	case ofi_op_tagged:
-		cq_entry.flags |= (FI_RECV | FI_TAGGED);
-		cq_entry.op_context = rx_entry->trecv->msg.context;
-		cq_entry.len = rx_entry->done;
-		cq_entry.buf = rx_entry->trecv->iov[0].iov_base;
-		cq_entry.data = rx_entry->op_hdr.data;
-		cq_entry.tag = rx_entry->trecv->msg.tag;
-		break;
-	case ofi_op_atomic:
-		cq_entry.flags |= FI_ATOMIC;
-		break;
-	case ofi_op_write:
-		if (!(rx_entry->op_hdr.flags & OFI_REMOTE_CQ_DATA))
-			return;
-
-		cq_entry.flags |= (FI_RMA | FI_REMOTE_WRITE);
-		cq_entry.op_context = rx_entry->trecv->msg.context;
-		cq_entry.len = rx_entry->done;
-		cq_entry.buf = rx_entry->write.iov[0].iov_base;
-		cq_entry.data = rx_entry->op_hdr.data;
-		break;
-	case ofi_op_read_rsp:
-		return;
-	default:
-		FI_WARN(&rxd_prov, FI_LOG_EP_CTRL, "invalid op type: %d\n",
-			rx_entry->op_hdr.op);
-		break;
-	}
-
-	cq->write_fn(cq, &cq_entry);
 }
 
 void rxd_cq_report_error(struct rxd_cq *cq, struct fi_cq_err_entry *err_entry)
@@ -641,7 +593,10 @@ void rxd_ep_handle_data_msg(struct rxd_ep *ep, struct rxd_peer *peer,
 			   struct ofi_ctrl_hdr *ctrl, void *data,
 			   struct rxd_rx_buf *rx_buf)
 {
+	struct fi_cq_tagged_entry cq_entry = {0};
+	struct util_cntr *cntr = NULL;
 	uint64_t done;
+	struct rxd_cq *rxd_rx_cq = rxd_ep_rx_cq(ep);
 
 	ep->credits++;
 	done = ofi_copy_to_iov(iov, iov_count, rx_entry->done, data,
@@ -659,8 +614,8 @@ void rxd_ep_handle_data_msg(struct rxd_ep *ep, struct rxd_peer *peer,
 	if (rx_entry->credits == 0) {
 		rxd_set_rx_credits(ep, rx_entry);
 
-		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "replying ack [%p] - %d\n",
-			ctrl->msg_id, ctrl->seg_no);
+		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "replying ack [%" PRIx64 "] - %d\n",
+		       ctrl->msg_id, ctrl->seg_no);
 
 		rxd_ep_reply_ack(ep, ctrl, ofi_ctrl_ack, rx_entry->credits,
 			       rx_entry->key, peer->conn_data, ctrl->conn_id);
@@ -670,26 +625,63 @@ void rxd_ep_handle_data_msg(struct rxd_ep *ep, struct rxd_peer *peer,
 		if (rx_entry->credits == 0) {
 			dlist_init(&rx_entry->wait_entry);
 			dlist_insert_tail(&rx_entry->wait_entry, &ep->wait_rx_list);
-			FI_WARN(&rxd_prov, FI_LOG_EP_CTRL, "rx-entry %p - %d enqueued\n",
+			FI_WARN(&rxd_prov, FI_LOG_EP_CTRL, "rx-entry %" PRIx64 " - %d enqueued\n",
 				ctrl->msg_id, ctrl->seg_no);
 		} else {
 			FI_DBG(&rxd_prov, FI_LOG_EP_CTRL,
-				"rx_entry->op_hdr.size: %d, rx_entry->done: %d\n",
-				rx_entry->op_hdr.size, rx_entry->done);
+			       "rx_entry->op_hdr.size: %" PRIu64 ", rx_entry->done: %" PRId64 "\n",
+			       rx_entry->op_hdr.size,
+			       rx_entry->done);
 		}
 		return;
 	}
 
-	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "reporting RX completion event\n");
-	rxd_cq_report_rx_comp(rxd_ep_rx_cq(ep), rx_entry);
-	rxd_cntr_report_rx_comp(ep, rx_entry);
-
+	/* todo: handle FI_COMPLETION for RX CQ comp */
 	switch(rx_entry->op_hdr.op) {
 	case ofi_op_msg:
 		freestack_push(ep->recv_fs, rx_entry->recv);
+		/* Handle cntr */
+		cntr = ep->util_ep.rx_cntr;
+		/* Handle CQ comp */
+		cq_entry.flags |= FI_RECV;
+		cq_entry.op_context = rx_entry->recv->msg.context;
+		cq_entry.len = rx_entry->done;
+		cq_entry.buf = rx_entry->recv->iov[0].iov_base;
+		cq_entry.data = rx_entry->op_hdr.data;
+		rxd_rx_cq->write_fn(rxd_rx_cq, &cq_entry);
 		break;
 	case ofi_op_tagged:
 		freestack_push(ep->trecv_fs, rx_entry->trecv);
+		/* Handle cntr */
+		cntr = ep->util_ep.rx_cntr;
+		/* Handle CQ comp */
+		cq_entry.flags |= (FI_RECV | FI_TAGGED);
+		cq_entry.op_context = rx_entry->trecv->msg.context;
+		cq_entry.len = rx_entry->done;
+		cq_entry.buf = rx_entry->trecv->iov[0].iov_base;
+		cq_entry.data = rx_entry->op_hdr.data;
+		cq_entry.tag = rx_entry->trecv->msg.tag;\
+		rxd_rx_cq->write_fn(rxd_rx_cq, &cq_entry);
+		break;
+	case ofi_op_atomic:
+		/* Handle cntr */
+		cntr = ep->util_ep.rem_wr_cntr;
+		/* Handle CQ comp */
+		cq_entry.flags |= FI_ATOMIC;
+		rxd_rx_cq->write_fn(rxd_rx_cq, &cq_entry);
+		break;
+	case ofi_op_write:
+		/* Handle cntr */
+		cntr = ep->util_ep.rem_wr_cntr;
+		/* Handle CQ comp */
+		if (rx_entry->op_hdr.flags & OFI_REMOTE_CQ_DATA) {
+			cq_entry.flags |= (FI_RMA | FI_REMOTE_WRITE);
+			cq_entry.op_context = rx_entry->trecv->msg.context;
+			cq_entry.len = rx_entry->done;
+			cq_entry.buf = rx_entry->write.iov[0].iov_base;
+			cq_entry.data = rx_entry->op_hdr.data;
+			rxd_rx_cq->write_fn(rxd_rx_cq, &cq_entry);
+		}
 		break;
 	case ofi_op_read_rsp:
 		rxd_cq_report_tx_comp(rxd_ep_tx_cq(ep), rx_entry->read_rsp.tx_entry);
@@ -697,8 +689,14 @@ void rxd_ep_handle_data_msg(struct rxd_ep *ep, struct rxd_peer *peer,
 		rxd_tx_entry_done(ep, rx_entry->read_rsp.tx_entry);
 		break;
 	default:
+		FI_WARN(&rxd_prov, FI_LOG_EP_CTRL, "invalid op type: %d\n",
+			rx_entry->op_hdr.op);
 		break;
 	}
+
+	if (cntr)
+		cntr->cntr_fid.ops->add(&cntr->cntr_fid, 1);
+
 	rxd_rx_entry_free(ep, rx_entry);
 }
 
@@ -784,8 +782,8 @@ void rxd_ep_check_unexp_tag_list(struct rxd_ep *ep, struct rxd_trecv_entry *trec
 
 		rx_entry = container_of(match, struct rxd_rx_entry, unexp_entry);
 		rx_entry->trecv = trecv_entry;
-		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "progressing unexp tagged recv [%p]\n",
-			rx_entry->msg_id);
+		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "progressing unexp tagged recv [%" PRIx64 "]\n",
+		       rx_entry->msg_id);
 
 		pkt_start = (struct rxd_pkt_data_start *) rx_entry->unexp_buf->buf;
 		rxd_ep_handle_data_msg(ep, rx_entry->peer_info, rx_entry, rx_entry->trecv->iov,
@@ -815,9 +813,10 @@ static void rxd_handle_data(struct rxd_ep *ep, struct rxd_peer *peer,
 	if (ret) {
 		if (ret == -FI_EALREADY) {
 			FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "duplicate pkt: %d "
-				"expected:%d, rx-key:%d, ctrl_msg_id: %p\n",
-				ctrl->seg_no, rx_entry->exp_seg_no, ctrl->rx_key,
-				ctrl->msg_id);
+			       "expected:%d, rx-key:%" PRId64 ", ctrl_msg_id: %" PRIx64 "\n",
+			       ctrl->seg_no, rx_entry->exp_seg_no,
+			       ctrl->rx_key,
+			       ctrl->msg_id);
 
 			credits = ((rx_entry->msg_id == ctrl->msg_id) &&
 				  (rx_entry->last_win_seg == ctrl->seg_no)) ?
@@ -828,9 +827,10 @@ static void rxd_handle_data(struct rxd_ep *ep, struct rxd_peer *peer,
 			goto repost;
 		} else {
 			FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "invalid pkt: segno: %d "
-			       "expected:%d, rx-key:%d, ctrl_msg_id: %ld, "
-			       "rx_entry_msg_id: %ld\n",
-			       ctrl->seg_no, rx_entry->exp_seg_no, ctrl->rx_key,
+			       "expected:%d, rx-key:%" PRId64 ", ctrl_msg_id: %" PRIu64 ", "
+			       "rx_entry_msg_id: %" PRIx64 "\n",
+			       ctrl->seg_no, rx_entry->exp_seg_no,
+			       ctrl->rx_key,
 			       ctrl->msg_id, rx_entry->msg_id);
 			FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "invalid pkt: "
 			       "credits: %d, last win: %d\n",
@@ -1048,7 +1048,7 @@ static void rxd_handle_start_data(struct rxd_ep *ep, struct rxd_peer *peer,
 	rx_entry->credits = 1;
 	rx_entry->last_win_seg = 1;
 
-	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "Assign rx_entry :%d for  %p\n",
+	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "Assign rx_entry :%" PRId64 " for %" PRIx64 "\n",
 	       rx_entry->key, rx_entry->msg_id);
 
 	ep->credits--;
@@ -1059,8 +1059,8 @@ static void rxd_handle_start_data(struct rxd_ep *ep, struct rxd_peer *peer,
 		peer->exp_msg_id++;
 
 		/* reply ack, with no window = 0 */
-		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "Sending wait-ACK [%p] - %d\n",
-			ctrl->msg_id, ctrl->seg_no);
+		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "Sending wait-ACK [%" PRIx64 "] - %d\n",
+		       ctrl->msg_id, ctrl->seg_no);
 		goto out;
 	} else {
 		peer->exp_msg_id++;
@@ -1115,7 +1115,7 @@ void rxd_handle_recv_comp(struct rxd_ep *ep, struct fi_cq_msg_entry *comp)
 	default:
 		rxd_ep_repost_buff(rx_buf);
 		FI_WARN(&rxd_prov, FI_LOG_EP_CTRL,
-			"invalid ctrl type \n", ctrl->type);
+			"invalid ctrl type %u\n", ctrl->type);
 	}
 
 	rxd_check_waiting_rx(ep);

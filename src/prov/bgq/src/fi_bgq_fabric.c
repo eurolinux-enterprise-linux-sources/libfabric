@@ -30,7 +30,7 @@
  * SOFTWARE.
  */
 #include "rdma/bgq/fi_bgq.h"
-#include <fi_enosys.h>
+#include <ofi_enosys.h>
 
 #include <errno.h>
 #include <stdlib.h>
@@ -70,7 +70,7 @@ static struct fi_ops_fabric fi_bgq_ops_fabric = {
 	.eq_open	= fi_no_eq_open
 };
 
-int fi_bgq_check_fabric_attr(struct fi_fabric_attr *attr)
+int fi_bgq_check_fabric_attr(const struct fi_fabric_attr *attr)
 {
 	if (attr->name) {
 		if (strcmp(attr->name, FI_BGQ_FABRIC_NAME)) {

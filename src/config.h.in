@@ -1,5 +1,8 @@
 /* config.h.in.  Generated from configure.ac by autoheader.  */
 
+/* adds build_id to version if it was defined */
+#undef BUILD_ID
+
 /* defined to 1 if libfabric was configured with --enable-debug, 0 otherwise
    */
 #undef ENABLE_DEBUG
@@ -13,6 +16,9 @@
 /* Set to 1 to use c11 atomic functions */
 #undef HAVE_ATOMICS
 
+/* Set to 1 to use c11 atomic `least` types */
+#undef HAVE_ATOMICS_LEAST_TYPES
+
 /* bgq provider is built */
 #undef HAVE_BGQ
 
@@ -21,6 +27,9 @@
 
 /* Set to 1 to use built-in intrincics atomics */
 #undef HAVE_BUILTIN_ATOMICS
+
+/* Set to 1 to to use cpuid */
+#undef HAVE_CPUID
 
 /* Define to 1 if criterion requested and available */
 #undef HAVE_CRITERION
@@ -36,6 +45,9 @@
 
 /* Define to 1 if you have the `getifaddrs' function. */
 #undef HAVE_GETIFADDRS
+
+/* Set to 1 to use glibc malloc hooks */
+#undef HAVE_GLIBC_MALLOC_HOOKS
 
 /* gni provider is built */
 #undef HAVE_GNI
@@ -67,6 +79,10 @@
 /* Define to 1 if you have the `pthread' library (-lpthread). */
 #undef HAVE_LIBPTHREAD
 
+/* Whether we have __builtin_ia32_rdpmc() and linux/perf_event.h file or not
+   */
+#undef HAVE_LINUX_PERF_RDPMC
+
 /* Define to 1 if you have the <memory.h> header file. */
 #undef HAVE_MEMORY_H
 
@@ -82,11 +98,17 @@
 /* Define to 1 if you have the <netlink/version.h> header file. */
 #undef HAVE_NETLINK_VERSION_H
 
+/* Define to 1 if you have the <numa.h> header file. */
+#undef HAVE_NUMA_H
+
 /* psm provider is built */
 #undef HAVE_PSM
 
 /* psm2 provider is built */
 #undef HAVE_PSM2
+
+/* psm2_am_register_handlers_2 function is present */
+#undef HAVE_PSM2_AM_REGISTER_HANDLERS_2
 
 /* psm2 provider is built as DSO */
 #undef HAVE_PSM2_DL
@@ -94,14 +116,17 @@
 /* Define to 1 if you have the <psm2.h> header file. */
 #undef HAVE_PSM2_H
 
+/* PSM2 source is built-in */
+#undef HAVE_PSM2_SRC
+
 /* psm provider is built as DSO */
 #undef HAVE_PSM_DL
 
 /* Define to 1 if you have the <psm.h> header file. */
 #undef HAVE_PSM_H
 
-/* Define to 1 if you have the <rdma/rsocket.h> header file. */
-#undef HAVE_RDMA_RSOCKET_H
+/* Define to 1 if you have the <rdma/rdma_cma.h> header file. */
+#undef HAVE_RDMA_RDMA_CMA_H
 
 /* rxd provider is built */
 #undef HAVE_RXD
@@ -114,6 +139,12 @@
 
 /* rxm provider is built as DSO */
 #undef HAVE_RXM_DL
+
+/* shm provider is built */
+#undef HAVE_SHM
+
+/* shm provider is built as DSO */
+#undef HAVE_SHM_DL
 
 /* sockets provider is built */
 #undef HAVE_SOCKETS
@@ -144,6 +175,12 @@
 
 /* Define to 1 if you have the <sys/types.h> header file. */
 #undef HAVE_SYS_TYPES_H
+
+/* tcp provider is built */
+#undef HAVE_TCP
+
+/* tcp provider is built as DSO */
+#undef HAVE_TCP_DL
 
 /* Define to 1 if typeof works with your compiler. */
 #undef HAVE_TYPEOF

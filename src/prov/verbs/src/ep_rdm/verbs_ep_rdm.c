@@ -35,9 +35,9 @@
 #include <arpa/inet.h>
 #include <rdma/rdma_cma.h>
 
-#include <fi_list.h>
-#include <fi_file.h>
-#include <fi_enosys.h>
+#include <ofi_list.h>
+#include <ofi_file.h>
+#include <ofi_enosys.h>
 #include "../fi_verbs.h"
 #include "verbs_queuing.h"
 #include "verbs_utils.h"
@@ -45,83 +45,9 @@
 
 extern struct fi_ops_tagged fi_ibv_rdm_tagged_ops;
 extern struct fi_ops_cm fi_ibv_rdm_tagged_ep_cm_ops;
-extern struct dlist_entry fi_ibv_rdm_posted_queue;
-extern struct util_buf_pool* fi_ibv_rdm_request_pool;
-extern struct util_buf_pool* fi_ibv_rdm_extra_buffers_pool;
 extern struct fi_provider fi_ibv_prov;
-
-static int
-fi_ibv_rdm_find_max_inline(struct ibv_pd *pd, struct ibv_context *context)
-{
-	struct ibv_qp_init_attr qp_attr;
-	struct ibv_qp *qp = NULL;
-	struct ibv_cq *cq = ibv_create_cq(context, 1, NULL, NULL, 0);
-	assert(cq);
-	int max_inline = 2;
-	int rst = 0;
-
-	memset(&qp_attr, 0, sizeof(qp_attr));
-	qp_attr.send_cq = cq;
-	qp_attr.recv_cq = cq;
-	qp_attr.qp_type = IBV_QPT_RC;
-	qp_attr.cap.max_send_wr = 1;
-	qp_attr.cap.max_recv_wr = 1;
-	qp_attr.cap.max_send_sge = 1;
-	qp_attr.cap.max_recv_sge = 1;
-
-	do {
-		if (qp)
-			ibv_destroy_qp(qp);
-		qp_attr.cap.max_inline_data = max_inline;
-		qp = ibv_create_qp(pd, &qp_attr);
-		if (qp) {
-			/* 
-			 * truescale returns max_inline_data 0
-			 */
-			if (qp_attr.cap.max_inline_data == 0)
-				break;
-
-			/*
-			 * iWarp is able to create qp with unsupported
-			 * max_inline, lets take first returned value.
-			 */
-			if (context->device->transport_type == IBV_TRANSPORT_IWARP) {
-				max_inline = rst = qp_attr.cap.max_inline_data;
-				break;
-			}
-			rst = max_inline;
-		}
-	} while (qp && (max_inline < INT_MAX / 2) && (max_inline *= 2));
-
-	if (rst != 0) {
-		int pos = rst, neg = max_inline;
-		do {
-			max_inline = pos + (neg - pos) / 2;
-			if (qp)
-				ibv_destroy_qp(qp);
-
-			qp_attr.cap.max_inline_data = max_inline;
-			qp = ibv_create_qp(pd, &qp_attr);
-			if (qp)
-				pos = max_inline;
-			else
-				neg = max_inline;
-
-		} while (neg - pos > 2);
-
-		rst = pos;
-	}
-
-	if (qp) {
-		ibv_destroy_qp(qp);
-	}
-
-	if (cq) {
-		ibv_destroy_cq(cq);
-	}
-
-	return rst;
-}
+extern struct fi_ops_msg fi_ibv_rdm_ep_msg_ops;
+extern struct fi_ops_rma fi_ibv_rdm_ep_rma_ops;
 
 static int fi_ibv_rdm_ep_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 {
@@ -164,10 +90,8 @@ static int fi_ibv_rdm_ep_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 		break;
 	case FI_CLASS_AV:
 		av = container_of(bfid, struct fi_ibv_av, av_fid.fid);
-		if (ep->domain != av->domain) {
+		if (ep->domain != av->domain)
 			return -FI_EINVAL;
-		}
-
 		ep->av = av;
 		break;
 	case FI_CLASS_CNTR:
@@ -224,22 +148,26 @@ static ssize_t fi_ibv_rdm_cancel(fid_t fid, void *ctx)
 	struct fi_ibv_rdm_request *request = context->internal[0];
 
 	VERBS_DBG(FI_LOG_EP_DATA,
-		  "ep_cancel, match %p, tag 0x%llx, len %d, ctx %p\n",
+		  "ep_cancel, match %p, tag 0x%" PRIx64 ", len %" PRIu64 ", ctx %p\n",
 		  request, request->minfo.tag, request->len, request->context);
 
 	struct dlist_entry *found =
-		dlist_find_first_match(&fi_ibv_rdm_posted_queue,
+		dlist_find_first_match(&ep_rdm->fi_ibv_rdm_posted_queue,
 					fi_ibv_rdm_req_match, request);
 	if (found) {
+		uint32_t posted_recvs;
+
 		assert(container_of(found, struct fi_ibv_rdm_request,
 				    queue_entry) == request);
-		fi_ibv_rdm_remove_from_posted_queue(request, ep_rdm);
-		VERBS_DBG(FI_LOG_EP_DATA, "\t\t-> SUCCESS, post recv %d\n",
-			ep_rdm->posted_recvs);
+		request->context->internal[0] = NULL;
+		posted_recvs = fi_ibv_rdm_remove_from_posted_queue(request, ep_rdm);
+		(void)posted_recvs;
+		VERBS_DBG(FI_LOG_EP_DATA, "\t\t-> SUCCESS, post recv %"PRIu32"\n",
+			  posted_recvs);
 		err = 0;
 	} else {
 		request = fi_ibv_rdm_take_first_match_from_postponed_queue
-				(fi_ibv_rdm_req_match, request);
+		    (fi_ibv_rdm_req_match, request, ep_rdm);
 		if (request) {
 			fi_ibv_rdm_remove_from_postponed_queue(request);
 			err = 0;
@@ -253,6 +181,7 @@ static ssize_t fi_ibv_rdm_cancel(fid_t fid, void *ctx)
 			fi_ibv_rdm_move_to_errcq(ep_rdm->fi_rcq, request,
 						 FI_ECANCELED);
 		}
+		request->state.eager = FI_IBV_STATE_EAGER_READY_TO_FREE;
 	}
 
 	return err;
@@ -332,6 +261,9 @@ static int fi_ibv_rdm_ep_close(fid_t fid)
 	int err = FI_SUCCESS;
 	struct fi_ibv_rdm_ep *ep =
 		container_of(fid, struct fi_ibv_rdm_ep, ep_fid.fid);
+	struct fi_ibv_rdm_av_entry *av_entry = NULL, *tmp = NULL;
+	struct slist_entry *item, *prev_item;
+	struct fi_ibv_rdm_conn *conn = NULL;
 
 	if (ep->fi_scq)
 		ep->fi_scq->ep = NULL;
@@ -367,23 +299,24 @@ static int fi_ibv_rdm_ep_close(fid_t fid)
 	slist_remove_first_match(&ep->domain->ep_list,
 				 fi_ibv_rdm_ep_match, ep);
 
-	struct fi_ibv_rdm_av_entry *av_entry = NULL, *tmp = NULL;
-
 	HASH_ITER(hh, ep->domain->rdm_cm->av_hash, av_entry, tmp) {
-		struct fi_ibv_rdm_conn *conn = NULL;
-
+		pthread_mutex_lock(&ep->domain->rdm_cm->cm_lock);
 		HASH_FIND(hh, av_entry->conn_hash, &ep,
 			  sizeof(struct fi_ibv_rdm_ep *), conn);
 		if (conn) {
 			switch (conn->state) {
 			case FI_VERBS_CONN_ALLOCATED:
-			case FI_VERBS_CONN_REMOTE_DISCONNECT:
 			case FI_VERBS_CONN_ESTABLISHED:
 				ret = fi_ibv_rdm_start_disconnection(conn);
+				pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
 				break;
 			case FI_VERBS_CONN_STARTED:
+				pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
+				/* No need to hold `rdm_cm::cm_lock` during
+				 * CM progressing of the EP */
 				while (conn->state != FI_VERBS_CONN_ESTABLISHED &&
-				       conn->state != FI_VERBS_CONN_REJECTED) {
+				       conn->state != FI_VERBS_CONN_REJECTED &&
+				       conn->state != FI_VERBS_CONN_CLOSED) {
 					ret = fi_ibv_rdm_cm_progress(ep);
 					if (ret) {
 						VERBS_INFO(FI_LOG_AV, 
@@ -393,19 +326,24 @@ static int fi_ibv_rdm_ep_close(fid_t fid)
 				}
 				break;
 			default:
+				pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
 				break;
-		}
+			}
+		} else {
+			pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
 		}
 	}
 
         /* ok, all connections are initiated to disconnect. now wait
 	 * till all connections are switch to state 'closed' */
 	HASH_ITER(hh, ep->domain->rdm_cm->av_hash, av_entry, tmp) {
-		struct fi_ibv_rdm_conn *conn = NULL;
-
+		pthread_mutex_lock(&ep->domain->rdm_cm->cm_lock);
 		HASH_FIND(hh, av_entry->conn_hash, &ep,
 			  sizeof(struct fi_ibv_rdm_ep *), conn);
+		pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
 		if (conn) {
+			/* No need to hold `rdm_cm::cm_lock` during
+			 * polling of receive CQ */
 			while(conn->state != FI_VERBS_CONN_CLOSED &&
 			      conn->state != FI_VERBS_CONN_ALLOCATED) {
 				fi_ibv_rdm_tagged_poll_recv(ep);
@@ -418,16 +356,44 @@ static int fi_ibv_rdm_ep_close(fid_t fid)
 		}
 	}
 
-        /* now destroy all connections */
+        /* now destroy all connections that wasn't removed from HASH */
 	HASH_ITER(hh, ep->domain->rdm_cm->av_hash, av_entry, tmp) {
-		struct fi_ibv_rdm_conn *conn = NULL;
-
+		pthread_mutex_lock(&ep->domain->rdm_cm->cm_lock);
 		HASH_FIND(hh, av_entry->conn_hash, &ep,
 			  sizeof(struct fi_ibv_rdm_ep *), conn);
 		if (conn) {
 			HASH_DEL(av_entry->conn_hash, conn);
+			pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
+			/* No need to hold `rdm_cm::cm_lock` during
+			 * connection cleanup */
 			fi_ibv_rdm_conn_cleanup(conn);
+		} else {
+			pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
 		}
+	}
+
+	/* now destroy all connection that was removed from HASH */
+	slist_foreach(&ep->domain->rdm_cm->av_removed_entry_head,
+		      item, prev_item) {
+		OFI_UNUSED(prev_item); /* Compiler complains about unused variable */
+		av_entry = container_of(item,
+					struct fi_ibv_rdm_av_entry,
+					removed_next);
+		pthread_mutex_lock(&ep->domain->rdm_cm->cm_lock);
+		HASH_FIND(hh, av_entry->conn_hash, &ep,
+			  sizeof(struct fi_ibv_rdm_ep *), conn);
+		if (conn) {
+			HASH_DEL(av_entry->conn_hash, conn);
+			pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
+			/* No need to hold `rdm_cm::cm_lock` during
+			 * connection cleanup */
+			fi_ibv_rdm_conn_cleanup(conn);
+		} else {
+			pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
+		}
+		/* do NOT free av_entry and do NOT remove from
+		 * the List of removed AV entries, becasue we need to
+		 * remove remaining connections during domain closure */
 	}
 
 	/* TODO: MUST be removed in DOMAIN_CLOSE */
@@ -449,20 +415,15 @@ static int fi_ibv_rdm_ep_close(fid_t fid)
 		ret = (ret == FI_SUCCESS) ? -errno : ret;
 	}
 
-	errno = 0;
 	rdma_freeaddrinfo(ep->rai);
-	if (errno) {
-		VERBS_INFO_ERRNO(FI_LOG_AV, "rdma_freeaddrinfo failed",
-				 errno);
-		ret = (ret == FI_SUCCESS) ? -errno : ret;
-	}
 
 	/* TODO: move queues & related pools cleanup to close CQ*/
 	fi_ibv_rdm_clean_queues(ep);
 
-	util_buf_pool_destroy(fi_ibv_rdm_request_pool);
-	util_buf_pool_destroy(fi_ibv_rdm_extra_buffers_pool);
-	util_buf_pool_destroy(fi_ibv_rdm_postponed_pool);
+	util_buf_pool_destroy(ep->fi_ibv_rdm_request_pool);
+	util_buf_pool_destroy(ep->fi_ibv_rdm_multi_request_pool);
+	util_buf_pool_destroy(ep->fi_ibv_rdm_extra_buffers_pool);
+	util_buf_pool_destroy(ep->fi_ibv_rdm_postponed_pool);
 
 	fi_freeinfo(ep->info);
 
@@ -483,9 +444,8 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 			struct fid_ep **ep, void *context)
 {
 	struct fi_ibv_domain *_domain = 
-		container_of(domain, struct fi_ibv_domain, domain_fid);
-	int ret = 0, param = 0;
-	char *str_param = NULL;
+		container_of(domain, struct fi_ibv_domain, util_domain.domain_fid);
+	int ret = 0;
 
 	if (!info || !info->ep_attr || !info->domain_attr ||
 	    strncmp(_domain->verbs->device->name, info->domain_attr->name,
@@ -510,26 +470,19 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 	_ep->ep_fid.fid.ops = &fi_ibv_rdm_ep_ops;
 	_ep->ep_fid.ops = &fi_ibv_rdm_ep_base_ops;
 	_ep->ep_fid.cm = &fi_ibv_rdm_tagged_ep_cm_ops;
-	_ep->ep_fid.msg = fi_ibv_rdm_ep_ops_msg();
-	_ep->ep_fid.rma = fi_ibv_rdm_ep_ops_rma();
+	_ep->ep_fid.msg = &fi_ibv_rdm_ep_msg_ops;
+	_ep->ep_fid.rma = &fi_ibv_rdm_ep_rma_ops;
 	_ep->ep_fid.tagged = &fi_ibv_rdm_tagged_ops;
 	_ep->tx_selective_completion = 0;
 	_ep->rx_selective_completion = 0;
+	_ep->n_buffs = fi_ibv_gl_data.rdm.buffer_num;
 
-	_ep->n_buffs = fi_param_get_int(&fi_ibv_prov, "rdm_buffer_num", &param) ?
-		FI_IBV_RDM_TAGGED_DFLT_BUFFER_NUM : param;
-
-	if (_ep->n_buffs & (_ep->n_buffs - 1)) {
-		VERBS_INFO(FI_LOG_CORE,
-			   "invalid value of rdm_buffer_num\n");
-		ret = -FI_EINVAL;
-		goto err2;
-	}
-
-	VERBS_INFO(FI_LOG_EP_CTRL, "inject_size: %d\n",
+	VERBS_INFO(FI_LOG_EP_CTRL, "inject_size: %zu\n",
 		   info->tx_attr->inject_size);
 
 	_ep->rndv_threshold = info->tx_attr->inject_size;
+	_ep->iov_per_rndv_thr =
+		(_ep->rndv_threshold / sizeof(struct iovec));
 	VERBS_INFO(FI_LOG_EP_CTRL, "rndv_threshold: %d\n",
 		   _ep->rndv_threshold);
 
@@ -540,63 +493,23 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 	_ep->rx_op_flags = info->rx_attr->op_flags;
 	_ep->min_multi_recv_size = (_ep->rx_op_flags & FI_MULTI_RECV) ?
 				   info->tx_attr->inject_size : 0;
-
-	_ep->rndv_seg_size = FI_IBV_RDM_SEG_MAXSIZE;
-	if (!fi_param_get_int(&fi_ibv_prov, "rdm_rndv_seg_size", &param)) {
-		if (param > 0) {
-			_ep->rndv_seg_size = param;
-		} else {
-			VERBS_INFO(FI_LOG_CORE,
-				   "invalid value of rdm_rndv_seg_size\n");
-			ret = -FI_EINVAL;
-			goto err2;
-		}
-	}
-
-#ifdef HAVE_VERBS_EXP_H
-	struct ibv_exp_device_attr exp_attr;
-	exp_attr.comp_mask = IBV_EXP_DEVICE_ATTR_ODP | IBV_EXP_DEVICE_ATTR_EXP_CAP_FLAGS;
-	ret = ibv_exp_query_device(_ep->domain->verbs, &exp_attr);
-	if (!ret && exp_attr.exp_device_cap_flags & IBV_EXP_DEVICE_ODP) {
-		_ep->use_odp = 1;
-	} else {
-		_ep->use_odp = 0;
-	}
-#else /* HAVE_VERBS_EXP_H */
-	_ep->use_odp = 0;
-#endif /* HAVE_VERBS_EXP_H */
-	if (!fi_param_get_bool(&fi_ibv_prov, "rdm_use_odp", &param)) {
-		if (!_ep->use_odp && param) {
-			VERBS_WARN(FI_LOG_CORE, "ODP is not supported on this "
-				   "configuration, ignore \n");
-		} else {
-			_ep->use_odp = param;
-		}
-	} else {
-		/* Disable by default. Because this feature may corrupt
-		 * data due to IBV_EXP_ACCESS_RELAXED flag. But usage
-		 * this feature w/o this flag leads to poor bandwidth */
-		_ep->use_odp = 0;
-	}
-
+	_ep->rndv_seg_size = fi_ibv_gl_data.rdm.rndv_seg_size;
 	_ep->rq_wr_depth = info->rx_attr->size;
 	/* one more outstanding slot for releasing eager buffers */
 	_ep->sq_wr_depth = _ep->n_buffs + 1;
-	if (!fi_param_get_str(&fi_ibv_prov, "rdm_eager_send_opcode", &str_param)) {
-		if (!strncmp(str_param, "IBV_WR_RDMA_WRITE_WITH_IMM",
-			     strlen("IBV_WR_RDMA_WRITE_WITH_IMM"))) {
-			_ep->eopcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-		} else if (!strncmp(str_param, "IBV_WR_SEND",
-				    strlen("IBV_WR_SEND"))) {
-			_ep->eopcode = IBV_WR_SEND;
-		} else {
-			VERBS_INFO(FI_LOG_CORE,
-				   "invalid value of rdm_eager_send_opcode\n");
-			ret = -FI_EINVAL;
-			goto err2;
-		}
-	} else {
+	if (!strncmp(fi_ibv_gl_data.rdm.eager_send_opcode,
+		     "IBV_WR_RDMA_WRITE_WITH_IMM",
+		     strlen("IBV_WR_RDMA_WRITE_WITH_IMM"))) {
+		_ep->eopcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+	} else if (!strncmp(fi_ibv_gl_data.rdm.eager_send_opcode,
+			    "IBV_WR_SEND",
+			    strlen("IBV_WR_SEND"))) {
 		_ep->eopcode = IBV_WR_SEND;
+	} else {
+		VERBS_INFO(FI_LOG_CORE,
+			   "Invalid value of rdm_eager_send_opcode\n");
+		ret = -FI_EINVAL;
+		goto err2;
 	}
 
 	switch (info->ep_attr->protocol) {
@@ -638,19 +551,40 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 	VERBS_INFO(FI_LOG_EP_CTRL, "recv preposted threshold: %d\n",
 		   _ep->recv_preposted_threshold);
 
-	fi_ibv_rdm_request_pool = util_buf_pool_create(
-		sizeof(struct fi_ibv_rdm_request),
-		FI_IBV_RDM_MEM_ALIGNMENT, 0, 100);
+	ret = util_buf_pool_create(&_ep->fi_ibv_rdm_request_pool,
+				   sizeof(struct fi_ibv_rdm_request),
+				   FI_IBV_MEM_ALIGNMENT, 0,
+				   FI_IBV_POOL_BUF_CNT);
+	if (ret)
+		goto err3;
 
-	fi_ibv_rdm_postponed_pool = util_buf_pool_create(
-		sizeof(struct fi_ibv_rdm_postponed_entry),
-		FI_IBV_RDM_MEM_ALIGNMENT, 0, 100);
+	ret = util_buf_pool_create(&_ep->fi_ibv_rdm_multi_request_pool,
+				   sizeof(struct fi_ibv_rdm_multi_request),
+				   FI_IBV_MEM_ALIGNMENT, 0,
+				   FI_IBV_POOL_BUF_CNT);
+	if (ret)
+		goto err3;
 
-	fi_ibv_rdm_extra_buffers_pool = util_buf_pool_create(
-		_ep->buff_len, FI_IBV_RDM_MEM_ALIGNMENT, 0, 100);
+	ret = util_buf_pool_create(&_ep->fi_ibv_rdm_postponed_pool,
+				   sizeof(struct fi_ibv_rdm_postponed_entry),
+				   FI_IBV_MEM_ALIGNMENT, 0,
+				   FI_IBV_POOL_BUF_CNT);
+	if (ret)
+		goto err3;
 
-	_ep->max_inline_rc = 
-		fi_ibv_rdm_find_max_inline(_ep->domain->pd, _ep->domain->verbs);
+	ret = util_buf_pool_create(&_ep->fi_ibv_rdm_extra_buffers_pool,
+				   _ep->buff_len, FI_IBV_MEM_ALIGNMENT,
+				   0, FI_IBV_POOL_BUF_CNT);
+	if (ret)
+		goto err3;
+
+	dlist_init(&_ep->fi_ibv_rdm_posted_queue);
+	dlist_init(&_ep->fi_ibv_rdm_postponed_queue);
+	dlist_init(&_ep->fi_ibv_rdm_unexp_queue);
+	dlist_init(&_ep->fi_ibv_rdm_multi_recv_list);
+
+	_ep->max_inline_rc =
+		fi_ibv_find_max_inline(_ep->domain->pd, _ep->domain->verbs, IBV_QPT_RC);
 
 	_ep->scq_depth = FI_IBV_RDM_TAGGED_DFLT_SCQ_SIZE;
 	_ep->rcq_depth = FI_IBV_RDM_TAGGED_DFLT_RCQ_SIZE;
@@ -660,7 +594,7 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 	if (_ep->scq == NULL) {
 		VERBS_INFO_ERRNO(FI_LOG_EP_CTRL, "ibv_create_cq", errno);
 		ret = -FI_EOTHER;
-		goto err2;
+		goto err3;
 	}
 
 	_ep->rcq =
@@ -668,7 +602,7 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 	if (_ep->rcq == NULL) {
 		VERBS_INFO_ERRNO(FI_LOG_EP_CTRL, "ibv_create_cq", errno);
 		ret = -FI_EOTHER;
-		goto err2;
+		goto err4;
 	}
 
 	*ep = &_ep->ep_fid;
@@ -679,6 +613,18 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 	slist_insert_tail(&_ep->list_entry, &_domain->ep_list);
 
 	return ret;
+err4:
+	if (ibv_destroy_cq(_ep->scq))
+		VERBS_INFO_ERRNO(FI_LOG_EP_CTRL, "ibv_destroy_cq", errno);
+err3:
+	if (_ep->fi_ibv_rdm_request_pool)
+		util_buf_pool_destroy(_ep->fi_ibv_rdm_request_pool);
+	if (_ep->fi_ibv_rdm_multi_request_pool)
+		util_buf_pool_destroy(_ep->fi_ibv_rdm_multi_request_pool);
+	if (_ep->fi_ibv_rdm_postponed_pool)
+		util_buf_pool_destroy(_ep->fi_ibv_rdm_postponed_pool);
+	if (_ep->fi_ibv_rdm_extra_buffers_pool)
+		util_buf_pool_destroy(_ep->fi_ibv_rdm_extra_buffers_pool);
 err2:
 	fi_freeinfo(_ep->info);
 err1:

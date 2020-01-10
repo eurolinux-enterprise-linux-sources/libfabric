@@ -158,17 +158,25 @@ static void __gnix_rma_copy_chained_get_data(struct gnix_fab_req *req)
 		GNIX_INFO(FI_LOG_EP_DATA, "writing %d bytes to %p\n",
 			  tail_len, addr);
 		memcpy((void *)addr,
-		       (void *) ((uint8_t *) req->int_tx_buf + GNI_READ_ALIGN),
-		       tail_len);
+			   (void *) ((uint8_t *) req->int_tx_buf + GNI_READ_ALIGN),
+			   tail_len);
 	}
 }
 
 static void __gnix_rma_more_fr_complete(struct gnix_fab_req *req)
 {
+	int rc;
+
 	if (req->flags & FI_LOCAL_MR) {
 		GNIX_INFO(FI_LOG_EP_DATA, "freeing auto-reg MR: %p\n",
 			  req->rma.loc_md);
-		fi_close(&req->rma.loc_md->mr_fid.fid);
+		rc = fi_close(&req->rma.loc_md->mr_fid.fid);
+		if (rc != FI_SUCCESS)
+			GNIX_FATAL(FI_LOG_DOMAIN,
+				"failed to close auto-registration, "
+				"rc=%d\n", rc);
+
+		req->flags &= ~FI_LOCAL_MR;
 	}
 
 	/* Schedule VC TX queue in case the VC is 'fenced'. */
@@ -179,10 +187,18 @@ static void __gnix_rma_more_fr_complete(struct gnix_fab_req *req)
 
 static void __gnix_rma_fr_complete(struct gnix_fab_req *req)
 {
+	int rc;
+
 	if (req->flags & FI_LOCAL_MR) {
 		GNIX_INFO(FI_LOG_EP_DATA, "freeing auto-reg MR: %p\n",
 			  req->rma.loc_md);
-		fi_close(&req->rma.loc_md->mr_fid.fid);
+		rc = fi_close(&req->rma.loc_md->mr_fid.fid);
+		if (rc != FI_SUCCESS)
+			GNIX_FATAL(FI_LOG_DOMAIN,
+				"failed to close auto-registration, "
+				"rc=%d\n", rc);
+
+		req->flags &= ~FI_LOCAL_MR;
 	}
 
 	ofi_atomic_dec32(&req->vc->outstanding_tx_reqs);
@@ -278,7 +294,7 @@ int __smsg_rma_data(void *data, void *msg)
 	}
 
 	status = GNI_SmsgRelease(vc->gni_ep);
-	if (unlikely(status != GNI_RC_SUCCESS)) {
+	if (OFI_UNLIKELY(status != GNI_RC_SUCCESS)) {
 		GNIX_WARN(FI_LOG_EP_DATA,
 			  "GNI_SmsgRelease returned %s\n",
 			  gni_err_str[status]);
@@ -685,7 +701,7 @@ int _gnix_rma_post_irq(struct gnix_vc *vc)
 
 	status = GNI_PostCqWrite(vc->gni_ep,
 				 &txd->gni_desc);
-	if (unlikely(status != GNI_RC_SUCCESS)) {
+	if (OFI_UNLIKELY(status != GNI_RC_SUCCESS)) {
 		rc = gnixu_to_fi_errno(status);
 		_gnix_nic_tx_free(nic, txd);
 	}
@@ -744,9 +760,10 @@ int _gnix_rma_post_rdma_chain_req(void *data)
 		return -FI_ENOSPC;
 	}
 
-	_gnix_convert_key_to_mhdl(
-			(gnix_mr_key_t *)&req->rma.rem_mr_key,
-			&mdh);
+	_GNIX_CONVERT_MR_KEY(ep->auth_key->using_vmdh,
+		req->vc->peer_key_offset,
+		_gnix_convert_key_to_mhdl,
+		&req->rma.rem_mr_key, &mdh);
 
 	/* BTE TXD */
 	bte_txd->completer_fn = __gnix_rma_txd_complete;
@@ -820,7 +837,7 @@ int _gnix_rma_post_rdma_chain_req(void *data)
 	 * TODO: need work here too!
 	 */
 
-	if (unlikely(inject_err)) {
+	if (OFI_UNLIKELY(inject_err)) {
 		_gnix_nic_txd_err_inject(nic, bte_txd);
 		status = GNI_RC_SUCCESS;
 	} else {
@@ -838,7 +855,7 @@ int _gnix_rma_post_rdma_chain_req(void *data)
 		return gnixu_to_fi_errno(status);
 	}
 
-	if (unlikely(inject_err)) {
+	if (OFI_UNLIKELY(inject_err)) {
 		_gnix_nic_txd_err_inject(nic, ct_txd);
 		status = GNI_RC_SUCCESS;
 	} else if (fma_chain) {
@@ -1051,9 +1068,10 @@ static void __gnix_rma_more_fill_pd(struct gnix_fab_req *req,
 			more_put[idx].local_addr = (uint64_t)more_req->
 								rma.loc_addr;
 
-			_gnix_convert_key_to_mhdl_no_crc(
-				(gnix_mr_key_t *)&more_req->rma.rem_mr_key,
-				&mdh);
+			_GNIX_CONVERT_MR_KEY(more_req->vc->ep->auth_key->using_vmdh,
+				more_req->vc->peer_key_offset,
+				_gnix_convert_key_to_mhdl_no_crc,
+				&more_req->rma.rem_mr_key, &mdh);
 			more_put[idx].remote_mem_hndl = mdh;
 
 			if (idx < entries - 1)
@@ -1063,9 +1081,10 @@ static void __gnix_rma_more_fill_pd(struct gnix_fab_req *req,
 			idx++;
 		} else {
 			assert(more_get);
-			_gnix_convert_key_to_mhdl_no_crc(
-				(gnix_mr_key_t *)&more_req->rma.rem_mr_key,
-				&mdh);
+			_GNIX_CONVERT_MR_KEY(more_req->vc->ep->auth_key->using_vmdh,
+				more_req->vc->peer_key_offset,
+				_gnix_convert_key_to_mhdl_no_crc,
+				&more_req->rma.rem_mr_key, &mdh);
 			more_get[idx].remote_mem_hndl = mdh;
 			more_get[idx].ep_hndl = more_req->vc->gni_ep;
 
@@ -1141,9 +1160,10 @@ int _gnix_rma_more_post_req(void *data)
 	txd->completer_fn = __gnix_rma_more_txd_complete;
 	txd->req = fab_req;
 
-	_gnix_convert_key_to_mhdl_no_crc(
-			(gnix_mr_key_t *)&fab_req->rma.rem_mr_key,
-			&mdh);
+	_GNIX_CONVERT_MR_KEY(ep->auth_key->using_vmdh,
+		fab_req->vc->peer_key_offset,
+		_gnix_convert_key_to_mhdl_no_crc,
+		&fab_req->rma.rem_mr_key, &mdh);
 
 	txd->gni_desc.type = __gnix_fr_post_type(fab_req->type, 0);
 	txd->gni_desc.cq_mode = GNI_CQMODE_GLOBAL_EVENT; /* check flags */
@@ -1219,24 +1239,26 @@ int _gnix_rma_post_req(void *data)
 	txd->req = fab_req;
 
 	if (rdma) {
-		_gnix_convert_key_to_mhdl(
-				(gnix_mr_key_t *)&fab_req->rma.rem_mr_key,
-				&mdh);
+		_GNIX_CONVERT_MR_KEY(ep->auth_key,
+			fab_req->vc->peer_key_offset,
+			_gnix_convert_key_to_mhdl,
+			&fab_req->rma.rem_mr_key, &mdh);
 	} else {
 		/* Mem handle CRC is not validated during FMA operations.  Skip
 		 * this costly calculation. */
-		_gnix_convert_key_to_mhdl_no_crc(
-				(gnix_mr_key_t *)&fab_req->rma.rem_mr_key,
-				&mdh);
+		_GNIX_CONVERT_MR_KEY(ep->auth_key,
+			fab_req->vc->peer_key_offset,
+			_gnix_convert_key_to_mhdl_no_crc,
+			&fab_req->rma.rem_mr_key, &mdh);
 	}
 
 	txd->gni_desc.type = __gnix_fr_post_type(fab_req->type, rdma);
 	txd->gni_desc.cq_mode = GNI_CQMODE_GLOBAL_EVENT; /* check flags */
 	txd->gni_desc.dlvr_mode = GNI_DLVMODE_PERFORMANCE; /* check flags */
 
-	if (unlikely(indirect)) {
+	if (OFI_UNLIKELY(indirect)) {
 		__gnix_rma_fill_pd_indirect_get(fab_req, txd);
-	} else if (unlikely(chained)) {
+	} else if (OFI_UNLIKELY(chained)) {
 		__gnix_rma_fill_pd_chained_get(fab_req, txd, &mdh);
 	} else {
 		txd->gni_desc.local_addr = (uint64_t)fab_req->rma.loc_addr;
@@ -1257,7 +1279,7 @@ int _gnix_rma_post_req(void *data)
 
 	COND_ACQUIRE(nic->requires_lock, &nic->lock);
 
-	if (unlikely(inject_err)) {
+	if (OFI_UNLIKELY(inject_err)) {
 		_gnix_nic_txd_err_inject(nic, txd);
 		status = GNI_RC_SUCCESS;
 	} else if (chained) {
@@ -1327,6 +1349,7 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 	struct gnix_fab_req *more_req;
 	struct slist_entry *sle;
 	int connected;
+	struct gnix_auth_key *info;
 
 	if (!(flags & FI_INJECT) && !ep->send_cq &&
 	    (((fr_type == GNIX_FAB_RQ_RDMA_WRITE) && !ep->write_cntr) ||
@@ -1386,10 +1409,21 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 
 	if (!(flags & (GNIX_RMA_INDIRECT | FI_INJECT)) && !mdesc &&
 	    (rdma || fr_type == GNIX_FAB_RQ_RDMA_READ)) {
+		uint64_t requested_key;
+
+		info = ep->auth_key;
+		assert(info);
+
+		if (info->using_vmdh)
+			requested_key = _gnix_get_next_reserved_key(info);
+		else
+			requested_key = 0;
+
 		/* We need to auto-register the source buffer. */
-		rc = gnix_mr_reg(&ep->domain->domain_fid.fid, (void *)loc_addr,
-				 len, FI_READ | FI_WRITE, 0, 0, 0, &auto_mr,
-				 NULL);
+		rc = _gnix_mr_reg(&ep->domain->domain_fid.fid, (void *)loc_addr,
+				 len, FI_READ | FI_WRITE, 0, requested_key,
+				 0, &auto_mr, NULL, ep->auth_key,
+				 GNIX_PROV_REG);
 		if (rc != FI_SUCCESS) {
 			GNIX_INFO(FI_LOG_EP_DATA,
 				  "Failed to auto-register local buffer: %d\n",

@@ -32,7 +32,7 @@
 
 #include <rdma/fi_errno.h>
 
-#include <prov.h>
+#include <ofi_prov.h>
 #include "udpx.h"
 
 #include <sys/types.h>
@@ -86,7 +86,8 @@ static void udpx_getinfo_ifs(struct fi_info **info)
 			loopback = cur;
 		}
 
-		if ((cur->src_addr = mem_dup(ifa->ifa_addr, addrlen))) {
+		cur->src_addr = mem_dup(ifa->ifa_addr, addrlen);
+		if (cur->src_addr) {
 			cur->src_addrlen = addrlen;
 			cur->addr_format = addr_format;
 		}
@@ -112,7 +113,8 @@ static void udpx_getinfo_ifs(struct fi_info **info)
 #endif
 
 static int udpx_getinfo(uint32_t version, const char *node, const char *service,
-			uint64_t flags, struct fi_info *hints, struct fi_info **info)
+			uint64_t flags, const struct fi_info *hints,
+			struct fi_info **info)
 {
 	int ret;
 
@@ -135,7 +137,7 @@ static void udpx_fini(void)
 struct fi_provider udpx_prov = {
 	.name = "UDP",
 	.version = FI_VERSION(UDPX_MAJOR_VERSION, UDPX_MINOR_VERSION),
-	.fi_version = FI_VERSION(1, 5),
+	.fi_version = FI_VERSION(1, 6),
 	.getinfo = udpx_getinfo,
 	.fabric = udpx_fabric,
 	.cleanup = udpx_fini

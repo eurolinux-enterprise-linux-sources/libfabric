@@ -78,7 +78,7 @@ static int rxd_av_set_addrlen(struct rxd_av *av, const void *addr)
 		goto close;
 	}
 
-	FI_INFO(&rxd_prov, FI_LOG_AV, "set dgram address len: %d\n", len);
+	FI_INFO(&rxd_prov, FI_LOG_AV, "set dgram address len: %zu\n", len);
 	av->dg_addrlen = len;
 close:
 	fi_close(&tmp_av->fid);
@@ -332,7 +332,7 @@ int rxd_av_create(struct fid_domain *domain_fid, struct fi_av_attr *attr,
 
 	util_attr.addrlen = sizeof(fi_addr_t);
 	util_attr.overhead = attr->count;
-	util_attr.flags = FI_SOURCE;
+	util_attr.flags = OFI_AV_HASH;
 	if (attr->type == FI_AV_UNSPEC)
 		attr->type = FI_AV_TABLE;
 

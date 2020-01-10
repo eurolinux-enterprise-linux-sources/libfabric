@@ -55,14 +55,14 @@
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-#include "fi.h"
-#include "fi_enosys.h"
+#include "ofi.h"
+#include "ofi_enosys.h"
 
 #include "usnic_direct.h"
 #include "usd.h"
 #include "usdf.h"
 #include "usdf_wait.h"
-#include "fi_util.h"
+#include "ofi_util.h"
 
 static inline int
 usdf_eq_empty(struct usdf_eq *eq)
@@ -522,7 +522,8 @@ usdf_eq_close(fid_t fid)
 	switch (eq->eq_attr.wait_obj) {
 	case FI_WAIT_SET:
 		ret = usdf_eq_unbind_wait(eq);
-		/* FALLTHROUGH. Need to close the FD used for wait set. */
+		/* FALLTHROUGH */
+		/* Need to close the FD used for wait set. */
 	case FI_WAIT_FD:
 		close(eq->eq_fd);
 		break;
@@ -601,10 +602,11 @@ usdf_eq_open(struct fid_fabric *fabric, struct fi_eq_attr *attr,
 	case FI_WAIT_UNSPEC:
 		/* default to FD */
 		attr->wait_obj = FI_WAIT_FD;
-		/* FALLSTHROUGH */
+		/* FALLTHROUGH */
 	case FI_WAIT_FD:
 		eq->eq_ops_data.sread = usdf_eq_sread_fd;
-		/* FALLTHROUGH. Don't set sread for wait set. */
+		/* FALLTHROUGH  */
+		/* Don't set sread for wait set. */
 	case FI_WAIT_SET:
 		eq->eq_fd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
 		if (eq->eq_fd == -1) {

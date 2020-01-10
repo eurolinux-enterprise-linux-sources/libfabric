@@ -52,7 +52,7 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 
-#include <fi_osd.h>
+#include <ofi_osd.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
@@ -174,14 +174,15 @@ struct ct_pingpong {
 	struct fid_eq *eq;
 
 	struct fid_mr no_mr;
-	struct fi_context tx_ctx, rx_ctx;
+	void *tx_ctx_ptr, *rx_ctx_ptr;
+	struct fi_context tx_ctx[2], rx_ctx[2];
 	uint64_t remote_cq_data;
 
 	uint64_t tx_seq, rx_seq, tx_cq_cntr, rx_cq_cntr;
 
 	fi_addr_t remote_fi_addr;
 	void *buf, *tx_buf, *rx_buf;
-	size_t buf_size, tx_size, rx_size;
+	size_t buf_size, tx_size, rx_size, msg_prefix_size;
 
 	int timeout_sec;
 	uint64_t start, end;
@@ -195,7 +196,7 @@ struct ct_pingpong {
 
 	SOCKET ctrl_connfd;
 	char ctrl_buf[PP_CTRL_BUF_LEN + 1];
-	char rem_name[PP_MAX_CTRL_MSG];
+	void *rem_name;
 };
 
 static const char integ_alphabet[] =
@@ -208,7 +209,7 @@ static const int integ_alphabet_length =
  *                                         Utils
  ******************************************************************************/
 
-uint64_t pp_gettime_us(void)
+static uint64_t pp_gettime_us(void)
 {
 	struct timeval now;
 
@@ -216,7 +217,7 @@ uint64_t pp_gettime_us(void)
 	return now.tv_sec * 1000000 + now.tv_usec;
 }
 
-long parse_ulong(char *str, long max)
+static long parse_ulong(char *str, long max)
 {
 	long ret;
 	char *end;
@@ -242,48 +243,18 @@ long parse_ulong(char *str, long max)
 	return ret;
 }
 
-int size_to_count(int size)
-{
-	if (size >= (1 << 20))
-		return 100;
-	else if (size >= (1 << 16))
-		return 1000;
-	else
-		return 10000;
-}
-
-void pp_banner_fabric_info(struct ct_pingpong *ct)
+static void pp_banner_fabric_info(struct ct_pingpong *ct)
 {
 	PP_DEBUG(
-	    "Running pingpong test with the %s endpoint trough a %s provider\n",
-	    fi_tostr(&ct->fi->ep_attr->type, FI_TYPE_EP_TYPE),
-	    ct->fi->fabric_attr->prov_name);
-	PP_DEBUG(" * Fabric Attributes:\n");
-	PP_DEBUG("  - %-20s: %s\n", "name", ct->fi->fabric_attr->name);
-	PP_DEBUG("  - %-20s: %s\n", "prov_name",
-		 ct->fi->fabric_attr->prov_name);
-	PP_DEBUG("  - %-20s: %" PRIu32 "\n", "prov_version",
-		 ct->fi->fabric_attr->prov_version);
-	PP_DEBUG(" * Domain Attributes:\n");
-	PP_DEBUG("  - %-20s: %s\n", "name", ct->fi->domain_attr->name);
-	PP_DEBUG("  - %-20s: %zu\n", "cq_cnt", ct->fi->domain_attr->cq_cnt);
-	PP_DEBUG("  - %-20s: %zu\n", "cq_data_size",
-		 ct->fi->domain_attr->cq_data_size);
-	PP_DEBUG("  - %-20s: %zu\n", "ep_cnt", ct->fi->domain_attr->ep_cnt);
-	PP_DEBUG(" * Endpoint Attributes:\n");
-	PP_DEBUG("  - %-20s: %s\n", "type",
-		 fi_tostr(&ct->fi->ep_attr->type, FI_TYPE_EP_TYPE));
-	PP_DEBUG("  - %-20s: %" PRIu32 "\n", "protocol",
-		 ct->fi->ep_attr->protocol);
-	PP_DEBUG("  - %-20s: %" PRIu32 "\n", "protocol_version",
-		 ct->fi->ep_attr->protocol_version);
-	PP_DEBUG("  - %-20s: %zu\n", "max_msg_size",
-		 ct->fi->ep_attr->max_msg_size);
-	PP_DEBUG("  - %-20s: %zu\n", "max_order_raw_size",
-		 ct->fi->ep_attr->max_order_raw_size);
+	    "Running pingpong test with the %s provider and %s endpoint type\n",
+	    ct->fi->fabric_attr->prov_name,
+	    fi_tostr(&ct->fi->ep_attr->type, FI_TYPE_EP_TYPE));
+	PP_DEBUG("%s", fi_tostr(ct->fi->fabric_attr, FI_TYPE_FABRIC_ATTR));
+	PP_DEBUG("%s", fi_tostr(ct->fi->domain_attr, FI_TYPE_DOMAIN_ATTR));
+	PP_DEBUG("%s", fi_tostr(ct->fi->ep_attr, FI_TYPE_EP_ATTR));
 }
 
-void pp_banner_options(struct ct_pingpong *ct)
+static void pp_banner_options(struct ct_pingpong *ct)
 {
 	char size_msg[50];
 	char iter_msg[50];
@@ -305,7 +276,6 @@ void pp_banner_options(struct ct_pingpong *ct)
 		snprintf(iter_msg, 50, "selected iterations: %d",
 			 opts.iterations);
 	else {
-		opts.iterations = size_to_count(opts.transfer_size);
 		snprintf(iter_msg, 50, "default iterations: %d",
 			 opts.iterations);
 	}
@@ -328,7 +298,7 @@ void pp_banner_options(struct ct_pingpong *ct)
  *                                         Control Messaging
  ******************************************************************************/
 
-int pp_getaddrinfo(char *name, uint16_t port, struct addrinfo **results)
+static int pp_getaddrinfo(char *name, uint16_t port, struct addrinfo **results)
 {
 	int ret;
 	const char *err_msg;
@@ -485,7 +455,7 @@ fail_close_socket:
 	return ret;
 }
 
-int pp_ctrl_init(struct ct_pingpong *ct)
+static int pp_ctrl_init(struct ct_pingpong *ct)
 {
 	const uint32_t default_ctrl = 47592;
 	struct timeval tv = {
@@ -521,7 +491,7 @@ int pp_ctrl_init(struct ct_pingpong *ct)
 	return ret;
 }
 
-int pp_ctrl_send(struct ct_pingpong *ct, char *buf, size_t size)
+static int pp_ctrl_send(struct ct_pingpong *ct, char *buf, size_t size)
 {
 	int ret, err;
 
@@ -540,14 +510,14 @@ int pp_ctrl_send(struct ct_pingpong *ct, char *buf, size_t size)
 	return ret;
 }
 
-int pp_ctrl_recv(struct ct_pingpong *ct, char *buf, size_t size)
+static int pp_ctrl_recv(struct ct_pingpong *ct, char *buf, size_t size)
 {
 	int ret, err;
 
 	do {
 		PP_DEBUG("receiving\n");
 		ret = ofi_read_socket(ct->ctrl_connfd, buf, size);
-	} while (ret == -1 && OFI_SOCK_TRY_RCV_AGAIN(ofi_sockerr()));
+	} while (ret == -1 && OFI_SOCK_TRY_SND_RCV_AGAIN(ofi_sockerr()));
 	if (ret < 0) {
 		err = -ofi_sockerr();
 		PP_PRINTERR("ctrl/read", err);
@@ -562,41 +532,49 @@ int pp_ctrl_recv(struct ct_pingpong *ct, char *buf, size_t size)
 	return ret;
 }
 
-int pp_send_name(struct ct_pingpong *ct, struct fid *endpoint)
+static int pp_send_name(struct ct_pingpong *ct, struct fid *endpoint)
 {
-	char local_name[64];
-	size_t addrlen;
+	void *local_name = NULL;
+	size_t addrlen = 0;
 	uint32_t len;
 	int ret;
 
 	PP_DEBUG("Fetching local address\n");
 
-	addrlen = sizeof(local_name);
+	ret = fi_getname(endpoint, local_name, &addrlen);
+	if ((ret != -FI_ETOOSMALL) || (addrlen <= 0)) {
+		PP_ERR("fi_getname didn't return length\n");
+		return -EMSGSIZE;
+	}
+
+	local_name = calloc(1, addrlen);
+	if (!local_name) {
+		PP_ERR("Failed to allocate memory for the address\n");
+		return -ENOMEM;
+	}
+
 	ret = fi_getname(endpoint, local_name, &addrlen);
 	if (ret) {
 		PP_PRINTERR("fi_getname", ret);
-		return ret;
-	}
-
-	if (addrlen > sizeof(local_name)) {
-		PP_DEBUG("Address exceeds control buffer length\n");
-		return -EMSGSIZE;
+		goto fn;
 	}
 
 	PP_DEBUG("Sending name length\n");
 	len = htonl(addrlen);
 	ret = pp_ctrl_send(ct, (char *) &len, sizeof(len));
 	if (ret < 0)
-		return ret;
+		goto fn;
 
 	PP_DEBUG("Sending name\n");
 	ret = pp_ctrl_send(ct, local_name, addrlen);
 	PP_DEBUG("Sent name\n");
 
+fn:
+	free(local_name);
 	return ret;
 }
 
-int pp_recv_name(struct ct_pingpong *ct)
+static int pp_recv_name(struct ct_pingpong *ct)
 {
 	uint32_t len;
 	int ret;
@@ -608,9 +586,10 @@ int pp_recv_name(struct ct_pingpong *ct)
 
 	len = ntohl(len);
 
-	if (len > sizeof(ct->rem_name)) {
-		PP_DEBUG("Address length exceeds address storage\n");
-		return -EMSGSIZE;
+	ct->rem_name = calloc(1, len);
+	if (!ct->rem_name) {
+		PP_ERR("Failed to allocate memory for the address\n");
+		return -ENOMEM;
 	}
 
 	PP_DEBUG("Receiving name\n");
@@ -619,7 +598,7 @@ int pp_recv_name(struct ct_pingpong *ct)
 		return ret;
 	PP_DEBUG("Received name\n");
 
-	ct->hints->dest_addr = malloc(len);
+	ct->hints->dest_addr = calloc(1, len);
 	if (!ct->hints->dest_addr) {
 		PP_DEBUG("Failed to allocate memory for destination address\n");
 		return -ENOMEM;
@@ -632,7 +611,7 @@ int pp_recv_name(struct ct_pingpong *ct)
 	return 0;
 }
 
-int pp_ctrl_finish(struct ct_pingpong *ct)
+static int pp_ctrl_finish(struct ct_pingpong *ct)
 {
 	if (ct->ctrl_connfd != -1) {
 		ofi_close_socket(ct->ctrl_connfd);
@@ -642,7 +621,7 @@ int pp_ctrl_finish(struct ct_pingpong *ct)
 	return 0;
 }
 
-int pp_ctrl_sync(struct ct_pingpong *ct)
+static int pp_ctrl_sync(struct ct_pingpong *ct)
 {
 	int ret;
 
@@ -711,7 +690,7 @@ int pp_ctrl_sync(struct ct_pingpong *ct)
 	return 0;
 }
 
-int pp_ctrl_txrx_msg_count(struct ct_pingpong *ct)
+static int pp_ctrl_txrx_msg_count(struct ct_pingpong *ct)
 {
 	int ret;
 
@@ -818,7 +797,7 @@ static inline int pp_check_opts(struct ct_pingpong *ct, uint64_t flags)
  *                                         Data Verification
  ******************************************************************************/
 
-void pp_fill_buf(void *buf, int size)
+static void pp_fill_buf(void *buf, int size)
 {
 	char *msg_buf;
 	int msg_index;
@@ -835,7 +814,7 @@ void pp_fill_buf(void *buf, int size)
 	}
 }
 
-int pp_check_buf(void *buf, int size)
+static int pp_check_buf(void *buf, int size)
 {
 	char *recv_data;
 	char c;
@@ -875,7 +854,7 @@ int pp_check_buf(void *buf, int size)
  *                                         Error handling
  ******************************************************************************/
 
-void eq_readerr(struct fid_eq *eq)
+static void eq_readerr(struct fid_eq *eq)
 {
 	struct fi_eq_err_entry eq_err;
 	int rd;
@@ -890,7 +869,7 @@ void eq_readerr(struct fid_eq *eq)
 	}
 }
 
-void pp_process_eq_err(ssize_t rd, struct fid_eq *eq, const char *fn)
+static void pp_process_eq_err(ssize_t rd, struct fid_eq *eq, const char *fn)
 {
 	if (rd == -FI_EAVAIL)
 		eq_readerr(eq);
@@ -902,9 +881,9 @@ void pp_process_eq_err(ssize_t rd, struct fid_eq *eq, const char *fn)
  *                                         Test sizes
  ******************************************************************************/
 
-int generate_test_sizes(struct pp_opts *opts, size_t tx_size, int **sizes_)
+static int generate_test_sizes(struct pp_opts *opts, size_t tx_size, int **sizes_)
 {
-	int defaults[6] = {64, 256, 1024, 4096, 65536, 1048576};
+	int defaults[] = {64, 256, 1024, 4096, 65536, 1048576};
 	int power_of_two;
 	int half_up;
 	int n = 0;
@@ -962,7 +941,7 @@ int generate_test_sizes(struct pp_opts *opts, size_t tx_size, int **sizes_)
  ******************************************************************************/
 
 /* str must be an allocated buffer of PP_STR_LEN bytes */
-char *size_str(char *str, uint64_t size)
+static char *size_str(char *str, uint64_t size)
 {
 	uint64_t base, fraction = 0;
 	char mag;
@@ -996,7 +975,7 @@ char *size_str(char *str, uint64_t size)
 }
 
 /* str must be an allocated buffer of PP_STR_LEN bytes */
-char *cnt_str(char *str, size_t size, uint64_t cnt)
+static char *cnt_str(char *str, size_t size, uint64_t cnt)
 {
 	if (cnt >= 1000000000)
 		snprintf(str, size, "%" PRIu64 "b", cnt / 1000000000);
@@ -1010,7 +989,7 @@ char *cnt_str(char *str, size_t size, uint64_t cnt)
 	return str;
 }
 
-void show_perf(char *name, int tsize, int sent, int acked,
+static void show_perf(char *name, int tsize, int sent, int acked,
 	       uint64_t start, uint64_t end, int xfers_per_iter)
 {
 	static int header = 1;
@@ -1061,7 +1040,7 @@ void show_perf(char *name, int tsize, int sent, int acked,
  *                                      Data Messaging
  ******************************************************************************/
 
-int pp_cq_readerr(struct fid_cq *cq)
+static int pp_cq_readerr(struct fid_cq *cq)
 {
 	struct fi_cq_err_entry cq_err;
 	int ret;
@@ -1117,7 +1096,7 @@ static int pp_get_cq_comp(struct fid_cq *cq, uint64_t *cur, uint64_t total,
 	return 0;
 }
 
-int pp_get_rx_comp(struct ct_pingpong *ct, uint64_t total)
+static int pp_get_rx_comp(struct ct_pingpong *ct, uint64_t total)
 {
 	int ret = FI_SUCCESS;
 
@@ -1132,7 +1111,7 @@ int pp_get_rx_comp(struct ct_pingpong *ct, uint64_t total)
 	return ret;
 }
 
-int pp_get_tx_comp(struct ct_pingpong *ct, uint64_t total)
+static int pp_get_tx_comp(struct ct_pingpong *ct, uint64_t total)
 {
 	int ret;
 
@@ -1173,8 +1152,8 @@ int pp_get_tx_comp(struct ct_pingpong *ct, uint64_t total)
 		seq++;                                                         \
 	} while (0)
 
-ssize_t pp_post_tx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size,
-		   struct fi_context *ctx)
+static ssize_t pp_post_tx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size,
+			  void *ctx)
 {
 	if (!(ct->fi->caps & FI_TAGGED))
 		PP_POST(fi_send, pp_get_tx_comp, ct->tx_seq, "transmit", ep,
@@ -1187,14 +1166,14 @@ ssize_t pp_post_tx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size,
 	return 0;
 }
 
-ssize_t pp_tx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
+static ssize_t pp_tx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
 {
 	ssize_t ret;
 
 	if (pp_check_opts(ct, PP_OPT_VERIFY_DATA | PP_OPT_ACTIVE))
-		pp_fill_buf((char *)ct->tx_buf, size);
+		pp_fill_buf((char *)ct->tx_buf + ct->msg_prefix_size, size);
 
-	ret = pp_post_tx(ct, ep, size, &(ct->tx_ctx));
+	ret = pp_post_tx(ct, ep, size + ct->msg_prefix_size, ct->tx_ctx_ptr);
 	if (ret)
 		return ret;
 
@@ -1203,7 +1182,8 @@ ssize_t pp_tx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
 	return ret;
 }
 
-ssize_t pp_post_inject(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
+static ssize_t pp_post_inject(struct ct_pingpong *ct, struct fid_ep *ep,
+			      size_t size)
 {
 	if (!(ct->fi->caps & FI_TAGGED))
 		PP_POST(fi_inject, pp_get_tx_comp, ct->tx_seq, "inject", ep,
@@ -1215,35 +1195,35 @@ ssize_t pp_post_inject(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
 	return 0;
 }
 
-ssize_t pp_inject(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
+static ssize_t pp_inject(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
 {
 	ssize_t ret;
 
 	if (pp_check_opts(ct, PP_OPT_VERIFY_DATA | PP_OPT_ACTIVE))
-		pp_fill_buf((char *)ct->tx_buf, size);
+		pp_fill_buf((char *)ct->tx_buf + ct->msg_prefix_size, size);
 
-	ret = pp_post_inject(ct, ep, size);
+	ret = pp_post_inject(ct, ep, size + ct->msg_prefix_size);
 	if (ret)
 		return ret;
 
 	return ret;
 }
 
-ssize_t pp_post_rx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size,
-		   struct fi_context *ctx)
+static ssize_t pp_post_rx(struct ct_pingpong *ct, struct fid_ep *ep,
+			  size_t size, void *ctx)
 {
 	if (!(ct->fi->caps & FI_TAGGED))
 		PP_POST(fi_recv, pp_get_rx_comp, ct->rx_seq, "receive", ep,
-			ct->rx_buf, MAX(size, PP_MAX_CTRL_MSG),
+			ct->rx_buf, MAX(size, PP_MAX_CTRL_MSG + ct->msg_prefix_size),
 			fi_mr_desc(ct->mr), 0, ctx);
 	else
 		PP_POST(fi_trecv, pp_get_rx_comp, ct->rx_seq, "t-receive", ep,
-			ct->rx_buf, MAX(size, PP_MAX_CTRL_MSG),
+			ct->rx_buf, MAX(size, PP_MAX_CTRL_MSG + ct->msg_prefix_size),
 			fi_mr_desc(ct->mr), 0, TAG, 0, ctx);
 	return 0;
 }
 
-ssize_t pp_rx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
+static ssize_t pp_rx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
 {
 	ssize_t ret;
 
@@ -1252,7 +1232,8 @@ ssize_t pp_rx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
 		return ret;
 
 	if (pp_check_opts(ct, PP_OPT_VERIFY_DATA | PP_OPT_ACTIVE)) {
-		ret = pp_check_buf((char *)ct->rx_buf, size);
+		ret = pp_check_buf((char *)ct->rx_buf + ct->msg_prefix_size,
+				   size);
 		if (ret)
 			return ret;
 	}
@@ -1263,7 +1244,8 @@ ssize_t pp_rx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
 	 * before message size is updated. The recvs posted are always for the
 	 * next incoming message.
 	 */
-	ret = pp_post_rx(ct, ct->ep, ct->rx_size, &(ct->rx_ctx));
+	ret = pp_post_rx(ct, ct->ep, ct->rx_size + ct->msg_prefix_size,
+			 ct->rx_ctx_ptr);
 	if (!ret)
 		ct->cnt_ack_msg++;
 
@@ -1274,18 +1256,16 @@ ssize_t pp_rx(struct ct_pingpong *ct, struct fid_ep *ep, size_t size)
  *                                Initialization and allocations
  ******************************************************************************/
 
-void init_test(struct ct_pingpong *ct, struct pp_opts *opts)
+static void init_test(struct ct_pingpong *ct, struct pp_opts *opts)
 {
 	char sstr[PP_STR_LEN];
 
 	size_str(sstr, opts->transfer_size);
-	if (!(opts->options & PP_OPT_ITER))
-		opts->iterations = size_to_count(opts->transfer_size);
 
 	ct->cnt_ack_msg = 0;
 }
 
-uint64_t pp_init_cq_data(struct fi_info *info)
+static uint64_t pp_init_cq_data(struct fi_info *info)
 {
 	if (info->domain_attr->cq_data_size >= sizeof(uint64_t)) {
 		return 0x0123456789abcdefULL;
@@ -1295,7 +1275,7 @@ uint64_t pp_init_cq_data(struct fi_info *info)
 	}
 }
 
-int pp_alloc_msgs(struct ct_pingpong *ct)
+static int pp_alloc_msgs(struct ct_pingpong *ct)
 {
 	int ret;
 	long alignment = 1;
@@ -1306,7 +1286,8 @@ int pp_alloc_msgs(struct ct_pingpong *ct)
 		ct->tx_size = ct->fi->ep_attr->max_msg_size;
 	ct->rx_size = ct->tx_size;
 	ct->buf_size = MAX(ct->tx_size, PP_MAX_CTRL_MSG) +
-		       MAX(ct->rx_size, PP_MAX_CTRL_MSG);
+		       MAX(ct->rx_size, PP_MAX_CTRL_MSG) +
+		       2 * ct->msg_prefix_size;
 
 	alignment = ofi_sysconf(_SC_PAGESIZE);
 	if (alignment < 0) {
@@ -1324,7 +1305,9 @@ int pp_alloc_msgs(struct ct_pingpong *ct)
 	}
 	memset(ct->buf, 0, ct->buf_size);
 	ct->rx_buf = ct->buf;
-	ct->tx_buf = (char *)ct->buf + MAX(ct->rx_size, PP_MAX_CTRL_MSG);
+	ct->tx_buf = (char *)ct->buf +
+			MAX(ct->rx_size, PP_MAX_CTRL_MSG) +
+			ct->msg_prefix_size;
 	ct->tx_buf = (void *)(((uintptr_t)ct->tx_buf + alignment - 1) &
 			      ~(alignment - 1));
 
@@ -1345,7 +1328,7 @@ int pp_alloc_msgs(struct ct_pingpong *ct)
 	return 0;
 }
 
-int pp_open_fabric_res(struct ct_pingpong *ct)
+static int pp_open_fabric_res(struct ct_pingpong *ct)
 {
 	int ret;
 
@@ -1374,7 +1357,7 @@ int pp_open_fabric_res(struct ct_pingpong *ct)
 	return 0;
 }
 
-int pp_alloc_active_res(struct ct_pingpong *ct, struct fi_info *fi)
+static int pp_alloc_active_res(struct ct_pingpong *ct, struct fi_info *fi)
 {
 	int ret;
 
@@ -1412,6 +1395,7 @@ int pp_alloc_active_res(struct ct_pingpong *ct, struct fi_info *fi)
 			return ret;
 		}
 	}
+	ct->msg_prefix_size = fi->ep_attr->msg_prefix_size;
 
 	ret = fi_endpoint(ct->domain, fi, &(ct->ep), NULL);
 	if (ret) {
@@ -1422,8 +1406,8 @@ int pp_alloc_active_res(struct ct_pingpong *ct, struct fi_info *fi)
 	return 0;
 }
 
-int pp_getinfo(struct ct_pingpong *ct, struct fi_info *hints,
-	       struct fi_info **info)
+static int pp_getinfo(struct ct_pingpong *ct, struct fi_info *hints,
+		      struct fi_info **info)
 {
 	uint64_t flags = 0;
 	int ret;
@@ -1436,6 +1420,36 @@ int pp_getinfo(struct ct_pingpong *ct, struct fi_info *hints,
 		PP_PRINTERR("fi_getinfo", ret);
 		return ret;
 	}
+
+	if (((*info)->tx_attr->mode & FI_CONTEXT2) != 0) {
+		ct->tx_ctx_ptr = &(ct->tx_ctx[0]);
+	} else if (((*info)->tx_attr->mode & FI_CONTEXT) != 0) {
+		ct->tx_ctx_ptr = &(ct->tx_ctx[1]);
+	} else if (((*info)->mode & FI_CONTEXT2) != 0) {
+		ct->tx_ctx_ptr = &(ct->tx_ctx[0]);
+	} else if (((*info)->mode & FI_CONTEXT) != 0) {
+		ct->tx_ctx_ptr = &(ct->tx_ctx[1]);
+	} else {
+		ct->tx_ctx_ptr = NULL;
+	}
+
+	if (((*info)->rx_attr->mode & FI_CONTEXT2) != 0) {
+		ct->rx_ctx_ptr = &(ct->rx_ctx[0]);
+	} else if (((*info)->rx_attr->mode & FI_CONTEXT) != 0) {
+		ct->rx_ctx_ptr = &(ct->rx_ctx[1]);
+	} else if (((*info)->mode & FI_CONTEXT2) != 0) {
+		ct->rx_ctx_ptr = &(ct->rx_ctx[0]);
+	} else if (((*info)->mode & FI_CONTEXT) != 0) {
+		ct->rx_ctx_ptr = &(ct->rx_ctx[1]);
+	} else {
+		ct->rx_ctx_ptr = NULL;
+	}
+
+	if (hints && ((hints->caps & FI_DIRECTED_RECV) == 0)) {
+		(*info)->caps &= ~FI_DIRECTED_RECV;
+		(*info)->rx_attr->caps &= ~FI_DIRECTED_RECV;
+	}
+
 	return 0;
 }
 
@@ -1451,7 +1465,7 @@ int pp_getinfo(struct ct_pingpong *ct, struct fi_info *hints,
 		}                                                              \
 	} while (0)
 
-int pp_init_ep(struct ct_pingpong *ct)
+static int pp_init_ep(struct ct_pingpong *ct)
 {
 	int ret;
 
@@ -1470,7 +1484,7 @@ int pp_init_ep(struct ct_pingpong *ct)
 	}
 
 	ret = pp_post_rx(ct, ct->ep, MAX(ct->rx_size, PP_MAX_CTRL_MSG),
-			 &(ct->rx_ctx));
+			 ct->rx_ctx_ptr);
 	if (ret)
 		return ret;
 
@@ -1479,8 +1493,8 @@ int pp_init_ep(struct ct_pingpong *ct)
 	return 0;
 }
 
-int pp_av_insert(struct fid_av *av, void *addr, size_t count,
-		 fi_addr_t *fi_addr, uint64_t flags, void *context)
+static int pp_av_insert(struct fid_av *av, void *addr, size_t count,
+			fi_addr_t *fi_addr, uint64_t flags, void *context)
 {
 	int ret;
 
@@ -1502,7 +1516,7 @@ int pp_av_insert(struct fid_av *av, void *addr, size_t count,
 	return 0;
 }
 
-int pp_exchange_names_connected(struct ct_pingpong *ct)
+static int pp_exchange_names_connected(struct ct_pingpong *ct)
 {
 	int ret;
 
@@ -1529,7 +1543,7 @@ int pp_exchange_names_connected(struct ct_pingpong *ct)
 	return 0;
 }
 
-int pp_start_server(struct ct_pingpong *ct)
+static int pp_start_server(struct ct_pingpong *ct)
 {
 	int ret;
 
@@ -1574,7 +1588,7 @@ int pp_start_server(struct ct_pingpong *ct)
 	return 0;
 }
 
-int pp_server_connect(struct ct_pingpong *ct)
+static int pp_server_connect(struct ct_pingpong *ct)
 {
 	struct fi_eq_cm_entry entry;
 	uint32_t event;
@@ -1654,7 +1668,7 @@ err:
 	return ret;
 }
 
-int pp_client_connect(struct ct_pingpong *ct)
+static int pp_client_connect(struct ct_pingpong *ct)
 {
 	struct fi_eq_cm_entry entry;
 	uint32_t event;
@@ -1710,7 +1724,7 @@ int pp_client_connect(struct ct_pingpong *ct)
 	return 0;
 }
 
-int pp_init_fabric(struct ct_pingpong *ct)
+static int pp_init_fabric(struct ct_pingpong *ct)
 {
 	int ret;
 
@@ -1790,7 +1804,7 @@ int pp_init_fabric(struct ct_pingpong *ct)
  *                                Deallocations and Final
  ******************************************************************************/
 
-void pp_free_res(struct ct_pingpong *ct)
+static void pp_free_res(struct ct_pingpong *ct)
 {
 	PP_DEBUG("Freeing resources of test suite\n");
 
@@ -1805,6 +1819,8 @@ void pp_free_res(struct ct_pingpong *ct)
 	PP_CLOSE_FID(ct->domain);
 	PP_CLOSE_FID(ct->fabric);
 
+	if (ct->buf)
+		free(ct->rem_name);
 	if (ct->buf) {
 		ofi_freealign(ct->buf);
 		ct->buf = ct->rx_buf = ct->tx_buf = NULL;
@@ -1826,7 +1842,7 @@ void pp_free_res(struct ct_pingpong *ct)
 	PP_DEBUG("Resources of test suite freed\n");
 }
 
-int pp_finalize(struct ct_pingpong *ct)
+static int pp_finalize(struct ct_pingpong *ct)
 {
 	struct iovec iov;
 	int ret;
@@ -1838,7 +1854,7 @@ int pp_finalize(struct ct_pingpong *ct)
 
 	strcpy(ct->tx_buf, "fin");
 	iov.iov_base = ct->tx_buf;
-	iov.iov_len = 4;
+	iov.iov_len = 4 + ct->msg_prefix_size;
 
 	if (!(ct->fi->caps & FI_TAGGED)) {
 		memset(&msg, 0, sizeof(msg));
@@ -1888,7 +1904,7 @@ int pp_finalize(struct ct_pingpong *ct)
  *                                CLI: Usage and Options parsing
  ******************************************************************************/
 
-void pp_pingpong_usage(char *name, char *desc)
+static void pp_pingpong_usage(struct ct_pingpong *ct, char *name, char *desc)
 {
 	fprintf(stderr, "Usage:\n");
 	fprintf(stderr, "  %s [OPTIONS]\t\tstart server\n", name);
@@ -1910,8 +1926,8 @@ void pp_pingpong_usage(char *name, char *desc)
 	fprintf(stderr, " %-20s %s\n", "-e <ep_type>",
 		"endpoint type: msg|rdm|dgram (dgram)");
 
-	fprintf(stderr, " %-20s %s\n", "-I <number>",
-		"number of iterations (1000)");
+	fprintf(stderr, " %-20s %s (%d)\n", "-I <number>",
+		"number of iterations", ct->opts.iterations);
 	fprintf(stderr, " %-20s %s\n", "-S <size>",
 		"specific transfer size or 'all' (all)");
 
@@ -1924,7 +1940,7 @@ void pp_pingpong_usage(char *name, char *desc)
 	fprintf(stderr, " %-20s %s\n", "-v", "enable debugging output");
 }
 
-void pp_parse_opts(struct ct_pingpong *ct, int op, char *optarg)
+static void pp_parse_opts(struct ct_pingpong *ct, int op, char *optarg)
 {
 	switch (op) {
 
@@ -2012,7 +2028,7 @@ void pp_parse_opts(struct ct_pingpong *ct, int op, char *optarg)
  *      PingPong core and implemenations for endpoints
  ******************************************************************************/
 
-int pingpong(struct ct_pingpong *ct)
+static int pingpong(struct ct_pingpong *ct)
 {
 	int ret, i;
 
@@ -2067,7 +2083,7 @@ int pingpong(struct ct_pingpong *ct)
 	return 0;
 }
 
-int run_suite_pingpong(struct ct_pingpong *ct)
+static int run_suite_pingpong(struct ct_pingpong *ct)
 {
 	int i, sizes_cnt;
 	int ret = 0;
@@ -2106,7 +2122,7 @@ static int run_pingpong_dgram(struct ct_pingpong *ct)
 	 * finalize.
 	 */
 	ret = fi_recv(ct->ep, ct->rx_buf, ct->rx_size, fi_mr_desc(ct->mr), 0,
-		      &ct->rx_ctx);
+		      ct->rx_ctx_ptr);
 
 	ret = run_suite_pingpong(ct);
 	if (ret)
@@ -2176,8 +2192,8 @@ int main(int argc, char **argv)
 		.timeout_sec = -1,
 		.ctrl_connfd = -1,
 		.opts = {
-			.iterations = 1000,
-			.transfer_size = 1024,
+			.iterations = 10,
+			.transfer_size = 64,
 			.sizes_enabled = PP_DEFAULT_SIZE
 		},
 		.eq_attr.wait_obj = FI_WAIT_UNSPEC,
@@ -2188,7 +2204,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	ct.hints->ep_attr->type = FI_EP_DGRAM;
 	ct.hints->caps = FI_MSG;
-	ct.hints->mode = FI_CONTEXT;
+	ct.hints->mode = FI_CONTEXT | FI_CONTEXT2 | FI_MSG_PREFIX;
 	ct.hints->domain_attr->mr_mode = FI_MR_LOCAL | OFI_MR_BASIC_MAP;
 
 	ofi_osd_init();
@@ -2200,7 +2216,7 @@ int main(int argc, char **argv)
 			break;
 		case '?':
 		case 'h':
-			pp_pingpong_usage(argv[0],
+			pp_pingpong_usage(&ct, argv[0],
 					  "Ping pong client and server");
 			return EXIT_FAILURE;
 		}

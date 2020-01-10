@@ -125,10 +125,19 @@ static int __gnix_amo_send_completion(struct gnix_fid_ep *ep,
 
 static void __gnix_amo_fr_complete(struct gnix_fab_req *req)
 {
+	int rc;
+
 	if (req->flags & FI_LOCAL_MR) {
 		GNIX_INFO(FI_LOG_EP_DATA, "freeing auto-reg MR: %p\n",
 			  req->amo.loc_md);
-		fi_close(&req->amo.loc_md->mr_fid.fid);
+		rc = fi_close(&req->amo.loc_md->mr_fid.fid);
+		if (rc != FI_SUCCESS) {
+			GNIX_ERR(FI_LOG_DOMAIN,
+				"failed to deregister auto-registered region, "
+				"rc=%d\n", rc);
+		}
+
+		req->flags &= ~FI_LOCAL_MR;
 	}
 
 	ofi_atomic_dec32(&req->vc->outstanding_tx_reqs);
@@ -180,7 +189,7 @@ int __smsg_amo_cntr(void *data, void *msg)
 	}
 
 	status = GNI_SmsgRelease(vc->gni_ep);
-	if (unlikely(status != GNI_RC_SUCCESS)) {
+	if (OFI_UNLIKELY(status != GNI_RC_SUCCESS)) {
 		GNIX_WARN(FI_LOG_EP_DATA,
 			  "GNI_SmsgRelease returned %s\n",
 			  gni_err_str[status]);
@@ -426,9 +435,11 @@ int _gnix_amo_post_req(void *data)
 
 	/* Mem handle CRC is not validated during FMA operations.  Skip this
 	 * costly calculation. */
-	_gnix_convert_key_to_mhdl_no_crc(
-			(gnix_mr_key_t *)&fab_req->amo.rem_mr_key,
-			&mdh);
+	_GNIX_CONVERT_MR_KEY(ep->auth_key->using_vmdh,
+			fab_req->vc->peer_key_offset,
+			_gnix_convert_key_to_mhdl_no_crc,
+			&fab_req->amo.rem_mr_key, &mdh);
+
 	loc_md = (struct gnix_fid_mem_desc *)fab_req->amo.loc_md;
 
 	txd->gni_desc.type = GNI_POST_AMO;
@@ -458,7 +469,7 @@ int _gnix_amo_post_req(void *data)
 
 	COND_ACQUIRE(nic->requires_lock, &nic->lock);
 
-	if (unlikely(inject_err)) {
+	if (OFI_UNLIKELY(inject_err)) {
 		_gnix_nic_txd_err_inject(nic, txd);
 		status = GNI_RC_SUCCESS;
 	} else {
@@ -515,7 +526,7 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 	if (!ep || !msg || !msg->msg_iov ||
 	    msg->msg_iov[0].count != 1 ||
 	    msg->iov_count != GNIX_MAX_ATOMIC_IOV_LIMIT ||
-	    !msg->rma_iov || !msg->rma_iov[0].addr)
+	    !msg->rma_iov)
 		return -FI_EINVAL;
 
 	/*
@@ -571,9 +582,10 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 		}
 
 		if (!result_desc || !result_desc[0]) {
-			rc = gnix_mr_reg(&ep->domain->domain_fid.fid,
+			rc = _gnix_mr_reg(&ep->domain->domain_fid.fid,
 					 loc_addr, len, FI_READ | FI_WRITE,
-					 0, 0, 0, &auto_mr, NULL);
+					 0, 0, 0, &auto_mr,
+					 NULL, ep->auth_key, GNIX_PROV_REG);
 			if (rc != FI_SUCCESS) {
 				GNIX_INFO(FI_LOG_EP_DATA,
 					  "Failed to auto-register local buffer: %d\n",

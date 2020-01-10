@@ -53,12 +53,12 @@
 #include <rdma/fi_tagged.h>
 #include <rdma/fi_trigger.h>
 
-#include <fi.h>
-#include <fi_enosys.h>
-#include <fi_rbuf.h>
-#include <fi_list.h>
-#include <fi_signal.h>
-#include <fi_util.h>
+#include <ofi.h>
+#include <ofi_enosys.h>
+#include <ofi_rbuf.h>
+#include <ofi_list.h>
+#include <ofi_signal.h>
+#include <ofi_util.h>
 
 #ifndef _UDPX_H_
 #define _UDPX_H_
@@ -104,7 +104,7 @@ struct udpx_ep {
 	udpx_rx_comp_func	rx_comp;
 	udpx_tx_comp_func	tx_comp;
 	struct udpx_rx_cirq	*rxq;    /* protected by rx_cq lock */
-	int			sock;
+	SOCKET			sock;
 	int			is_bound;
 	ofi_atomic32_t		ref;
 };

@@ -34,7 +34,7 @@
 #include <string.h>
 #include <getopt.h>
 
-#include <fi_osd.h>
+#include <ofi_osd.h>
 
 #include <rdma/fabric.h>
 #include <rdma/fi_errno.h>
@@ -334,9 +334,15 @@ int main(int argc, char **argv)
 				 &option_index)) != -1) {
 		switch (op) {
 		case 0:
-			/* If --verbose set a flag, do nothing. */
-			if (longopts[option_index].flag != 0)
-				break;
+			/* there is no short variant only for --version */
+			if (ver) {
+				printf("%s: %s\n", argv[0], PACKAGE_VERSION);
+				printf("libfabric: %s\n", fi_tostr("1", FI_TYPE_VERSION));
+				printf("libfabric api: %d.%d\n",
+				       FI_MAJOR_VERSION, FI_MINOR_VERSION);
+				return EXIT_SUCCESS;
+			}
+			goto print_help;
 		case 'n':
 			node = optarg;
 			break;
@@ -396,17 +402,11 @@ int main(int argc, char **argv)
 			break;
 		case 'h':
 		default:
+print_help:
 			printf("Usage: %s\n", argv[0]);
 			usage();
 			return EXIT_FAILURE;
 		}
-	}
-
-	if (ver) {
-		printf("%s: %s\n", argv[0], PACKAGE_VERSION);
-		printf("libfabric: %s\n", fi_tostr("1", FI_TYPE_VERSION));
-		printf("libfabric api: %d.%d\n", FI_MAJOR_VERSION, FI_MINOR_VERSION);
-		return EXIT_SUCCESS;
 	}
 
 	if (env) {

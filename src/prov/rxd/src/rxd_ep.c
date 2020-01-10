@@ -32,8 +32,8 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <fi_mem.h>
-#include <fi_iov.h>
+#include <ofi_mem.h>
+#include <ofi_iov.h>
 #include "rxd.h"
 
 int rxd_progress_spin_count = 1000;
@@ -49,35 +49,39 @@ static ssize_t rxd_ep_cancel(fid_t fid, void *context)
 
 	ep = container_of(fid, struct rxd_ep, util_ep.ep_fid.fid);
 	fastlock_acquire(&ep->lock);
-	for (entry = ep->recv_list.next; entry != &ep->recv_list; entry = next) {
-		next = entry->next;
-		recv_entry = container_of(entry, struct rxd_recv_entry, entry);
-		if (recv_entry->msg.context != context)
-			continue;
+	if (ep->util_ep.caps & FI_MSG) {
+		for (entry = ep->recv_list.next; entry != &ep->recv_list; entry = next) {
+			next = entry->next;
+			recv_entry = container_of(entry, struct rxd_recv_entry, entry);
+			if (recv_entry->msg.context != context)
+				continue;
 
-		dlist_remove(entry);
-		err_entry.op_context = recv_entry->msg.context;
-		err_entry.flags = (FI_MSG | FI_RECV);
-		err_entry.err = FI_ECANCELED;
-		err_entry.prov_errno = -FI_ECANCELED;
-		rxd_cq_report_error(rxd_ep_rx_cq(ep), &err_entry);
-		goto out;
+			dlist_remove(entry);
+			err_entry.op_context = recv_entry->msg.context;
+			err_entry.flags = (FI_MSG | FI_RECV);
+			err_entry.err = FI_ECANCELED;
+			err_entry.prov_errno = -FI_ECANCELED;
+			rxd_cq_report_error(rxd_ep_rx_cq(ep), &err_entry);
+			goto out;
+		}
 	}
 
-	for (entry = ep->trecv_list.next; entry != &ep->trecv_list; entry = next) {
-		next = entry->next;
-		trecv_entry = container_of(entry, struct rxd_trecv_entry, entry);
-		if (trecv_entry->msg.context != context)
-			continue;
+	if (ep->util_ep.caps & FI_TAGGED) {
+		for (entry = ep->trecv_list.next; entry != &ep->trecv_list; entry = next) {
+			next = entry->next;
+			trecv_entry = container_of(entry, struct rxd_trecv_entry, entry);
+			if (trecv_entry->msg.context != context)
+				continue;
 
-		dlist_remove(entry);
-		err_entry.op_context = trecv_entry->msg.context;
-		err_entry.flags = (FI_MSG | FI_RECV | FI_TAGGED);
-		err_entry.tag = trecv_entry->msg.tag;
-		err_entry.err = FI_ECANCELED;
-		err_entry.prov_errno = -FI_ECANCELED;
-		rxd_cq_report_error(rxd_ep_rx_cq(ep), &err_entry);
-		goto out;
+			dlist_remove(entry);
+			err_entry.op_context = trecv_entry->msg.context;
+			err_entry.flags = (FI_MSG | FI_RECV | FI_TAGGED);
+			err_entry.tag = trecv_entry->msg.tag;
+			err_entry.err = FI_ECANCELED;
+			err_entry.prov_errno = -FI_ECANCELED;
+			rxd_cq_report_error(rxd_ep_rx_cq(ep), &err_entry);
+			goto out;
+		}
 	}
 
 out:
@@ -132,8 +136,8 @@ static ssize_t rxd_ep_recvmsg(struct fid_ep *ep, const struct fi_msg *msg,
 	for (i = 0; i < msg->iov_count; i++) {
 		recv_entry->iov[i].iov_base = msg->msg_iov[i].iov_base;
 		recv_entry->iov[i].iov_len = msg->msg_iov[i].iov_len;
-		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "post recv: %u\n",
-			msg->msg_iov[i].iov_len);
+		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "post recv: %zu\n",
+		       msg->msg_iov[i].iov_len);
 	}
 
 	dlist_init(&recv_entry->entry);
@@ -198,7 +202,7 @@ int rxd_ep_repost_buff(struct rxd_rx_buf *buf)
 }
 
 /*
- * See fi_proto.h for how conn_data is being used.
+ * See ofi_proto.h for how conn_data is being used.
  */
 static uint64_t rxd_ep_conn_data(struct rxd_ep *ep)
 {
@@ -464,8 +468,8 @@ static ssize_t rxd_ep_post_data_msg(struct rxd_ep *ep,
 		       pkt->ctrl.seg_no);
 	}
 
-	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "msg data %p, seg %d\n",
-		pkt->ctrl.msg_id, pkt->ctrl.seg_no);
+	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "msg data %" PRIx64 ", seg %d\n",
+	       pkt->ctrl.msg_id, pkt->ctrl.seg_no);
 	dlist_insert_tail(&pkt_meta->entry, &tx_entry->pkt_list);
 
 	return ret;
@@ -477,8 +481,8 @@ void rxd_ep_free_acked_pkts(struct rxd_ep *ep, struct rxd_tx_entry *tx_entry,
 	struct rxd_pkt_meta *pkt;
 	struct ofi_ctrl_hdr *ctrl;
 
-	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "freeing all [%p] pkts < %d\n",
-		tx_entry->msg_id, last_acked);
+	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "freeing all [%" PRIx64 "] pkts < %d\n",
+	       tx_entry->msg_id, last_acked);
 	while (!dlist_empty(&tx_entry->pkt_list)) {
 
 		pkt = container_of(tx_entry->pkt_list.next,
@@ -487,8 +491,8 @@ void rxd_ep_free_acked_pkts(struct rxd_ep *ep, struct rxd_tx_entry *tx_entry,
 		if (ctrl->seg_no >= last_acked)
 			break;
 
-		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "freeing [%p] pkt:%d\n",
-			tx_entry->msg_id, ctrl->seg_no);
+		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "freeing [%" PRIx64 "] pkt:%d\n",
+		       tx_entry->msg_id, ctrl->seg_no);
 		dlist_remove(&pkt->entry);
 		if (pkt->flags & RXD_LOCAL_COMP)
 			rxd_tx_pkt_free(pkt);
@@ -510,11 +514,11 @@ static int rxd_ep_retry_pkt(struct rxd_ep *ep, struct rxd_tx_entry *tx_entry,
 //		return -FI_EIO;
 //	}
 //
-	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "retry packet : %2d, size: %d, tx_id :%p\n",
-		ctrl->seg_no, ctrl->type == ofi_ctrl_start_data ?
-		ctrl->seg_size + sizeof(struct rxd_pkt_data_start) :
-		ctrl->seg_size + sizeof(struct rxd_pkt_data),
-		ctrl->msg_id);
+	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "retry packet : %2d, size: %zd, tx_id :%" PRIx64 "\n",
+	       ctrl->seg_no, ctrl->type == ofi_ctrl_start_data ?
+	       ctrl->seg_size + sizeof(struct rxd_pkt_data_start) :
+	       ctrl->seg_size + sizeof(struct rxd_pkt_data),
+	       ctrl->msg_id);
 
 	ret = fi_send(ep->dg_ep, ctrl,
 		      ctrl->type == ofi_ctrl_start_data ?
@@ -553,7 +557,7 @@ static int rxd_ep_retry_pkt(struct rxd_ep *ep, struct rxd_tx_entry *tx_entry,
 
 void rxd_tx_entry_progress(struct rxd_ep *ep, struct rxd_tx_entry *tx_entry)
 {
-	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "tx: %p [%p]\n",
+	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "tx: %p [%" PRIx64 "]\n",
 		tx_entry, tx_entry->msg_id);
 
 	while ((tx_entry->seg_no < tx_entry->window) &&
@@ -584,8 +588,8 @@ int rxd_ep_reply_ack(struct rxd_ep *ep, struct ofi_ctrl_hdr *in_ctrl,
 			  rx_entry ? rx_entry->exp_seg_no : 0,
 			  in_ctrl->msg_id, rx_key, source);
 
-	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "sending ack [%p] - segno: %d, window: %d\n",
-		pkt->ctrl.msg_id, pkt->ctrl.seg_no, pkt->ctrl.seg_size);
+	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "sending ack [%" PRIx64 "] - segno: %d, window: %d\n",
+	       pkt->ctrl.msg_id, pkt->ctrl.seg_no, pkt->ctrl.seg_size);
 
 	pkt_meta->flags = RXD_NOT_ACKED;
 	ret = fi_send(ep->dg_ep, pkt, sizeof(struct rxd_pkt_data),
@@ -698,7 +702,7 @@ ssize_t rxd_ep_start_xfer(struct rxd_ep *ep, struct rxd_peer *peer,
 		       pkt->ctrl.seg_no);
 	}
 
-	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "start msg %p, size: %ld\n",
+	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "start msg %" PRIx64 ", size: %" PRIu64 "\n",
 	       pkt->ctrl.msg_id, tx_entry->op_hdr.size);
 	rxd_set_timeout(tx_entry);
 	dlist_insert_tail(&pkt_meta->entry, &tx_entry->pkt_list);
@@ -746,7 +750,8 @@ ssize_t rxd_ep_connect(struct rxd_ep *ep, struct rxd_peer *peer, fi_addr_t addr)
 	if (ret)
 		goto err;
 
-	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "sent conn %p\n", pkt->ctrl.msg_id);
+	FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "sent conn %" PRIx64 "\n",
+	       pkt->ctrl.msg_id);
 	rxd_set_timeout(tx_entry);
 	dlist_insert_tail(&pkt_meta->entry, &tx_entry->pkt_list);
 	dlist_insert_tail(&tx_entry->entry, &ep->tx_entry_list);
@@ -1011,7 +1016,7 @@ static ssize_t rxd_trx_claim_recv(struct rxd_ep *ep,
 	for (i = 0; i < msg->iov_count; i++) {
 		trecv_entry->iov[i].iov_base = msg->msg_iov[i].iov_base;
 		trecv_entry->iov[i].iov_len = msg->msg_iov[i].iov_len;
-		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "post claim trecv: %u, tag: %p\n",
+		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "post claim trecv: %zu, tag: %" PRIx64 "\n",
 		       msg->msg_iov[i].iov_len, msg->tag);
 	}
 
@@ -1062,7 +1067,7 @@ static ssize_t rxd_ep_trecvmsg(struct fid_ep *ep, const struct fi_msg_tagged *ms
 	for (i = 0; i < msg->iov_count; i++) {
 		trecv_entry->iov[i].iov_base = msg->msg_iov[i].iov_base;
 		trecv_entry->iov[i].iov_len = msg->msg_iov[i].iov_len;
-		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "post trecv: %u, tag: %p\n",
+		FI_DBG(&rxd_prov, FI_LOG_EP_CTRL, "post trecv: %zu, tag: %" PRIx64 "\n",
 			msg->msg_iov[i].iov_len, msg->tag);
 	}
 	dlist_init(&trecv_entry->entry);
@@ -1124,7 +1129,7 @@ static ssize_t rxd_ep_tsendmsg(struct fid_ep *ep, const struct fi_msg_tagged *ms
 	struct rxd_ep *rxd_ep;
 	struct rxd_peer *peer;
 	struct rxd_tx_entry *tx_entry;
-	uint64_t peer_addr;
+	fi_addr_t peer_addr;
 	ssize_t ret;
 
 	rxd_ep = container_of(ep, struct rxd_ep, util_ep.ep_fid.fid);
@@ -1502,7 +1507,7 @@ static void rxd_ep_progress(struct util_ep *util_ep)
 		} else if ((tx_entry->retry_time > cur_time) /* &&
 			 dlist_empty(&tx_entry->pkt_list)*/ ) {
 
-			FI_WARN(&rxd_prov, FI_LOG_EP_CTRL, "Progressing waiting entry [%p]\n",
+			FI_WARN(&rxd_prov, FI_LOG_EP_CTRL, "Progressing waiting entry [%" PRIx64 "]\n",
 				tx_entry->msg_id);
 
 			rxd_tx_entry_progress(ep, tx_entry);
@@ -1547,22 +1552,24 @@ static void rxd_buf_region_free_hndlr(void *pool_ctx, void *context)
 
 int rxd_ep_create_buf_pools(struct rxd_ep *ep, struct fi_info *fi_info)
 {
-	ep->tx_pkt_pool = util_buf_pool_create_ex(
+	int ret = util_buf_pool_create_ex(
+		&ep->tx_pkt_pool,
 		rxd_ep_domain(ep)->max_mtu_sz + sizeof(struct rxd_pkt_meta),
 		RXD_BUF_POOL_ALIGNMENT, 0, RXD_TX_POOL_CHUNK_CNT,
 	        (fi_info->mode & FI_LOCAL_MR) ? rxd_buf_region_alloc_hndlr : NULL,
 		(fi_info->mode & FI_LOCAL_MR) ? rxd_buf_region_free_hndlr : NULL,
 		rxd_ep_domain(ep));
-	if (!ep->tx_pkt_pool)
+	if (ret)
 		return -FI_ENOMEM;
 
-	ep->rx_pkt_pool = util_buf_pool_create_ex(
+	ret = util_buf_pool_create_ex(
+		&ep->rx_pkt_pool,
 		rxd_ep_domain(ep)->max_mtu_sz + sizeof (struct rxd_rx_buf),
 		RXD_BUF_POOL_ALIGNMENT, 0, RXD_RX_POOL_CHUNK_CNT,
 	        (fi_info->mode & FI_LOCAL_MR) ? rxd_buf_region_alloc_hndlr : NULL,
 		(fi_info->mode & FI_LOCAL_MR) ? rxd_buf_region_free_hndlr : NULL,
 		rxd_ep_domain(ep));
-	if (!ep->rx_pkt_pool)
+	if (ret)
 		goto err;
 
 	ep->tx_entry_fs = rxd_tx_entry_fs_create(1ULL << RXD_MAX_TX_BITS);

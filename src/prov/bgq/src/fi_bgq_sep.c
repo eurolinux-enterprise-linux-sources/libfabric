@@ -31,8 +31,8 @@
  */
 #include "rdma/bgq/fi_bgq.h"
 
-#include <fi.h>
-#include <fi_enosys.h>
+#include <ofi.h>
+#include <ofi_enosys.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,6 +162,9 @@ static int fi_bgq_tx_ctx(struct fid_ep *sep, int index,
 
 	info.fabric_attr = &fab_attr;
 	memcpy(info.fabric_attr, bgq_sep->info->fabric_attr, sizeof(*info.fabric_attr));
+#ifdef FI_BGQ_TRACE
+        fprintf(stderr,"fi_bgq_tx_ctx calling fi_bgq_endpoint_rx_tx with tx index %d\n",index);
+#endif
 
 	ret = fi_bgq_endpoint_rx_tx((struct fid_domain *)bgq_sep->domain,
 		&info, tx_ep, context, -1, index);
@@ -291,6 +294,9 @@ static int fi_bgq_rx_ctx(struct fid_ep *sep, int index,
 	memcpy(info.fabric_attr, bgq_sep->info->fabric_attr,
 			sizeof(*info.fabric_attr));
 
+#ifdef FI_BGQ_TRACE
+        fprintf(stderr,"fi_bgq_tx_ctx calling fi_bgq_endpoint_rx_tx with rx index %d\n",index);
+#endif
 	ret = fi_bgq_endpoint_rx_tx(&bgq_sep->domain->domain_fid, &info,
 			rx_ep, context, index, -1);
 	if (ret) {
@@ -398,6 +404,10 @@ int fi_bgq_scalable_ep (struct fid_domain *domain,
 	bgq_sep->ep_fid.fid.ops		= &fi_bgq_fi_ops;
 	bgq_sep->ep_fid.ops		= &fi_bgq_sep_ops;
 
+        int ret = fi_bgq_init_cm_ops((struct fid_ep *)&(bgq_sep->ep_fid), info);
+        if (ret)
+                goto err;
+
 	bgq_sep->info = calloc(1, sizeof (struct fi_info));
 	if (!bgq_sep->info) {
 		errno = FI_ENOMEM;
@@ -412,6 +422,9 @@ int fi_bgq_scalable_ep (struct fid_domain *domain,
 	}
 	memcpy(bgq_sep->info->ep_attr, info->ep_attr, sizeof(struct fi_ep_attr));
 
+#ifdef FI_BGQ_TRACE
+	fprintf(stderr,"fi_bgq_scalable_ep - called with %ld tx %ld rx\n",bgq_sep->info->ep_attr->tx_ctx_cnt,bgq_sep->info->ep_attr->rx_ctx_cnt);
+#endif
 	/*
 	 * fi_endpoint.3
 	 *

@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  * Copyright (c) 2016 Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2017 DataDirect Networks, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -46,7 +47,7 @@
 #include <ifaddrs.h>
 #endif
 
-#include "fi_util.h"
+#include "ofi_util.h"
 #include "sock.h"
 #include "sock_util.h"
 
@@ -67,7 +68,7 @@ extern const struct fi_domain_attr sock_domain_attr;
 extern const struct fi_fabric_attr sock_fabric_attr;
 
 const struct fi_tx_attr sock_stx_attr = {
-	.caps = SOCK_EP_RDM_CAP,
+	.caps = SOCK_EP_RDM_CAP_BASE,
 	.mode = SOCK_MODE,
 	.op_flags = FI_TRANSMIT_COMPLETE,
 	.msg_order = SOCK_EP_MSG_ORDER,
@@ -78,7 +79,7 @@ const struct fi_tx_attr sock_stx_attr = {
 };
 
 const struct fi_rx_attr sock_srx_attr = {
-	.caps = SOCK_EP_RDM_CAP,
+	.caps = SOCK_EP_RDM_CAP_BASE,
 	.mode = SOCK_MODE,
 	.op_flags = 0,
 	.msg_order = SOCK_EP_MSG_ORDER,
@@ -289,7 +290,7 @@ static int sock_ctx_enable(struct fid_ep *ep)
 		rx_ctx = container_of(ep, struct sock_rx_ctx, ctx.fid);
 		sock_pe_add_rx_ctx(rx_ctx->domain->pe, rx_ctx);
 
-		if (!rx_ctx->ep_attr->listener.listener_thread &&
+		if (!rx_ctx->ep_attr->conn_handle.do_listen &&
 		    sock_conn_listen(rx_ctx->ep_attr)) {
 			SOCK_LOG_ERROR("failed to create listener\n");
 		}
@@ -300,7 +301,7 @@ static int sock_ctx_enable(struct fid_ep *ep)
 		tx_ctx = container_of(ep, struct sock_tx_ctx, fid.ctx.fid);
 		sock_pe_add_tx_ctx(tx_ctx->domain->pe, tx_ctx);
 
-		if (!tx_ctx->ep_attr->listener.listener_thread &&
+		if (!tx_ctx->ep_attr->conn_handle.do_listen &&
 		    sock_conn_listen(tx_ctx->ep_attr)) {
 			SOCK_LOG_ERROR("failed to create listener\n");
 		}
@@ -663,7 +664,8 @@ static int sock_ep_close(struct fid *fid)
 		ofi_atomic_dec32(&sock_ep->attr->ref);
 		return 0;
 	}
-	if (ofi_atomic_get32(&sock_ep->attr->ref) || ofi_atomic_get32(&sock_ep->attr->num_rx_ctx) ||
+	if (ofi_atomic_get32(&sock_ep->attr->ref) ||
+	    ofi_atomic_get32(&sock_ep->attr->num_rx_ctx) ||
 	    ofi_atomic_get32(&sock_ep->attr->num_tx_ctx))
 		return -FI_EBUSY;
 
@@ -673,8 +675,9 @@ static int sock_ep_close(struct fid *fid)
 			SOCK_LOG_DBG("Failed to signal\n");
 
 		if (sock_ep->attr->cm.listener_thread &&
-		    pthread_join(sock_ep->attr->cm.listener_thread, NULL)) {
-			SOCK_LOG_ERROR("pthread join failed (%d)\n", errno);
+			pthread_join(sock_ep->attr->cm.listener_thread, NULL)) {
+			SOCK_LOG_ERROR("pthread join failed (%d)\n",
+				       ofi_syserr());
 		}
 		ofi_close_socket(sock_ep->attr->cm.signal_fds[0]);
 		ofi_close_socket(sock_ep->attr->cm.signal_fds[1]);
@@ -684,7 +687,8 @@ static int sock_ep_close(struct fid *fid)
 	}
 	if (sock_ep->attr->av) {
 		fastlock_acquire(&sock_ep->attr->av->list_lock);
-		fid_list_remove(&sock_ep->attr->av->ep_list, &sock_ep->attr->lock, &sock_ep->ep.fid);
+		fid_list_remove(&sock_ep->attr->av->ep_list,
+				&sock_ep->attr->lock, &sock_ep->ep.fid);
 		fastlock_release(&sock_ep->attr->av->list_lock);
 	}
 
@@ -702,18 +706,13 @@ static int sock_ep_close(struct fid *fid)
 	}
 	pthread_mutex_unlock(&sock_ep->attr->domain->pe->list_lock);
 
-	if (sock_ep->attr->listener.do_listen) {
-		sock_ep->attr->listener.do_listen = 0;
-		if (ofi_write_socket(sock_ep->attr->listener.signal_fds[0], &c, 1) != 1)
-			SOCK_LOG_DBG("Failed to signal\n");
-
-		if (sock_ep->attr->listener.listener_thread &&
-		     pthread_join(sock_ep->attr->listener.listener_thread, NULL)) {
-			SOCK_LOG_ERROR("pthread join failed (%d)\n", errno);
-		}
-
-		ofi_close_socket(sock_ep->attr->listener.signal_fds[0]);
-		ofi_close_socket(sock_ep->attr->listener.signal_fds[1]);
+	if (sock_ep->attr->conn_handle.do_listen) {
+		fastlock_acquire(&sock_ep->attr->domain->conn_listener.signal_lock);
+		fi_epoll_del(sock_ep->attr->domain->conn_listener.emap,
+		             sock_ep->attr->conn_handle.sock);
+		fastlock_release(&sock_ep->attr->domain->conn_listener.signal_lock);
+		ofi_close_socket(sock_ep->attr->conn_handle.sock);
+		sock_ep->attr->conn_handle.do_listen = 0;
 	}
 
 	fastlock_destroy(&sock_ep->attr->cm.lock);
@@ -754,7 +753,6 @@ static int sock_ep_close(struct fid *fid)
 		free(sock_ep->attr->dest_addr);
 
 	fastlock_acquire(&sock_ep->attr->domain->pe->lock);
-	ofi_idm_reset(&sock_ep->attr->conn_idm);
 	ofi_idm_reset(&sock_ep->attr->av_idm);
 	sock_conn_map_destroy(sock_ep->attr);
 	fastlock_release(&sock_ep->attr->domain->pe->lock);
@@ -1042,7 +1040,8 @@ int sock_ep_enable(struct fid_ep *ep)
 	}
 
 	if (sock_ep->attr->ep_type != FI_EP_MSG &&
-	    !sock_ep->attr->listener.listener_thread && sock_conn_listen(sock_ep->attr))
+	    !sock_ep->attr->conn_handle.do_listen &&
+	    sock_conn_listen(sock_ep->attr))
 		SOCK_LOG_ERROR("cannot start connection thread\n");
 	sock_ep->attr->is_enabled = 1;
 	return 0;
@@ -1148,7 +1147,10 @@ static int sock_ep_tx_ctx(struct fid_ep *ep, int index, struct fi_tx_attr *attr,
 		return -FI_EINVAL;
 
 	if (attr) {
-		if (ofi_check_tx_attr(&sock_prov, &sock_ep->tx_attr, attr, 0))
+		if (ofi_check_tx_attr(&sock_prov, sock_ep->attr->info.tx_attr,
+				      attr, 0) ||
+			ofi_check_attr_subset(&sock_prov,
+				sock_ep->attr->info.tx_attr->caps, attr->caps))
 			return -FI_ENODATA;
 		tx_ctx = sock_tx_ctx_alloc(attr, context, 0);
 	} else {
@@ -1191,7 +1193,9 @@ static int sock_ep_rx_ctx(struct fid_ep *ep, int index, struct fi_rx_attr *attr,
 		return -FI_EINVAL;
 
 	if (attr) {
-		if (ofi_check_rx_attr(&sock_prov, &sock_ep->rx_attr, attr, 0))
+		if (ofi_check_rx_attr(&sock_prov, &sock_ep->attr->info, attr, 0) ||
+			ofi_check_attr_subset(&sock_prov, sock_ep->attr->info.rx_attr->caps,
+				attr->caps))
 			return -FI_ENODATA;
 		rx_ctx = sock_rx_ctx_alloc(attr, context, 0);
 	} else {
@@ -1330,17 +1334,20 @@ int sock_srx_ctx(struct fid_domain *domain,
 	return 0;
 }
 
-int sock_get_prefix_len(uint32_t net_addr)
+#if HAVE_GETIFADDRS
+static int sock_get_prefix_len(uint32_t net_addr)
 {
+	uint32_t addr;
 	int count = 0;
-	while (net_addr > 0) {
-		net_addr = net_addr >> 1;
+
+	addr = ntohl(net_addr);
+	while (addr > 0) {
+		addr = addr << 1;
 		count++;
 	}
 	return count;
 }
 
-#if HAVE_GETIFADDRS
 char *sock_get_fabric_name(struct sockaddr_in *src_addr)
 {
 	int ret;
@@ -1487,6 +1494,10 @@ static void sock_set_domain_attr(uint32_t api_version, void *src_addr,
 		attr->max_ep_tx_ctx = sock_domain_attr.max_ep_tx_ctx;
 	if (attr->max_ep_rx_ctx == 0)
 		attr->max_ep_rx_ctx = sock_domain_attr.max_ep_rx_ctx;
+	if (attr->max_ep_stx_ctx == 0)
+		attr->max_ep_stx_ctx = sock_domain_attr.max_ep_stx_ctx;
+	if (attr->max_ep_srx_ctx == 0)
+		attr->max_ep_srx_ctx = sock_domain_attr.max_ep_srx_ctx;
 	if (attr->cntr_cnt == 0)
 		attr->cntr_cnt = sock_domain_attr.cntr_cnt;
 	if (attr->mr_iov_limit == 0)
@@ -1504,7 +1515,7 @@ out:
 
 
 struct fi_info *sock_fi_info(uint32_t version, enum fi_ep_type ep_type,
-			     struct fi_info *hints, void *src_addr,
+			     const struct fi_info *hints, void *src_addr,
 			     void *dest_addr)
 {
 	struct fi_info *info;
@@ -1791,7 +1802,7 @@ int sock_alloc_endpoint(struct fid_domain *domain, struct fi_info *info,
 	}
 
 	if (sock_conn_map_init(sock_ep, sock_cm_def_map_sz)) {
-		SOCK_LOG_ERROR("failed to init connection map: %s\n", strerror(errno));
+		SOCK_LOG_ERROR("failed to init connection map\n");
 		ret = -FI_EINVAL;
 		goto err2;
 	}
@@ -1813,7 +1824,6 @@ err1:
 void sock_ep_remove_conn(struct sock_ep_attr *attr, struct sock_conn *conn)
 {
 	sock_pe_poll_del(attr->domain->pe, conn->sock_fd);
-	ofi_idm_clear(&attr->conn_idm, conn->sock_fd);
 	sock_conn_release_entry(&attr->cmap, conn);
 }
 
@@ -1827,15 +1837,22 @@ struct sock_conn *sock_ep_lookup_conn(struct sock_ep_attr *attr, fi_addr_t index
 	idx = (attr->ep_type == FI_EP_MSG) ? index : index & attr->av->mask;
 
 	conn = ofi_idm_lookup(&attr->av_idm, idx);
-	if (conn && conn != SOCK_CM_CONN_IN_PROGRESS)
+	if (conn && conn != SOCK_CM_CONN_IN_PROGRESS) {
+		if (conn->av_index == FI_ADDR_NOTAVAIL)
+			conn->av_index = idx;
 		return conn;
+	}
 
 	for (i = 0; i < attr->cmap.used; i++) {
 		if (!attr->cmap.table[i].connected)
 			continue;
 
-		if (ofi_equals_sockaddr(&attr->cmap.table[i].addr, addr))
-			return &attr->cmap.table[i];
+		if (ofi_equals_sockaddr(&attr->cmap.table[i].addr, addr)) {
+			conn = &attr->cmap.table[i];
+			if (conn->av_index == FI_ADDR_NOTAVAIL)
+				conn->av_index = idx;
+			break;
+		}
 	}
 	return conn;
 }
@@ -1844,8 +1861,10 @@ int sock_ep_get_conn(struct sock_ep_attr *attr, struct sock_tx_ctx *tx_ctx,
 		     fi_addr_t index, struct sock_conn **pconn)
 {
 	struct sock_conn *conn;
-	uint64_t av_index = (attr->ep_type == FI_EP_MSG) ? 0 : (index & attr->av->mask);
+	uint64_t av_index = (attr->ep_type == FI_EP_MSG) ?
+			    0 : (index & attr->av->mask);
 	struct sockaddr_in *addr;
+	int ret = FI_SUCCESS;
 
 	if (attr->ep_type == FI_EP_MSG)
 		addr = attr->dest_addr;
@@ -1862,16 +1881,16 @@ int sock_ep_get_conn(struct sock_ep_attr *attr, struct sock_tx_ctx *tx_ctx,
 	fastlock_release(&attr->cmap.lock);
 
 	if (conn == SOCK_CM_CONN_IN_PROGRESS)
-		conn = sock_ep_connect(attr, av_index);
+		ret = sock_ep_connect(attr, av_index, &conn);
 
 	if (!conn) {
-		SOCK_LOG_ERROR("Error in connecting: %s\n", strerror(errno));
-		if (errno == EINPROGRESS)
-			return -FI_EAGAIN;
-		else
-			return -errno;
+		SOCK_LOG_ERROR("Undable to find connection entry. "
+			       "Error in connecting: %s\n",
+			       fi_strerror(-ret));
+		return -FI_ENOENT;
 	}
 
 	*pconn = conn;
-	return conn->address_published ? 0 : sock_conn_send_src_addr(attr, tx_ctx, conn);
+	return conn->address_published ?
+	       0 : sock_conn_send_src_addr(attr, tx_ctx, conn);
 }

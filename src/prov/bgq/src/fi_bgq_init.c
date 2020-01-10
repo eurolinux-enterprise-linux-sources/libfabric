@@ -30,7 +30,7 @@
  * SOFTWARE.
  */
 #include "rdma/bgq/fi_bgq.h"
-#include "prov.h"
+#include "ofi_prov.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -40,7 +40,7 @@
 static int fi_bgq_init;
 static int fi_bgq_count;
 
-int fi_bgq_check_info(struct fi_info *info)
+int fi_bgq_check_info(const struct fi_info *info)
 {
 	int ret;
 
@@ -109,7 +109,7 @@ err:
 }
 
 static int fi_bgq_fillinfo(struct fi_info *fi, const char *node,
-		const char* service, struct fi_info *hints,
+		const char* service, const struct fi_info *hints,
 	        uint64_t flags)
 {
 	int ret;
@@ -267,7 +267,7 @@ struct fi_bgq_global_data fi_bgq_global;
 
 static int fi_bgq_getinfo(uint32_t version, const char *node,
 		const char *service, uint64_t flags,
-		struct fi_info *hints, struct fi_info **info)
+		const struct fi_info *hints, struct fi_info **info)
 {
 
 	if (!((FI_BGQ_FABRIC_DIRECT_PROGRESS == FI_PROGRESS_MANUAL) || (FI_BGQ_FABRIC_DIRECT_PROGRESS == FI_PROGRESS_AUTO))){
@@ -330,7 +330,7 @@ static void fi_bgq_fini()
 static struct fi_provider fi_bgq_provider = {
 	.name 		= FI_BGQ_PROVIDER_NAME,
 	.version 	= FI_VERSION(0, 1),
-	.fi_version 	= FI_VERSION(1,5),
+	.fi_version 	= FI_VERSION(1, 6),
 	.getinfo	= fi_bgq_getinfo,
 	.fabric		= fi_bgq_fabric,
 	.cleanup	= fi_bgq_fini

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2015 Intel Corp., Inc.  All rights reserved.
+ * Copyright (c) 2014-2017 Intel Corp., Inc.  All rights reserved.
  * Copyright (c) 2016 Cisco Systems, Inc.  All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -42,7 +42,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "fi.h"
+#include "ofi.h"
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
@@ -125,6 +125,8 @@ static void fi_tostr_flags(char *buf, uint64_t flags)
 	IFFLAGSTR(flags, FI_DELIVERY_COMPLETE);
 	IFFLAGSTR(flags, FI_AFFINITY);
 
+	IFFLAGSTR(flags, FI_RMA_PMEM);
+
 	fi_remove_comma(buf);
 }
 
@@ -198,6 +200,7 @@ static void fi_tostr_order(char *buf, uint64_t flags)
 
 static void fi_tostr_caps(char *buf, uint64_t caps)
 {
+	IFFLAGSTR(caps, FI_RMA_PMEM);
 	IFFLAGSTR(caps, FI_SOURCE_ERR);
 	IFFLAGSTR(caps, FI_LOCAL_COMM);
 	IFFLAGSTR(caps, FI_REMOTE_COMM);
@@ -245,6 +248,7 @@ static void fi_tostr_protocol(char *buf, uint32_t protocol)
 	CASEENUMSTR(FI_PROTO_RXD);
 	CASEENUMSTR(FI_PROTO_MLX);
 	CASEENUMSTR(FI_PROTO_NETWORKDIRECT);
+	CASEENUMSTR(FI_PROTO_SHM);
 	default:
 		if (protocol & FI_PROV_SPECIFIC)
 			strcatf(buf, "Provider specific");
@@ -602,6 +606,7 @@ static void fi_tostr_atomic_op(char *buf, enum fi_op op)
 static void fi_tostr_version(char *buf)
 {
 	strcatf(buf, VERSION);
+	strcatf(buf, BUILD_ID);
 }
 
 static void fi_tostr_eq_event(char *buf, int type)
@@ -636,7 +641,7 @@ static void fi_tostr_cq_event_flags(char *buf, uint64_t flags)
 	fi_remove_comma(buf);
 }
 
-__attribute__((visibility ("default")))
+__attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
 char *DEFAULT_SYMVER_PRE(fi_tostr)(const void *data, enum fi_type datatype)
 {
 	static char *buf = NULL;

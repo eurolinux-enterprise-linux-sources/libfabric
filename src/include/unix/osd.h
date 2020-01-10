@@ -41,6 +41,7 @@
 #include <complex.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/uio.h>
 
 /* MSG_NOSIGNAL doesn't exist on OS X */
 #ifndef MSG_NOSIGNAL
@@ -55,6 +56,9 @@
 #define INVALID_SOCKET (-1)
 #endif
 
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR (-1)
+#endif
 
 #define FI_DESTRUCTOR(func) static __attribute__((destructor)) void func
 
@@ -64,8 +68,12 @@
 #define OFI_UNUSED UNREFERENCED_PARAMETER
 #endif
 
-#define OFI_SOCK_TRY_RCV_AGAIN(err)			\
-	((err) == EAGAIN || (err) == EWOULDBLOCK)
+#define OFI_SOCK_TRY_SND_RCV_AGAIN(err)		\
+	(((err) == EAGAIN)	||		\
+	 ((err) == EWOULDBLOCK))
+
+#define OFI_SOCK_TRY_CONN_AGAIN(err)	\
+	((err) == EINPROGRESS)
 
 struct util_shm
 {
@@ -93,6 +101,11 @@ static inline void ofi_osd_fini(void)
 {
 }
 
+static inline int ofi_getsockname(SOCKET fd, struct sockaddr *addr, socklen_t *len)
+{
+	return getsockname(fd, addr, len);
+}
+
 static inline SOCKET ofi_socket(int domain, int type, int protocol)
 {
 	return socket(domain, type, protocol);
@@ -108,10 +121,43 @@ static inline ssize_t ofi_write_socket(SOCKET fd, const void *buf, size_t count)
 	return write(fd, buf, count);
 }
 
+static inline ssize_t ofi_recv_socket(SOCKET fd, void *buf, size_t count,
+				      int flags)
+{
+	return recv(fd, buf, count, flags);
+}
+
+static inline ssize_t ofi_recvfrom_socket(SOCKET fd, const void *buf, size_t count, int flags,
+					  const struct sockaddr *to, socklen_t tolen)
+{
+	return sendto(fd, buf, count, flags, to, tolen);
+}
+
 static inline ssize_t ofi_send_socket(SOCKET fd, const void *buf, size_t count,
 				      int flags)
 {
 	return send(fd, buf, count, flags);
+}
+
+static inline ssize_t ofi_sendto_socket(SOCKET fd, const void *buf, size_t count, int flags,
+					const struct sockaddr *to, socklen_t tolen)
+{
+	return sendto(fd, buf, count, flags, to, tolen);
+}
+
+static inline ssize_t ofi_writev_socket(SOCKET fd, struct iovec *iov, size_t iov_cnt)
+{
+	return writev(fd, iov, iov_cnt);
+}
+
+static inline ssize_t ofi_readv_socket(SOCKET fd, struct iovec *iov, int iov_cnt)
+{
+	return readv(fd, iov, iov_cnt);
+}
+
+static inline int ofi_shutdown(SOCKET socket, int how)
+{
+	return shutdown(socket, how);
 }
 
 static inline int ofi_close_socket(SOCKET socket)
@@ -119,7 +165,14 @@ static inline int ofi_close_socket(SOCKET socket)
 	return close(socket);
 }
 
+int fi_fd_nonblock(int fd);
+
 static inline int ofi_sockerr(void)
+{
+	return errno;
+}
+
+static inline int ofi_syserr(void)
 {
 	return errno;
 }
@@ -193,5 +246,39 @@ OFI_DEF_COMPLEX_OPS(long_double)
 #define ofi_atomic_add_and_fetch(radix, ptr, val) __sync_add_and_fetch((ptr), (val))
 #define ofi_atomic_sub_and_fetch(radix, ptr, val) __sync_sub_and_fetch((ptr), (val))
 #endif /* HAVE_BUILTIN_ATOMICS */
+
+int ofi_set_thread_affinity(const char *s);
+
+
+#if defined(HAVE_CPUID) && (defined(__x86_64__) || defined(__amd64__))
+
+#include <cpuid.h>
+
+static inline void
+ofi_cpuid(unsigned func, unsigned subfunc, unsigned cpuinfo[4])
+{
+	__cpuid_count(func, subfunc, cpuinfo[0], cpuinfo[1],
+		      cpuinfo[2], cpuinfo[3]);
+}
+
+#define ofi_clwb(addr) \
+	asm volatile(".byte 0x66; xsaveopt %0" : "+m" (*(volatile char *) (addr)))
+#define ofi_clflushopt(addr) \
+	asm volatile(".byte 0x66; clflush %0" : "+m" (*(volatile char *) addr))
+#define ofi_clflush(addr) \
+	asm volatile("clflush %0" : "+m" (*(volatile char *) addr))
+#define ofi_sfence() asm volatile("sfence" ::: "memory")
+
+#else /* defined(__x86_64__) || defined(__amd64__) */
+
+#define ofi_cpuid(func, subfunc, cpuinfo)
+#define ofi_clwb(addr)
+#define ofi_clflushopt(addr)
+#define ofi_clflush(addr)
+#define ofi_sfence()
+
+#endif /* defined(__x86_64__) || defined(__amd64__) */
+
+
 
 #endif /* _FI_UNIX_OSD_H_ */

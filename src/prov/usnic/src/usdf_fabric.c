@@ -58,9 +58,9 @@
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-#include "fi.h"
-#include "fi_enosys.h"
-#include "prov.h"
+#include "ofi.h"
+#include "ofi_enosys.h"
+#include "ofi_prov.h"
 
 #include "usnic_direct.h"
 #include "libnl_utils.h"
@@ -108,7 +108,7 @@ static int usdf_fabric_getname(uint32_t version, struct usd_device_attrs *dap,
 }
 
 static bool usdf_fabric_checkname(uint32_t version,
-				  struct usd_device_attrs *dap, char *hint)
+				  struct usd_device_attrs *dap, const char *hint)
 {
 	int ret;
 	bool valid = false;
@@ -143,7 +143,7 @@ static bool usdf_fabric_checkname(uint32_t version,
 	return usdf_fabric_checkname(FI_VERSION(1, 3), dap, hint);
 }
 
-static int usdf_validate_hints(uint32_t version, struct fi_info *hints)
+static int usdf_validate_hints(uint32_t version, const struct fi_info *hints)
 {
 	struct fi_fabric_attr *fattrp;
 	size_t size;
@@ -228,6 +228,10 @@ usdf_fill_sockaddr_info(struct fi_info *fi,
 	/* copy in dest if specified */
 	if (dest != NULL) {
 		sin = calloc(1, sizeof(*sin));
+		if (NULL == sin) {
+			free(fi->src_addr);
+			return -FI_ENOMEM;
+		}
 		*sin = *dest;
 		fi->dest_addr = sin;
 		fi->dest_addrlen = sizeof(*sin);
@@ -247,6 +251,8 @@ usdf_fill_straddr_info(struct fi_info *fi,
 	 */
 	if (src == NULL) {
 		sin = calloc(1, sizeof(*sin));
+		if (NULL == sin)
+			return -FI_ENOMEM;
 		sin->sin_family = AF_INET;
 		sin->sin_addr.s_addr = dap->uda_ipaddr_be;
 
@@ -261,6 +267,8 @@ usdf_fill_straddr_info(struct fi_info *fi,
 	 * Just copy it.
 	 */
 		address_string = strdup(src);
+		if (NULL == address_string)
+			return -FI_ENOMEM;
 		fi->src_addr = address_string;
 		fi->src_addrlen = strlen(address_string);
 	}
@@ -309,7 +317,7 @@ fail:
 	return ret;		// fi_freeinfo() in caller frees all
 }
 
-static int validate_modebits(uint32_t version, struct fi_info *hints,
+static int validate_modebits(uint32_t version, const struct fi_info *hints,
 			       uint64_t supported, uint64_t *mode_out)
 {
 	uint64_t mode;
@@ -335,7 +343,7 @@ static int validate_modebits(uint32_t version, struct fi_info *hints,
 
 static int usdf_fill_info_dgram(
 	uint32_t version,
-	struct fi_info *hints,
+	const struct fi_info *hints,
 	void *src,
 	void *dest,
 	struct usd_device_attrs *dap,
@@ -430,7 +438,7 @@ fail:
 
 static int usdf_fill_info_msg(
 	uint32_t version,
-	struct fi_info *hints,
+	const struct fi_info *hints,
 	void *src,
 	void *dest,
 	struct usd_device_attrs *dap,
@@ -519,7 +527,7 @@ fail:
 
 static int usdf_fill_info_rdm(
 	uint32_t version,
-	struct fi_info *hints,
+	const struct fi_info *hints,
 	void *src,
 	void *dest,
 	struct usd_device_attrs *dap,
@@ -697,7 +705,7 @@ usdf_get_distance(
  * @return true on success, false on failure. For debug logging can be enabled
  *         to see why a device was disqualified.
  */
-static bool usdf_check_device(uint32_t version, struct fi_info *hints,
+static bool usdf_check_device(uint32_t version, const struct fi_info *hints,
 			      void *src, void *dest,
 			      struct usdf_dev_entry *dep)
 {
@@ -800,8 +808,8 @@ fail:
 
 static int
 usdf_handle_node_and_service(const char *node, const char *service,
-		uint64_t flags, void **src, void **dest, struct fi_info *hints,
-		struct addrinfo **ai)
+		uint64_t flags, void **src, void **dest,
+		const struct fi_info *hints, struct addrinfo **ai)
 {
 	int ret;
 	struct sockaddr_in *sin;
@@ -838,7 +846,7 @@ usdf_handle_node_and_service(const char *node, const char *service,
 
 static int
 usdf_getinfo(uint32_t version, const char *node, const char *service,
-	       uint64_t flags, struct fi_info *hints, struct fi_info **info)
+	       uint64_t flags, const struct fi_info *hints, struct fi_info **info)
 {
 	struct usdf_usnic_info *dp;
 	struct usdf_dev_entry *dep;
@@ -1154,7 +1162,7 @@ static void usdf_fini(void)
 struct fi_provider usdf_ops = {
 	.name = USDF_PROV_NAME,
 	.version = USDF_PROV_VERSION,
-	.fi_version = FI_VERSION(1, 5),
+	.fi_version = FI_VERSION(1, 6),
 	.getinfo = usdf_getinfo,
 	.fabric = usdf_fabric_open,
 	.cleanup =  usdf_fini

@@ -57,7 +57,8 @@ extern "C" {
  * is loaded.
  */
 #define FI_EXT_INI \
-	__attribute__((visibility ("default"))) struct fi_provider* fi_prov_ini(void)
+	__attribute__((visibility ("default"),EXTERNALLY_VISIBLE)) \
+	struct fi_provider* fi_prov_ini(void)
 
 struct fi_provider {
 	uint32_t version;
@@ -65,7 +66,8 @@ struct fi_provider {
 	struct fi_context context;
 	const char *name;
 	int	(*getinfo)(uint32_t version, const char *node, const char *service,
-			uint64_t flags, struct fi_info *hints, struct fi_info **info);
+			uint64_t flags, const struct fi_info *hints,
+			struct fi_info **info);
 	int	(*fabric)(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
 			void *context);
 	void	(*cleanup)(void);
@@ -128,6 +130,11 @@ fi_param_get_bool(struct fi_provider *provider, const char *param_name, int *val
 	return fi_param_get(provider, param_name, value);
 }
 
+static inline int
+fi_param_get_size_t(struct fi_provider *provider, const char *param_name, size_t *value)
+{
+	return fi_param_get(provider, param_name, value);
+}
 
 #ifdef __cplusplus
 }

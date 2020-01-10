@@ -56,22 +56,27 @@ extern "C" {
 #include <rdma/fi_cm.h>
 #include <rdma/fi_errno.h>
 #include <rdma/providers/fi_log.h>
-#include <fi.h>
-#include <fi_lock.h>
-#include <fi_list.h>
-#include "fi_enosys.h"
-#include <fi_mem.h>
-#include <fi_atom.h>
-#include <fi_util.h>
-#include <prov.h>
+#include <ofi.h>
+#include <ofi_lock.h>
+#include <ofi_list.h>
+#include "ofi_enosys.h"
+#include <ofi_mem.h>
+#include <ofi_atom.h>
+#include <ofi_util.h>
+#include <ofi_prov.h>
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <ifaddrs.h>
 
 #define FI_MLX_FABRIC_NAME "mlx"
 #define FI_MLX_DEFAULT_INJECT_SIZE 1024
+#define FI_MLX_DEFAULT_NS_PORT 12345
 #define FI_MLX_DEF_CQ_SIZE (1024)
 #define FI_MLX_DEF_MR_CNT (1 << 16)
 
-#define FI_MLX_VERSION_MINOR 4
+#define FI_MLX_VERSION_MINOR 5
 #define FI_MLX_VERSION_MAJOR 1
 #define FI_MLX_VERSION (FI_VERSION(FI_MLX_VERSION_MAJOR, FI_MLX_VERSION_MINOR))
 
@@ -79,13 +84,17 @@ extern "C" {
 
 #define FI_MLX_MAX_NAME_LEN (1024)
 
-#define FI_MLX_CAPS (FI_TAGGED | FI_SEND | FI_RECV)
+#define FI_MLX_CAPS (FI_SEND | FI_RECV | FI_TAGGED)
 #define FI_MLX_MODE_REQUIRED (0ULL)
 #define FI_MLX_MODE_SUPPORTED (FI_CONTEXT | FI_ASYNC_IOV)
 #define FI_MLX_OP_FLAGS (FI_SEND | FI_RECV)
-
+#define FI_MLX_ANY_SERVICE (0)
 struct mlx_global_descriptor{
 	ucp_config_t *config;
+	int use_ns;
+	int ns_port;
+	struct util_ns name_serv;
+	char *localhost;
 };
 
 struct mlx_fabric {
@@ -105,6 +114,9 @@ struct mlx_ep {
 	struct util_ep ep;
 	struct mlx_av *av; /*until AV is not implemented via utils*/
 	ucp_worker_h worker;
+	short service;
+	void *addr;
+	size_t addr_len;
 };
 
 struct mlx_av {
@@ -171,6 +183,8 @@ int mlx_av_open(
 		struct fid_domain *domain, struct fi_av_attr *attr,
 		struct fid_av **av, void *context);
 
+int mlx_ns_is_service_wildcard(void *svc);
+int mlx_ns_service_cmp(void *svc1, void *svc2);
 /* Callbacks */
 void mlx_send_callback_no_compl( void *request, ucs_status_t status);
 void mlx_send_callback( void *request, ucs_status_t status);

@@ -72,7 +72,7 @@ const struct fi_ep_attr sock_rdm_ep_attr = {
 };
 
 const struct fi_tx_attr sock_rdm_tx_attr = {
-	.caps = SOCK_EP_RDM_CAP,
+	.caps = SOCK_EP_RDM_CAP_BASE,
 	.mode = SOCK_MODE,
 	.op_flags = SOCK_EP_DEFAULT_OP_FLAGS,
 	.msg_order = SOCK_EP_MSG_ORDER,
@@ -83,7 +83,7 @@ const struct fi_tx_attr sock_rdm_tx_attr = {
 };
 
 const struct fi_rx_attr sock_rdm_rx_attr = {
-	.caps = SOCK_EP_RDM_CAP,
+	.caps = SOCK_EP_RDM_CAP_BASE,
 	.mode = SOCK_MODE,
 	.op_flags = 0,
 	.msg_order = SOCK_EP_MSG_ORDER,
@@ -171,9 +171,9 @@ static int sock_rdm_verify_tx_attr(const struct fi_tx_attr *attr)
 	return 0;
 }
 
-int sock_rdm_verify_ep_attr(struct fi_ep_attr *ep_attr,
-			    struct fi_tx_attr *tx_attr,
-			    struct fi_rx_attr *rx_attr)
+int sock_rdm_verify_ep_attr(const struct fi_ep_attr *ep_attr,
+			    const struct fi_tx_attr *tx_attr,
+			    const struct fi_rx_attr *rx_attr)
 {
 	int ret;
 
@@ -242,7 +242,7 @@ int sock_rdm_verify_ep_attr(struct fi_ep_attr *ep_attr,
 }
 
 int sock_rdm_fi_info(uint32_t version, void *src_addr, void *dest_addr,
-		     struct fi_info *hints, struct fi_info **info)
+		     const struct fi_info *hints, struct fi_info **info)
 {
 	*info = sock_fi_info(version, FI_EP_RDM, hints, src_addr, dest_addr);
 	if (!*info)

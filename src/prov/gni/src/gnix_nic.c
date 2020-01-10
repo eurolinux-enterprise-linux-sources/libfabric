@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
- * Copyright (c) 2015-2016 Los Alamos National Security, LLC.
+ * Copyright (c) 2015-2018 Los Alamos National Security, LLC.
  *                         All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -43,6 +43,7 @@
 #include "gnix_cm_nic.h"
 #include "gnix_vc.h"
 #include "gnix_mbox_allocator.h"
+#include "gnix_util.h"
 
 /*
  * TODO: make this a domain parameter
@@ -201,6 +202,9 @@ static int __nic_setup_irq_cq(struct gnix_nic *nic)
 	gni_return_t status;
 	int fd = -1;
 	void *mmap_addr;
+	int vmdh_index = -1;
+	int flags = GNI_MEM_READWRITE;
+	struct gnix_auth_key *info;
 
 	len = (size_t)sysconf(_SC_PAGESIZE);
 
@@ -216,12 +220,48 @@ static int __nic_setup_irq_cq(struct gnix_nic *nic)
 	nic->irq_mmap_addr = mmap_addr;
 	nic->irq_mmap_len = len;
 
+	if (nic->using_vmdh) {
+		info = _gnix_auth_key_lookup(GNIX_PROV_DEFAULT_AUTH_KEY,
+				GNIX_PROV_DEFAULT_AUTH_KEYLEN);
+		assert(info);
+
+		if (!nic->mdd_resources_set) {
+			/* check to see if the ptag registration limit was set
+			   yet or not -- becomes read-only after success */
+			ret = _gnix_auth_key_enable(info);
+			if (ret != FI_SUCCESS && ret != -FI_EBUSY) {
+				GNIX_WARN(FI_LOG_DOMAIN,
+					"failed to enable authorization key, "
+					"unexpected error rc=%d\n", ret);
+			}
+
+			status = GNI_SetMddResources(nic->gni_nic_hndl,
+					(info->attr.prov_key_limit +
+					info->attr.user_key_limit));
+			if (status != GNI_RC_SUCCESS) {
+				GNIX_FATAL(FI_LOG_DOMAIN,
+					"failed to set MDD resources, rc=%d\n",
+					status);
+			}
+
+			nic->mdd_resources_set = 1;
+		}
+		vmdh_index = _gnix_get_next_reserved_key(info);
+		if (vmdh_index <= 0) {
+			GNIX_FATAL(FI_LOG_DOMAIN,
+				"failed to get next reserved key, "
+				"rc=%d\n", vmdh_index);
+		}
+
+		flags |= GNI_MEM_USE_VMDH;
+	}
+
 	status = GNI_MemRegister(nic->gni_nic_hndl,
 				(uint64_t) nic->irq_mmap_addr,
 				len,
 				nic->rx_cq_blk,
-				GNI_MEM_READWRITE,
-				-1,
+				flags,
+				vmdh_index,
 				 &nic->irq_mem_hndl);
 	if (status != GNI_RC_SUCCESS) {
 		ret = gnixu_to_fi_errno(status);
@@ -292,7 +332,7 @@ __desc_lkup_by_id(struct gnix_nic *nic, int desc_id)
 {
 	struct gnix_tx_descriptor *tx_desc;
 
-	assert((desc_id >= 0) && (desc_id < nic->max_tx_desc_id));
+	assert((desc_id >= 0) && (desc_id <= nic->max_tx_desc_id));
 	tx_desc = &nic->tx_desc_base[desc_id];
 	return tx_desc;
 }
@@ -387,12 +427,12 @@ static int __nic_rx_progress(struct gnix_nic *nic)
 
 	do {
 		status = GNI_CqGetEvent(nic->rx_cq, &cqe);
-		if (unlikely(status == GNI_RC_NOT_DONE)) {
+		if (OFI_UNLIKELY(status == GNI_RC_NOT_DONE)) {
 			ret = FI_SUCCESS;
 			break;
 		}
 
-		if (likely(status == GNI_RC_SUCCESS)) {
+		if (OFI_LIKELY(status == GNI_RC_SUCCESS)) {
 			/* Find and schedule the associated VC. */
 			ret = __process_rx_cqe(nic, cqe);
 			if (ret != FI_SUCCESS) {
@@ -473,7 +513,7 @@ static void __nic_get_completed_txd(struct gnix_nic *nic,
 	assert(status == GNI_RC_SUCCESS ||
 	       status == GNI_RC_TRANSACTION_ERROR);
 
-	if (unlikely(status == GNI_RC_TRANSACTION_ERROR)) {
+	if (OFI_UNLIKELY(status == GNI_RC_TRANSACTION_ERROR)) {
 		status = GNI_CqErrorRecoverable(cqe, &recov);
 		if (status == GNI_RC_SUCCESS) {
 			if (!recov) {
@@ -506,7 +546,7 @@ static void __nic_get_completed_txd(struct gnix_nic *nic,
 		txd_p = __desc_lkup_by_id(nic, msg_id);
 	}
 
-	if (unlikely(txd_p == NULL))
+	if (OFI_UNLIKELY(txd_p == NULL))
 		GNIX_FATAL(FI_LOG_EP_DATA, "Unexpected CQE: 0x%lx", cqe);
 
 	/*
@@ -563,12 +603,12 @@ int _gnix_nic_progress(void *arg)
 	int ret = FI_SUCCESS;
 
 	ret =  __nic_tx_progress(nic, nic->tx_cq);
-	if (unlikely(ret != FI_SUCCESS))
+	if (OFI_UNLIKELY(ret != FI_SUCCESS))
 		return ret;
 
 	if (nic->tx_cq_blk && nic->tx_cq_blk != nic->tx_cq) {
 		ret =  __nic_tx_progress(nic, nic->tx_cq_blk);
-		if (unlikely(ret != FI_SUCCESS))
+		if (OFI_UNLIKELY(ret != FI_SUCCESS))
 			return ret;
 	}
 
@@ -968,6 +1008,8 @@ int gnix_nic_alloc(struct gnix_fid_domain *domain,
 			goto err;
 		}
 
+		nic->using_vmdh = domain->using_vmdh;
+
 		if (nic_attr->use_cdm_id == false) {
 			ret = _gnix_cm_nic_create_cdm_id(domain, &fake_cdm_id);
 			if (ret != FI_SUCCESS) {
@@ -1118,7 +1160,7 @@ int gnix_nic_alloc(struct gnix_fid_domain *domain,
 		}
 
 		ret = _gnix_alloc_bitmap(&nic->vc_id_bitmap,
-					 nic->vc_id_table_capacity);
+					 nic->vc_id_table_capacity, NULL);
 		if (ret != FI_SUCCESS) {
 			GNIX_WARN(FI_LOG_EP_CTRL,
 				  "alloc_bitmap returned %d\n", ret);
@@ -1294,7 +1336,7 @@ int gnix_nic_alloc(struct gnix_fid_domain *domain,
 					     (void *)nic);
 			if (ret)
 				GNIX_WARN(FI_LOG_EP_CTRL,
-				"pthread_ceate  call returned %d\n", ret);
+				"pthread_create call returned %d\n", ret);
 		}
 
 		dlist_insert_tail(&nic->gnix_nic_list, &gnix_nic_list);
@@ -1310,6 +1352,7 @@ int gnix_nic_alloc(struct gnix_fid_domain *domain,
 
 	if (nic) {
 		nic->requires_lock = domain->thread_model != FI_THREAD_COMPLETION;
+		nic->using_vmdh = domain->using_vmdh;
 	}
 
 	*nic_ptr = nic;

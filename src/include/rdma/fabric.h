@@ -49,6 +49,12 @@
 #define FI_DEPRECATED_FIELD
 #endif
 
+#if defined(__GNUC__) && !defined(__clang__)
+#define EXTERNALLY_VISIBLE externally_visible
+#else
+#define EXTERNALLY_VISIBLE
+#endif
+
 #if defined(_WIN32)
 #include <BaseTsd.h>
 #include <windows.h>
@@ -64,11 +70,16 @@ extern "C" {
 	((type *) ((char *)ptr - offsetof(type, field)))
 #endif
 
+#ifndef count_of
+#define count_of(x) 	\
+	((sizeof(x)/sizeof(0[x])) / ((size_t)(!(sizeof(x) % sizeof(0[x])))))
+#endif
+
 /* API version (which is not necessarily the same as the
  * tarball/libfabric package version number).
  */
 #define FI_MAJOR_VERSION 1
-#define FI_MINOR_VERSION 5
+#define FI_MINOR_VERSION 6
 
 enum {
 	FI_PATH_MAX		= 256,
@@ -145,7 +156,9 @@ typedef struct fid *fid_t;
 #define FI_TRANSMIT_COMPLETE	(1ULL << 27)
 #define FI_DELIVERY_COMPLETE	(1ULL << 28)
 #define FI_AFFINITY		(1ULL << 29)
+#define FI_COMMIT_COMPLETE	(1ULL << 30)
 
+#define FI_RMA_PMEM		(1ULL << 49)
 #define FI_SOURCE_ERR		(1ULL << 50)
 #define FI_LOCAL_COMM		(1ULL << 51)
 #define FI_REMOTE_COMM		(1ULL << 52)
@@ -178,6 +191,7 @@ enum {
 	FI_ADDR_MLX,
 	FI_ADDR_STR,		/* formatted char * */
 	FI_ADDR_PSMX2,		/* uint64_t[2] */
+	FI_ADDR_IB_UD,		/* uint64_t[4] */
 };
 
 #define FI_ADDR_UNSPEC		((uint64_t) -1)
@@ -228,18 +242,18 @@ enum fi_resource_mgmt {
 	FI_RM_ENABLED
 };
 
-#define FI_ORDER_NONE		0
-#define FI_ORDER_RAR		(1 << 0)
-#define FI_ORDER_RAW		(1 << 1)
-#define FI_ORDER_RAS		(1 << 2)
-#define FI_ORDER_WAR		(1 << 3)
-#define FI_ORDER_WAW		(1 << 4)
-#define FI_ORDER_WAS		(1 << 5)
-#define FI_ORDER_SAR		(1 << 6)
-#define FI_ORDER_SAW		(1 << 7)
-#define FI_ORDER_SAS		(1 << 8)
+#define FI_ORDER_NONE		0ULL
+#define FI_ORDER_RAR		(1ULL << 0)
+#define FI_ORDER_RAW		(1ULL << 1)
+#define FI_ORDER_RAS		(1ULL << 2)
+#define FI_ORDER_WAR		(1ULL << 3)
+#define FI_ORDER_WAW		(1ULL << 4)
+#define FI_ORDER_WAS		(1ULL << 5)
+#define FI_ORDER_SAR		(1ULL << 6)
+#define FI_ORDER_SAW		(1ULL << 7)
+#define FI_ORDER_SAS		(1ULL << 8)
 #define FI_ORDER_STRICT		0x1FF
-#define FI_ORDER_DATA		(1 << 16)
+#define FI_ORDER_DATA		(1ULL << 16)
 
 enum fi_ep_type {
 	FI_EP_UNSPEC,
@@ -274,6 +288,7 @@ enum {
 	FI_PROTO_MLX,
 	FI_PROTO_NETWORKDIRECT,
 	FI_PROTO_PSMX2,
+	FI_PROTO_SHM,
 };
 
 /* Mode bits */
@@ -425,7 +440,8 @@ struct fid {
 };
 
 int fi_getinfo(uint32_t version, const char *node, const char *service,
-	       uint64_t flags, struct fi_info *hints, struct fi_info **info);
+	       uint64_t flags, const struct fi_info *hints,
+	       struct fi_info **info);
 void fi_freeinfo(struct fi_info *info);
 struct fi_info *fi_dupinfo(const struct fi_info *info);
 
@@ -554,7 +570,8 @@ char *fi_tostr(const void *data, enum fi_type datatype);
 enum fi_param_type {
 	FI_PARAM_STRING,
 	FI_PARAM_INT,
-	FI_PARAM_BOOL
+	FI_PARAM_BOOL,
+	FI_PARAM_SIZE_T,
 };
 
 struct fi_param {

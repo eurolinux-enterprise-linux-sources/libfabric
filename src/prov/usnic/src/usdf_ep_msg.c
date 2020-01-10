@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014-2018, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -53,9 +53,9 @@
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-#include "fi.h"
-#include "fi_enosys.h"
-#include "fi_util.h"
+#include "ofi.h"
+#include "ofi_enosys.h"
+#include "ofi_util.h"
 
 #include "usnic_direct.h"
 #include "usd.h"
@@ -117,7 +117,7 @@ static const struct fi_domain_attr msg_dflt_domain_attr = {
 	.control_progress = FI_PROGRESS_AUTO,
 	.data_progress = FI_PROGRESS_MANUAL,
 	.resource_mgmt = FI_RM_DISABLED,
-	.mr_mode = OFI_MR_BASIC_MAP | FI_MR_LOCAL,
+	.mr_mode = FI_MR_ALLOCATED | FI_MR_LOCAL | FI_MR_BASIC,
 	.cntr_cnt = USDF_MSG_CNTR_CNT,
 	.mr_iov_limit = USDF_MSG_MR_IOV_LIMIT,
 	.mr_cnt = USDF_MSG_MR_CNT,
@@ -143,7 +143,7 @@ static struct fi_ops_atomic usdf_msg_atomic_ops = {
 /*******************************************************************************
  * Fill functions for attributes
  ******************************************************************************/
-int usdf_msg_fill_ep_attr(struct fi_info *hints, struct fi_info *fi,
+int usdf_msg_fill_ep_attr(const struct fi_info *hints, struct fi_info *fi,
 		struct usd_device_attrs *dap)
 {
 	struct fi_ep_attr defaults;
@@ -185,7 +185,7 @@ out:
 	return FI_SUCCESS;
 }
 
-int usdf_msg_fill_dom_attr(uint32_t version, struct fi_info *hints,
+int usdf_msg_fill_dom_attr(uint32_t version, const struct fi_info *hints,
 			   struct fi_info *fi, struct usd_device_attrs *dap)
 {
 	int ret;
@@ -245,7 +245,7 @@ int usdf_msg_fill_dom_attr(uint32_t version, struct fi_info *hints,
 		return -FI_ENODATA;
 	}
 
-	if (usdf_check_mr_mode(version, hints, defaults.mr_mode))
+	if (ofi_check_mr_mode(&usdf_ops, version, defaults.mr_mode, hints))
 		return -FI_ENODATA;
 
 	if (hints->domain_attr->mr_cnt <= USDF_MSG_MR_CNT) {
@@ -266,7 +266,7 @@ catch:
 	return FI_SUCCESS;
 }
 
-int usdf_msg_fill_tx_attr(uint32_t version, struct fi_info *hints,
+int usdf_msg_fill_tx_attr(uint32_t version, const struct fi_info *hints,
 			  struct fi_info *fi)
 {
 	int ret;
@@ -318,7 +318,7 @@ catch:
 	return FI_SUCCESS;
 }
 
-int usdf_msg_fill_rx_attr(uint32_t version, struct fi_info *hints, struct fi_info *fi)
+int usdf_msg_fill_rx_attr(uint32_t version, const struct fi_info *hints, struct fi_info *fi)
 {
 	int ret;
 	struct fi_rx_attr defaults;
@@ -901,6 +901,7 @@ static struct fi_ops_msg usdf_msg_ops = {
 static int usdf_ep_msg_control(struct fid *fid, int command, void *arg)
 {
 	struct fid_ep *ep;
+	int ret;
 
 	USDF_TRACE_SYS(EP_CTRL, "\n");
 
@@ -909,15 +910,17 @@ static int usdf_ep_msg_control(struct fid *fid, int command, void *arg)
 		ep = container_of(fid, struct fid_ep, fid);
 		switch (command) {
 		case FI_ENABLE:
-			return usdf_ep_msg_enable(ep);
+			ret = usdf_ep_msg_enable(ep);
 			break;
 		default:
-			return -FI_ENOSYS;
+			ret = -FI_ENOSYS;
 		}
 		break;
 	default:
-		return -FI_ENOSYS;
+		ret = -FI_ENOSYS;
 	}
+
+	return ret;
 }
 
 static struct fi_ops usdf_ep_msg_ops = {
