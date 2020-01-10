@@ -78,6 +78,7 @@ fi_ibv_cq_readerr(struct fid_cq *cq_fid, struct fi_cq_err_entry *entry,
 	struct fi_ibv_cq *cq;
 	struct fi_ibv_wce *wce;
 	struct slist_entry *slist_entry;
+	uint32_t api_version;
 
 	cq = container_of(cq_fid, struct fi_ibv_cq, cq_fid);
 
@@ -89,6 +90,8 @@ fi_ibv_cq_readerr(struct fid_cq *cq_fid, struct fi_cq_err_entry *entry,
 	if (!wce->wc.status)
 		goto err;
 
+	api_version = cq->domain->fab->util_fabric.fabric_fid.api_version;
+
 	slist_entry = slist_remove_head(&cq->wcq);
 	fastlock_release(&cq->lock);
 
@@ -98,8 +101,16 @@ fi_ibv_cq_readerr(struct fid_cq *cq_fid, struct fi_cq_err_entry *entry,
 	entry->flags = fi_ibv_comp_flags(&wce->wc);
 	entry->err = EIO;
 	entry->prov_errno = wce->wc.status;
-	memcpy(&entry->err_data, &wce->wc.vendor_err,
-	       sizeof(wce->wc.vendor_err));
+
+	if ((FI_VERSION_GE(api_version, FI_VERSION(1, 5))) &&
+		entry->err_data && entry->err_data_size) {
+		entry->err_data_size = MIN(entry->err_data_size,
+			sizeof(wce->wc.vendor_err));
+		memcpy(entry->err_data, &wce->wc.vendor_err, entry->err_data_size);
+	} else {
+		memcpy(&entry->err_data, &wce->wc.vendor_err,
+			sizeof(wce->wc.vendor_err));
+	}
 
 	util_buf_release(cq->wce_pool, wce);
 	return sizeof(*entry);
@@ -132,7 +143,7 @@ fi_ibv_poll_events(struct fi_ibv_cq *_cq, int timeout)
 		if (ret)
 			return ret;
 
-		atomic_inc(&_cq->nevents);
+		ofi_atomic_inc32(&_cq->nevents);
 		rc--;
 	}
 	if (fds[1].revents & POLLIN) {
@@ -143,7 +154,7 @@ fi_ibv_poll_events(struct fi_ibv_cq *_cq, int timeout)
 		rc--;
 	}
 	if (rc) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_CQ, "Unknown poll error: check revents\n");
+		VERBS_WARN(FI_LOG_CQ, "Unknown poll error: check revents\n");
 		return -FI_EOTHER;
 	}
 
@@ -211,12 +222,10 @@ static void fi_ibv_cq_read_data_entry(struct ibv_wc *wc, int i, void *buf)
 
 	entry[i].op_context = (void *) (uintptr_t) wc->wr_id;
 	entry[i].flags = fi_ibv_comp_flags(wc);
-
+	entry[i].len = (wc->opcode & (IBV_WC_RECV | IBV_WC_RECV_RDMA_WITH_IMM)) ?
+		wc->byte_len : 0;
 	entry[i].data = (wc->wc_flags & IBV_WC_WITH_IMM) ?
 		ntohl(wc->imm_data) : 0;
-
-	entry->len = (wc->opcode & (IBV_WC_RECV | IBV_WC_RECV_RDMA_WITH_IMM)) ?
-		wc->byte_len : 0;
 }
 
 static int fi_ibv_match_ep_id(struct slist_entry *entry, const void *ep_id)
@@ -249,14 +258,14 @@ ssize_t fi_ibv_poll_cq(struct fi_ibv_cq *cq, struct ibv_wc *wc)
 
 	entry = slist_remove_first_match(&cq->ep_list, fi_ibv_match_ep_id, (void *)wc->wr_id);
 	if (!entry) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_CQ, "No matching EP for :"
-				"given signaled send completion\n");
+		VERBS_WARN(FI_LOG_CQ, "No matching EP for :"
+			   "given signaled send completion\n");
 		return -FI_EOTHER;
 	}
 	epe = container_of(entry, struct fi_ibv_msg_epe, entry);
-	atomic_sub(&epe->ep->unsignaled_send_cnt,
+	ofi_atomic_sub32(&epe->ep->unsignaled_send_cnt,
 			VERBS_SEND_SIGNAL_THRESH(epe->ep));
-	atomic_dec(&epe->ep->comp_pending);
+	ofi_atomic_dec32(&epe->ep->comp_pending);
 	util_buf_release(cq->epe_pool, epe);
 
 	return 0;
@@ -330,7 +339,7 @@ int fi_ibv_cq_signal(struct fid_cq *cq)
 	_cq = container_of(cq, struct fi_ibv_cq, cq_fid);
 
 	if (write(_cq->signal_fd[1], &data, 1) != 1) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_CQ, "Error signalling CQ\n");
+		VERBS_WARN(FI_LOG_CQ, "Error signalling CQ\n");
 		return -errno;
 	}
 
@@ -347,7 +356,7 @@ static int fi_ibv_cq_trywait(struct fid *fid)
 	cq = container_of(fid, struct fi_ibv_cq, cq_fid.fid);
 
 	if (!cq->channel) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_CQ, "No wait object object associated with CQ\n");
+		VERBS_WARN(FI_LOG_CQ, "No wait object object associated with CQ\n");
 		return -FI_EINVAL;
 	}
 
@@ -371,11 +380,11 @@ static int fi_ibv_cq_trywait(struct fid *fid)
 	}
 
 	while (!ibv_get_cq_event(cq->channel, &cq->cq, &context))
-		atomic_inc(&cq->nevents);
+		ofi_atomic_inc32(&cq->nevents);
 
 	rc = ibv_req_notify_cq(cq->cq, 0);
 	if (rc) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_CQ, "ibv_req_notify_cq error: %d\n", ret);
+		VERBS_WARN(FI_LOG_CQ, "ibv_req_notify_cq error: %d\n", ret);
 		ret = -errno;
 		goto err;
 	}
@@ -441,8 +450,8 @@ static int fi_ibv_cq_close(fid_t fid)
 
 	cq = container_of(fid, struct fi_ibv_cq, cq_fid.fid);
 
-	if (atomic_get(&cq->nevents))
-		ibv_ack_cq_events(cq->cq, atomic_get(&cq->nevents));
+	if (ofi_atomic_get32(&cq->nevents))
+		ibv_ack_cq_events(cq->cq, ofi_atomic_get32(&cq->nevents));
 
 	fastlock_acquire(&cq->lock);
 	while (!slist_empty(&cq->wcq)) {
@@ -515,8 +524,8 @@ int fi_ibv_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 		_cq->channel = ibv_create_comp_channel(_cq->domain->verbs);
 		if (!_cq->channel) {
 			ret = -errno;
-			FI_WARN(&fi_ibv_prov, FI_LOG_CQ,
-					"Unable to create completion channel\n");
+			VERBS_WARN(FI_LOG_CQ,
+				   "Unable to create completion channel\n");
 			goto err1;
 		}
 
@@ -548,29 +557,29 @@ int fi_ibv_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 
 	if (!_cq->cq) {
 		ret = -errno;
-		FI_WARN(&fi_ibv_prov, FI_LOG_CQ, "Unable to create verbs CQ\n");
+		VERBS_WARN(FI_LOG_CQ, "Unable to create verbs CQ\n");
 		goto err3;
 	}
 
 	if (_cq->channel) {
 		ret = ibv_req_notify_cq(_cq->cq, 0);
 		if (ret) {
-			FI_WARN(&fi_ibv_prov, FI_LOG_CQ,
-				"ibv_req_notify_cq failed\n");
+			VERBS_WARN(FI_LOG_CQ,
+				   "ibv_req_notify_cq failed\n");
 			goto err4;
 		}
 	}
 
 	_cq->wce_pool = util_buf_pool_create(sizeof(struct fi_ibv_wce), 16, 0, VERBS_WCE_CNT);
 	if (!_cq->wce_pool) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_CQ, "Failed to create wce_pool\n");
+		VERBS_WARN(FI_LOG_CQ, "Failed to create wce_pool\n");
 		ret = -FI_ENOMEM;
 		goto err4;
 	}
 
 	_cq->epe_pool = util_buf_pool_create(sizeof(struct fi_ibv_msg_epe), 16, 0, VERBS_EPE_CNT);
 	if (!_cq->epe_pool) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_CQ, "Failed to create epe_pool\n");
+		VERBS_WARN(FI_LOG_CQ, "Failed to create epe_pool\n");
 		ret = -FI_ENOMEM;
 		goto err5;
 	}
@@ -613,7 +622,7 @@ int fi_ibv_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 	_cq->wr_id_mask = (~_cq->wr_id_mask) << ep_cnt_bits;
 
 	_cq->trywait = fi_ibv_cq_trywait;
-	atomic_initialize(&_cq->nevents, 0);
+	ofi_atomic_initialize32(&_cq->nevents, 0);
 
 	*cq = &_cq->cq_fid;
 	return 0;

@@ -1,6 +1,7 @@
 /*
- * Copyright (c) 2015-2016 Cray Inc.  All rights reserved.
- * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
+ * Copyright (c) 2015-2017 Cray Inc.  All rights reserved.
+ * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
+ *                         All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -42,6 +43,7 @@
 #include "gnix_bitmap.h"
 #include "gnix_av.h"
 #include "gnix_xpmem.h"
+#include "gnix_cm_nic.h"
 
 /*
  * mode bits
@@ -58,6 +60,7 @@
 #define GNIX_VC_FLAG_RX_SCHEDULED	0
 #define GNIX_VC_FLAG_WORK_SCHEDULED	1
 #define GNIX_VC_FLAG_TX_SCHEDULED	2
+#define GNIX_VC_FLAG_SCHEDULED		4
 
 /*
  * defines for connection state for gnix VC
@@ -80,15 +83,13 @@ enum gnix_vc_conn_req_type {
 #define REMOTE_MBOX_RCVD (1UL << 1)
 
 /**
- * Virual Connection (VC) struct
+ * Virtual Connection (VC) struct
  *
- * @var rx_list              NIC RX VC list
+ * @var prog_list            NIC VC progress list
  * @var work_queue           Deferred work request queue
- * @var work_queue_lock      Deferred work request queue lock
- * @var work_list            NIC work VC list
  * @var tx_queue             TX request queue
- * @var tx_queue_lock        TX request queue lock
- * @var tx_list              NIC TX VC list
+ * @var list                 used for unmapped vc list
+ * @var fr_list              used for vc free list
  * @var entry                used internally for managing linked lists
  *                           of vc structs that require O(1) insertion/removal
  * @var peer_fi_addr         FI address of peer with which this VC is connected
@@ -100,7 +101,6 @@ enum gnix_vc_conn_req_type {
  *                           associated
  * @var smsg_mbox            pointer to GNI SMSG mailbox used by this VC
  *                           to exchange SMSG messages with its peer
- * @var dgram                pointer to dgram - used in connection setup
  * @var gni_ep               GNI endpoint for this VC
  * @var outstanding_fab_reqs Count of outstanding libfabric level requests
  *                           associated with this endpoint.
@@ -114,27 +114,23 @@ enum gnix_vc_conn_req_type {
  * @var flags                Bitmap used to hold vc schedule state
  * @var peer_irq_mem_hndl    peer GNI memhndl used for delivering
  *                           GNI_PostCqWrite requests to remote peer
+ * @var peer_caps            peer capability flags
  */
 struct gnix_vc {
-	struct dlist_entry rx_list;	/* RX VC list entry */
-
+	struct dlist_entry prog_list;	/* NIC VC progress list entry */
 	struct dlist_entry work_queue;	/* Work reqs */
-	fastlock_t work_queue_lock;	/* Work req lock */
-	struct dlist_entry work_list;	/* Work VC list entry */
-
 	struct dlist_entry tx_queue;	/* TX reqs */
-	fastlock_t tx_queue_lock;	/* TX reqs lock */
-	struct dlist_entry tx_list;	/* TX VC list entry */
 
 	struct dlist_entry list;	/* General purpose list */
+	struct dlist_entry fr_list;	/* fr list */
 	fi_addr_t peer_fi_addr;
 	struct gnix_address peer_addr;
 	struct gnix_address peer_cm_nic_addr;
 	struct gnix_fid_ep *ep;
 	void *smsg_mbox;
-	struct gnix_datagram *dgram;
+	void *gnix_ep_name;
 	gni_ep_handle_t gni_ep;
-	atomic_t outstanding_tx_reqs;
+	ofi_atomic32_t outstanding_tx_reqs;
 	enum gnix_vc_conn_state conn_state;
 	uint32_t post_state;
 	int vc_id;
@@ -173,33 +169,6 @@ int _gnix_vc_alloc(struct gnix_fid_ep *ep_priv,
  *         connection request.
  */
 int _gnix_vc_connect(struct gnix_vc *vc);
-
-
-/**
- * @brief Sets up an accepting vc - one accepting vc can accept a
- *        single incoming connection request
- *
- * @param[in]  vc   pointer to previously allocated vc struct with
- *                  FI_ADDR_UNSPEC value supplied for the fi_addr_t
- *                  argument
- *
- * @return FI_SUCCESS on success, -FI_EINVAL if an invalid field in the vc
- *         struct is encountered, -ENOMEM if insufficient memory to initiate
- *         accept request.
- */
-int _gnix_vc_accept(struct gnix_vc *vc);
-
-/**
- * @brief Initiates a non-blocking disconnect of a vc from its peer
- *
- * @param[in]  vc   pointer to previously allocated and connected vc struct
- *
- * @return FI_SUCCESS on success, -FI_EINVAL if an invalid field in the vc
- *         struct is encountered, -ENOMEM if insufficient memory to initiate
- *         connection request.
- */
-int _gnix_vc_disconnect(struct gnix_vc *vc);
-
 
 /**
  * @brief Destroys a previously allocated vc and cleans up resources
@@ -248,6 +217,14 @@ int _gnix_vc_rx_schedule(struct gnix_vc *vc);
  * @param[in] req The GNIX fabric request to queue.
  */
 int _gnix_vc_queue_work_req(struct gnix_fab_req *req);
+
+/**
+ * @brief Requeue a request with deferred work.  Used only in TX completers
+ * where the VC lock is not yet held.
+ *
+ * @param[in] req The GNIX fabric request to requeue.
+ */
+int _gnix_vc_requeue_work_req(struct gnix_fab_req *req);
 
 /**
  * @brief Schedule a VC for TX progress.
@@ -325,6 +302,10 @@ fi_addr_t _gnix_vc_peer_fi_addr(struct gnix_vc *vc);
 
 int _gnix_vc_cm_init(struct gnix_cm_nic *cm_nic);
 int _gnix_vc_schedule(struct gnix_vc *vc);
+int _gnix_vc_smsg_init(struct gnix_vc *vc,
+		       int peer_id,
+		       gni_smsg_attr_t *peer_smsg_attr,
+		       gni_mem_handle_t *peer_irq_mem_hndl);
 
 /*
  * inline functions
@@ -341,6 +322,5 @@ static inline enum gnix_vc_conn_state _gnix_vc_state(struct gnix_vc *vc)
 	assert(vc);
 	return vc->conn_state;
 }
-
 
 #endif /* _GNIX_VC_H_ */

@@ -44,16 +44,16 @@
 static void udpx_getinfo_ifs(struct fi_info **info)
 {
 	struct ifaddrs *ifaddrs, *ifa;
-	struct fi_info *head, *tail, *cur;
+	struct fi_info *head, *tail, *cur, *loopback;
 	size_t addrlen;
 	uint32_t addr_format;
 	int ret;
 
-	ret = getifaddrs(&ifaddrs);
+	ret = ofi_getifaddrs(&ifaddrs);
 	if (ret)
 		return;
 
-	head = tail = NULL;
+	head = tail = loopback = NULL;
 	for (ifa = ifaddrs; ifa != NULL; ifa = ifa->ifa_next) {
 		if (ifa->ifa_addr == NULL || !(ifa->ifa_flags & IFF_UP))
 			continue;
@@ -75,11 +75,16 @@ static void udpx_getinfo_ifs(struct fi_info **info)
 		if (!cur)
 			break;
 
-		if (!head)
-			head = cur;
-		else
-			tail->next = cur;
-		tail = cur;
+		if(!ofi_is_loopback_addr(ifa->ifa_addr)) {
+			if (!head)
+				head = cur;
+			else
+				tail->next = cur;
+			tail = cur;
+		} else {
+			cur->next = loopback;
+			loopback = cur;
+		}
 
 		if ((cur->src_addr = mem_dup(ifa->ifa_addr, addrlen))) {
 			cur->src_addrlen = addrlen;
@@ -88,7 +93,16 @@ static void udpx_getinfo_ifs(struct fi_info **info)
 	}
 	freeifaddrs(ifaddrs);
 
-	if (head) {
+	if (head || loopback) {
+		if(!head) { /* loopback interface only? */
+			head = loopback;
+		} else {
+			/* append loopback interfaces to tail */
+			assert(tail);
+			assert(!tail->next);
+			tail->next = loopback;
+		}
+
 		fi_freeinfo(*info);
 		*info = head;
 	}
@@ -96,11 +110,6 @@ static void udpx_getinfo_ifs(struct fi_info **info)
 #else
 #define udpx_getinfo_ifs(info) do{}while(0)
 #endif
-
-int udpx_check_info(struct fi_info *info)
-{
-	return fi_check_info(&udpx_util_prov, info, FI_MATCH_EXACT);
-}
 
 static int udpx_getinfo(uint32_t version, const char *node, const char *service,
 			uint64_t flags, struct fi_info *hints, struct fi_info **info)
@@ -126,7 +135,7 @@ static void udpx_fini(void)
 struct fi_provider udpx_prov = {
 	.name = "UDP",
 	.version = FI_VERSION(UDPX_MAJOR_VERSION, UDPX_MINOR_VERSION),
-	.fi_version = FI_VERSION(1, 3),
+	.fi_version = FI_VERSION(1, 5),
 	.getinfo = udpx_getinfo,
 	.fabric = udpx_fabric,
 	.cleanup = udpx_fini

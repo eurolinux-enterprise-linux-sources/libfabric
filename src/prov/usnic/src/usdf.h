@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2016, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -76,6 +76,13 @@ extern struct fi_provider usdf_ops;
 #define USDF_EVENT_FLAG_ERROR (1ULL << 62)
 #define USDF_EVENT_FLAG_FREE_BUF (1ULL << 63)
 
+/* usdf domain capability: no loopback */
+#define USDF_DOM_CAPS (FI_REMOTE_COMM)
+
+#define USDF_MR_IOV_LIMIT 1
+#define USDF_MR_CNT (65535)
+#define USDF_ADDR_STR_LEN (INET6_ADDRSTRLEN+8)
+
 /*
  *  TAILQ stuff that should exist
  */
@@ -106,8 +113,8 @@ struct usdf_fabric {
 	struct fi_fabric_attr fab_attr;
 	struct usd_device_attrs *fab_dev_attrs;
 	int fab_arp_sockfd;
-	atomic_t fab_refcnt;
-	atomic_t num_blocked_waiting;
+	ofi_atomic32_t fab_refcnt;
+	ofi_atomic32_t num_blocked_waiting;
 	LIST_HEAD(,usdf_domain) fab_domain_list;
 
 	/* progression */
@@ -132,7 +139,7 @@ struct usdf_domain {
 	struct fid_domain   dom_fid;
 	struct usdf_fabric *dom_fabric;
 	struct fi_info *dom_info;
-	atomic_t dom_refcnt;
+	ofi_atomic32_t dom_refcnt;
 	struct usdf_eq *dom_eq;
 	struct usd_device   *dom_dev;
 
@@ -142,7 +149,7 @@ struct usdf_domain {
 
 	struct usdf_rdm_connection **dom_rdc_hashtab;
 	SLIST_HEAD(,usdf_rdm_connection) dom_rdc_free;
-	atomic_t dom_rdc_free_cnt;
+	ofi_atomic32_t dom_rdc_free_cnt;
 	size_t dom_rdc_total;
 
 	/* used only by connected endpoints */
@@ -167,11 +174,14 @@ enum usdf_pep_state {
 
 struct usdf_pep {
 	struct fid_pep pep_fid;
-	atomic_t pep_refcnt;
+	ofi_atomic32_t pep_refcnt;
 	struct usdf_fabric *pep_fabric;
 	struct usdf_eq *pep_eq;
 	int pep_sock;
-	struct sockaddr_in pep_src_addr;
+	union {
+		struct sockaddr_in sin;
+		char addr_str[USDF_ADDR_STR_LEN];
+	} pep_src_addr;
 	enum usdf_pep_state pep_state;
 	struct usdf_poll_item pep_pollitem;
 	struct fi_info *pep_info;
@@ -190,7 +200,7 @@ struct usdf_pep {
 
 struct usdf_tx {
 	struct fid_stx tx_fid;
-	atomic_t tx_refcnt;
+	ofi_atomic32_t tx_refcnt;
 	struct usdf_domain *tx_domain;
 	TAILQ_ENTRY(usdf_tx) tx_link;
 
@@ -212,7 +222,7 @@ struct usdf_tx {
 		struct {
 			struct usdf_cq_hard *tx_hcq;
 
-			atomic_t tx_next_msg_id;
+			ofi_atomic32_t tx_next_msg_id;
 			struct usdf_rdm_qe *tx_wqe_buf;
 			uint8_t *tx_inject_bufs;
 			TAILQ_HEAD(,usdf_rdm_qe) tx_free_wqe;
@@ -229,7 +239,7 @@ struct usdf_tx {
 
 struct usdf_rx {
 	struct fid_ep rx_fid;
-	atomic_t rx_refcnt;
+	ofi_atomic32_t rx_refcnt;
 	struct usdf_domain *rx_domain;
 
 	struct fi_rx_attr rx_attr;
@@ -270,7 +280,7 @@ enum {
 struct usdf_ep {
 	struct fid_ep ep_fid;
 	struct usdf_domain *ep_domain;
-	atomic_t ep_refcnt;
+	ofi_atomic32_t ep_refcnt;
 	uint64_t ep_caps;
 	uint64_t ep_mode;
 
@@ -359,7 +369,7 @@ struct usdf_mr {
 struct usdf_cq_hard {
 	struct usdf_cq *cqh_cq;
 	struct usd_cq *cqh_ucq;
-	atomic_t cqh_refcnt;
+	ofi_atomic32_t cqh_refcnt;
 	void (*cqh_progress)(struct usdf_cq_hard *hcq);
 	void (*cqh_post)(struct usdf_cq_hard *hcq, void *context, size_t len,
 			int prov_errno, uint64_t flags);
@@ -378,7 +388,7 @@ struct usdf_cq_soft_entry {
 
 struct usdf_cq {
 	struct fid_cq cq_fid;
-	atomic_t cq_refcnt;
+	ofi_atomic32_t cq_refcnt;
 	struct usdf_domain *cq_domain;
 	struct fi_cq_attr cq_attr;
 	uint8_t cq_is_soft;
@@ -432,7 +442,7 @@ struct usdf_event {
 struct usdf_eq {
 	struct fid_eq eq_fid;
 	struct usdf_fabric *eq_fabric;
-	atomic_t eq_refcnt;
+	ofi_atomic32_t eq_refcnt;
 
 	pthread_spinlock_t eq_lock;
 
@@ -442,7 +452,7 @@ struct usdf_eq {
 	struct usdf_event *eq_ev_tail;
 	struct usdf_event *eq_ev_end;
 	int eq_ev_ring_size;
-	atomic_t eq_num_events;
+	ofi_atomic32_t eq_num_events;
 
 	/* various ways to wait */
 	struct fi_eq_attr eq_attr;
@@ -479,6 +489,8 @@ int usdf_endpoint_open(struct fid_domain *domain, struct fi_info *info,
 		struct fid_ep **ep, void *context);
 int usdf_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 		 struct fid_av **av_o, void *context);
+int usdf_query_atomic(struct fid_domain *domain, enum fi_datatype datatype,
+		enum fi_op op, struct fi_atomic_attr *attr, uint64_t flags);
 
 /* Domain name functionality */
 int usdf_domain_getname(uint32_t version, struct usd_device_attrs *dap,
@@ -488,13 +500,30 @@ bool usdf_domain_checkname(uint32_t version, struct usd_device_attrs *dap,
 
 /* fi_ops_mr */
 int usdf_reg_mr(struct fid *fid, const void *buf, size_t len,
-	uint64_t access, uint64_t offset, uint64_t requested_key,
-	uint64_t flags, struct fid_mr **mr_o, void *context);
+		uint64_t access, uint64_t offset, uint64_t requested_key,
+		uint64_t flags, struct fid_mr **mr_o, void *context);
+int usdf_regv_mr(struct fid *fid, const struct iovec *iov,
+		 size_t count, uint64_t access,
+		 uint64_t offset, uint64_t requested_key,
+		 uint64_t flags, struct fid_mr **mr, void *context);
+int usdf_regattr(struct fid *fid, const struct fi_mr_attr *attr,
+		 uint64_t flags, struct fid_mr **mr);
 
 /* Fake IBV provider */
 void usdf_setup_fake_ibv_provider(void);
 
 /* passive endpoint functions */
 int usdf_pep_steal_socket(struct usdf_pep *pep, int *is_bound, int *sock_o);
+
+/* Utility functions */
+int usdf_catch_dom_attr(uint32_t version, struct fi_info *hints,
+			struct fi_domain_attr *dom_attr);
+int usdf_catch_tx_attr(uint32_t version, struct fi_tx_attr *tx_attr);
+int usdf_catch_rx_attr(uint32_t version, struct fi_rx_attr *rx_attr);
+int usdf_check_mr_mode(uint32_t version, struct fi_info *hints,
+		       uint64_t prov_mode);
+struct sockaddr_in *usdf_format_to_sin(struct fi_info *info, const void *addr);
+void *usdf_sin_to_format(struct fi_info *info, void *addr, size_t *len);
+void usdf_free_sin_if_needed(struct fi_info *info, struct sockaddr_in *sin);
 
 #endif /* _USDF_H_ */

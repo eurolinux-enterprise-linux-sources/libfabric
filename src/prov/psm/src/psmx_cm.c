@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -53,6 +53,7 @@ static int psmx_cm_getname(fid_t fid, void *addr, size_t *addrlen)
 
 struct fi_ops_cm psmx_cm_ops = {
 	.size = sizeof(struct fi_ops_cm),
+	.setname = fi_no_setname,
 	.getname = psmx_cm_getname,
 	.getpeer = fi_no_getpeer,
 	.connect = fi_no_connect,
@@ -60,5 +61,6 @@ struct fi_ops_cm psmx_cm_ops = {
 	.accept = fi_no_accept,
 	.reject = fi_no_reject,
 	.shutdown = fi_no_shutdown,
+	.join = fi_no_join,
 };
 

@@ -41,10 +41,20 @@ static void fi_ibv_fini(void);
 
 static const char *local_node = "localhost";
 
+#define VERBS_DEFAULT_MIN_RNR_TIMER 12
+
+size_t verbs_default_tx_size 		= 384;
+size_t verbs_default_rx_size 		= 384;
+size_t verbs_default_tx_iov_limit 	= 4;
+size_t verbs_default_rx_iov_limit 	= 4;
+size_t verbs_default_inline_size 	= 64;
+
+size_t verbs_min_rnr_timer = VERBS_DEFAULT_MIN_RNR_TIMER;
+
 struct fi_provider fi_ibv_prov = {
 	.name = VERBS_PROV_NAME,
 	.version = VERBS_PROV_VERS,
-	.fi_version = FI_VERSION(1, 3),
+	.fi_version = FI_VERSION(1, 5),
 	.getinfo = fi_ibv_getinfo,
 	.fabric = fi_ibv_fabric,
 	.cleanup = fi_ibv_fini
@@ -73,8 +83,8 @@ int fi_ibv_rdm_cm_bind_ep(struct fi_ibv_rdm_cm *cm, struct fi_ibv_rdm_ep *ep)
 
 	assert(cm->ec && cm->listener);
 
-	if (ep->domain->info->src_addr) {
-		memcpy(&ep->my_addr, ep->domain->info->src_addr, sizeof(ep->my_addr));
+	if (ep->info->src_addr) {
+		memcpy(&ep->my_addr, ep->info->src_addr, sizeof(ep->my_addr));
 
 		inet_ntop(ep->my_addr.sin_family,
 			  &ep->my_addr.sin_addr.s_addr,
@@ -174,7 +184,7 @@ int fi_ibv_create_ep(const char *node, const char *service,
 		     uint64_t flags, const struct fi_info *hints,
 		     struct rdma_addrinfo **rai, struct rdma_cm_id **id)
 {
-	struct rdma_addrinfo *_rai;
+	struct rdma_addrinfo *_rai = NULL;
 	int ret;
 
 	ret = fi_ibv_get_rdma_rai(node, service, flags, hints, &_rai);
@@ -209,8 +219,8 @@ void fi_ibv_destroy_ep(struct rdma_addrinfo *rai, struct rdma_cm_id **id)
 }
 
 #define VERBS_SIGNAL_SEND(ep) \
-	(atomic_get(&ep->unsignaled_send_cnt) >= VERBS_SEND_SIGNAL_THRESH(ep) && \
-	 !atomic_get(&ep->comp_pending))
+	(ofi_atomic_get32(&ep->unsignaled_send_cnt) >= VERBS_SEND_SIGNAL_THRESH(ep) && \
+	 !ofi_atomic_get32(&ep->comp_pending))
 
 static int fi_ibv_signal_send(struct fi_ibv_msg_ep *ep, struct ibv_send_wr *wr)
 {
@@ -228,7 +238,7 @@ static int fi_ibv_signal_send(struct fi_ibv_msg_ep *ep, struct ibv_send_wr *wr)
 		wr->wr_id = ep->ep_id;
 		epe->ep = ep;
 		slist_insert_tail(&epe->entry, &ep->scq->ep_list);
-		atomic_inc(&ep->comp_pending);
+		ofi_atomic_inc32(&ep->comp_pending);
 	}
 	fastlock_release(&ep->scq->lock);
 	return 0;
@@ -241,7 +251,7 @@ static int fi_ibv_reap_comp(struct fi_ibv_msg_ep *ep)
 	int ret = 0;
 
 	fastlock_acquire(&ep->scq->lock);
-	while (atomic_get(&ep->comp_pending) > 0) {
+	while (ofi_atomic_get32(&ep->comp_pending) > 0) {
 		if (!wce) {
 			wce = util_buf_alloc(ep->scq->wce_pool);
 			if (!wce) {
@@ -252,8 +262,8 @@ static int fi_ibv_reap_comp(struct fi_ibv_msg_ep *ep)
 		}
 		ret = fi_ibv_poll_cq(ep->scq, &wce->wc);
 		if (ret < 0) {
-			FI_WARN(&fi_ibv_prov, FI_LOG_EP_DATA,
-				"Failed to read completion for signaled send\n");
+			VERBS_WARN(FI_LOG_EP_DATA,
+				   "Failed to read completion for signaled send\n");
 			util_buf_release(ep->scq->wce_pool, wce);
 			fastlock_release(&ep->scq->lock);
 			return ret;
@@ -285,16 +295,16 @@ ssize_t fi_ibv_send(struct fi_ibv_msg_ep *ep, struct ibv_send_wr *wr, size_t len
 
 	if (wr->send_flags & IBV_SEND_SIGNALED) {
 		assert((wr->wr_id & ep->scq->wr_id_mask) != ep->scq->send_signal_wr_id);
-		atomic_set(&ep->unsignaled_send_cnt, 0);
+		ofi_atomic_set32(&ep->unsignaled_send_cnt, 0);
 	} else {
 		if (VERBS_SIGNAL_SEND(ep)) {
 			ret = fi_ibv_signal_send(ep, wr);
 			if (ret)
 				return ret;
 		} else {
-			atomic_inc(&ep->unsignaled_send_cnt);
+			ofi_atomic_inc32(&ep->unsignaled_send_cnt);
 
-			if (atomic_get(&ep->unsignaled_send_cnt) >=
+			if (ofi_atomic_get32(&ep->unsignaled_send_cnt) >=
 					VERBS_SEND_COMP_THRESH(ep)) {
 				ret = fi_ibv_reap_comp(ep);
 				if (ret)
@@ -351,7 +361,96 @@ ssize_t fi_ibv_send_iov_flags(struct fi_ibv_msg_ep *ep, struct ibv_send_wr *wr,
 
 	wr->send_flags = VERBS_INJECT_FLAGS(ep, len, flags) | VERBS_COMP_FLAGS(ep, flags);
 
+	if (flags & FI_FENCE)
+		wr->send_flags = IBV_SEND_FENCE;
+
 	return fi_ibv_send(ep, wr, len, count, context);
+}
+
+static int fi_ibv_get_param_int(char *param_name, char *param_str,
+				size_t *param_default)
+{
+	char *param_help;
+	size_t len, ret_len;
+	int param, ret = FI_SUCCESS;
+
+	len = strlen(param_str) + 50;
+	param_help = calloc(1, len);
+	if (!param_help)
+		return -FI_ENOMEM;
+
+	ret_len = snprintf(param_help, len, "%s (default: %zu)", param_str,
+			   *param_default);
+	if (ret_len >= len) {
+		VERBS_WARN(FI_LOG_EP_DATA,
+			   "param_help string size insufficient!\n");
+		assert(0);
+		ret = -FI_ETOOSMALL;
+		goto out;
+	}
+
+	fi_param_define(&fi_ibv_prov, param_name, FI_PARAM_INT, param_help);
+
+	if (!fi_param_get_int(&fi_ibv_prov, param_name, &param))
+		*param_default = param;
+
+out:
+	free(param_help);
+	return ret;
+}
+
+#if ENABLE_DEBUG
+static int fi_ibv_dbg_query_qp_attr(struct ibv_qp *qp)
+{
+	struct ibv_qp_init_attr attr = { 0 };
+	struct ibv_qp_attr qp_attr = { 0 };
+	int ret;
+
+	ret = ibv_query_qp(qp, &qp_attr, IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+			   IBV_QP_RNR_RETRY | IBV_QP_MIN_RNR_TIMER, &attr);
+	if (ret) {
+		VERBS_WARN(FI_LOG_EP_CTRL, "Unable to query QP\n");
+		return ret;
+	}
+	FI_DBG_TRACE(&fi_ibv_prov, FI_LOG_EP_CTRL, "QP attributes: "
+		     "min_rnr_timer"	": %" PRIu8 ", "
+		     "timeout"		": %" PRIu8 ", "
+		     "retry_cnt"	": %" PRIu8 ", "
+		     "rnr_retry"	": %" PRIu8 "\n",
+		     qp_attr.min_rnr_timer, qp_attr.timeout, qp_attr.retry_cnt,
+		     qp_attr.rnr_retry);
+	return 0;
+}
+#else
+static int fi_ibv_dbg_query_qp_attr(struct ibv_qp *qp)
+{
+	return 0;
+}
+#endif
+
+int fi_ibv_set_rnr_timer(struct ibv_qp *qp)
+{
+	struct ibv_qp_attr attr = { 0 };
+	int ret;
+
+	if (verbs_min_rnr_timer > 31) {
+		VERBS_WARN(FI_LOG_EQ, "min_rnr_timer value out of valid range; "
+			   "using default value of %d\n",
+			   VERBS_DEFAULT_MIN_RNR_TIMER);
+		attr.min_rnr_timer = VERBS_DEFAULT_MIN_RNR_TIMER;
+	} else {
+		attr.min_rnr_timer = verbs_min_rnr_timer;
+	}
+
+	ret = ibv_modify_qp(qp, &attr, IBV_QP_MIN_RNR_TIMER);
+	if (ret) {
+		VERBS_WARN(FI_LOG_EQ, "Unable to modify QP attribute\n");
+		return ret;
+	}
+	ret = fi_ibv_dbg_query_qp_attr(qp);
+	if (ret)
+		return ret;
+	return 0;
 }
 
 static void fi_ibv_fini(void)
@@ -371,9 +470,12 @@ VERBS_INI
 	fi_param_define(&fi_ibv_prov, "rdm_buffer_size", FI_PARAM_INT,
 			"the maximum size of a buffered operation (bytes) "
 			"(default: platform specific)");
+	fi_param_define(&fi_ibv_prov, "rdm_use_odp", FI_PARAM_BOOL,
+			"enable on-demand paging experimental feature"
+			"(default: platform specific)");
 	fi_param_define(&fi_ibv_prov, "rdm_rndv_seg_size", FI_PARAM_INT,
 			"the segment size for zero copy protocols (bytes)"
-			"(default: 1073741824)");
+			"(default: platform specific");
 	fi_param_define(&fi_ibv_prov, "rdm_cqread_bunch_size", FI_PARAM_INT,
 			"the number of entries to be read from the verbs "
 			"completion queue at a time (default: 8)");
@@ -385,6 +487,31 @@ VERBS_INI
 			"Only IBV_WR_SEND and IBV_WR_RDMA_WRITE_WITH_IMM are supported. "
 			"The last one is not applicable for iWarp. "
 			"(default: IBV_WR_SEND)");
+
+	if (fi_ibv_get_param_int("tx_size", "Default maximum tx context size",
+				 &verbs_default_tx_size))
+		return NULL;
+
+	if (fi_ibv_get_param_int("rx_size", "Default maximum rx context size",
+				 &verbs_default_rx_size))
+		return NULL;
+
+	if (fi_ibv_get_param_int("tx_iov_limit", "Default maximum tx iov_limit",
+				 &verbs_default_tx_iov_limit))
+		return NULL;
+
+	if (fi_ibv_get_param_int("rx_iov_limit", "Default maximum rx iov_limit",
+				 &verbs_default_rx_iov_limit))
+		return NULL;
+
+	if (fi_ibv_get_param_int("inline_size", "Default maximum inline size. "
+				 "Actual inject size returned in fi_info may be "
+				 "greater", &verbs_default_inline_size))
+		return NULL;
+
+	if (fi_ibv_get_param_int("min_rnr_timer", "Set min_rnr_timer QP "
+				 "attribute (0 - 31)", &verbs_min_rnr_timer))
+		return NULL;
 
 	return &fi_ibv_prov;
 }

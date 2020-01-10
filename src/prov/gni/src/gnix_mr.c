@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2016 Cray Inc. All rights reserved.
+ * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
  * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
  *
  *
@@ -85,7 +85,7 @@ void _gnix_convert_key_to_mhdl_no_crc(
 	uint8_t flags = 0;
 
 	va = (uint64_t) __sign_extend(va << GNIX_MR_PAGE_SHIFT,
-				      GNIX_MR_VA_BITS);
+		GNIX_MR_VA_BITS);
 
 	if (key->flags & GNIX_MR_FLAG_READONLY)
 		flags |= GNI_MEMHNDL_ATTR_READONLY;
@@ -105,8 +105,8 @@ void _gnix_convert_key_to_mhdl_no_crc(
  * @param mhdl  gni memory handle
  */
 void _gnix_convert_key_to_mhdl(
-		gnix_mr_key_t *key,
-		gni_mem_handle_t *mhdl)
+	gnix_mr_key_t *key,
+	gni_mem_handle_t *mhdl)
 {
 	_gnix_convert_key_to_mhdl_no_crc(key, mhdl);
 	compiler_barrier();
@@ -121,12 +121,11 @@ void _gnix_convert_key_to_mhdl(
  */
 uint64_t _gnix_convert_mhdl_to_key(gni_mem_handle_t *mhdl)
 {
-	gnix_mr_key_t key = {{{{0}}}};
+	gnix_mr_key_t key = {{{0}}};
 	key.pfn = GNI_MEMHNDL_GET_VA((*mhdl)) >> GNIX_MR_PAGE_SHIFT;
 	key.mdd = GNI_MEMHNDL_GET_MDH((*mhdl));
 	//key->format = GNI_MEMHNDL_NEW_FRMT((*mhdl));
 	key.flags = 0;
-
 	if (GNI_MEMHNDL_GET_FLAGS((*mhdl)) & GNI_MEMHNDL_FLAG_READONLY)
 		key.flags |= GNIX_MR_FLAG_READONLY;
 
@@ -159,14 +158,14 @@ static inline uint64_t __calculate_length(
 	return pages * pagesize;
 }
 
-DIRECT_FN int gnix_mr_reg(struct fid *fid, const void *buf, size_t len,
+static int __mr_reg(struct fid *fid, const void *buf, size_t len,
 			  uint64_t access, uint64_t offset,
 			  uint64_t requested_key, uint64_t flags,
-			  struct fid_mr **mr_o, void *context)
+			  struct fid_mr **mr_o, void *context,
+			  struct gnix_auth_key *auth_key)
 {
 	struct gnix_fid_mem_desc *mr = NULL;
 	struct gnix_fid_domain *domain;
-	struct gnix_nic *nic;
 	int rc;
 	uint64_t reg_addr, reg_len;
 	struct _gnix_fi_reg_context fi_reg_context = {
@@ -175,7 +174,9 @@ DIRECT_FN int gnix_mr_reg(struct fid *fid, const void *buf, size_t len,
 			.requested_key = requested_key,
 			.flags = flags,
 			.context = context,
+			.auth_key = auth_key,
 	};
+	struct gnix_mr_cache_info *info;
 
 	GNIX_TRACE(FI_LOG_MR, "\n");
 
@@ -188,39 +189,29 @@ DIRECT_FN int gnix_mr_reg(struct fid *fid, const void *buf, size_t len,
 	 *   correct fclass on associated fid
 	 */
 	if (offset || !buf || !mr_o || !access ||
-			(access & ~(FI_READ | FI_WRITE | FI_RECV | FI_SEND |
+		(access & ~(FI_READ | FI_WRITE | FI_RECV | FI_SEND |
 						FI_REMOTE_READ |
 						FI_REMOTE_WRITE)) ||
-			(fid->fclass != FI_CLASS_DOMAIN))
-
+		(fid->fclass != FI_CLASS_DOMAIN))
 		return -FI_EINVAL;
 
 	domain = container_of(fid, struct gnix_fid_domain, domain_fid.fid);
 
-	/* If the nic list is empty, create a nic */
-	if (unlikely(dlist_empty(&domain->nic_list))) {
-		rc = gnix_nic_alloc(domain, NULL, &nic);
-		if (rc) {
-			GNIX_INFO(FI_LOG_MR,
-				  "could not allocate nic to do mr_reg,"
-				  " ret=%i\n", rc);
-			goto err;
-		}
-	}
+	info = &domain->mr_cache_info[auth_key->ptag];
 
 	reg_addr = ((uint64_t) buf) & ~((1 << GNIX_MR_PAGE_SHIFT) - 1);
 	reg_len = __calculate_length((uint64_t) buf, len,
 			1 << GNIX_MR_PAGE_SHIFT);
 
 	/* call cache register op to retrieve the right entry */
-	fastlock_acquire(&domain->mr_cache_lock);
+	fastlock_acquire(&info->mr_cache_lock);
 	if (unlikely(!domain->mr_ops))
 		_gnix_open_cache(domain, GNIX_DEFAULT_CACHE_TYPE);
 
-	if (unlikely(!domain->mr_ops->is_init(domain))) {
-		rc = domain->mr_ops->init(domain);
+	if (unlikely(!domain->mr_ops->is_init(domain, auth_key))) {
+		rc = domain->mr_ops->init(domain, auth_key);
 		if (rc != FI_SUCCESS) {
-			fastlock_release(&domain->mr_cache_lock);
+			fastlock_release(&info->mr_cache_lock);
 			goto err;
 		}
 	}
@@ -228,7 +219,7 @@ DIRECT_FN int gnix_mr_reg(struct fid *fid, const void *buf, size_t len,
 	rc = domain->mr_ops->reg_mr(domain,
 			(uint64_t) reg_addr, reg_len, &fi_reg_context,
 			(void **) &mr);
-	fastlock_release(&domain->mr_cache_lock);
+	fastlock_release(&info->mr_cache_lock);
 
 	/* check retcode */
 	if (unlikely(rc != FI_SUCCESS))
@@ -242,9 +233,9 @@ DIRECT_FN int gnix_mr_reg(struct fid *fid, const void *buf, size_t len,
 
 	/* setup internal key structure */
 	mr->mr_fid.key = _gnix_convert_mhdl_to_key(&mr->mem_hndl);
+	mr->auth_key = auth_key;
 
 	_gnix_ref_get(mr->domain);
-	_gnix_ref_get(mr->nic);
 
 	/* set up mr_o out pointer */
 	*mr_o = &mr->mr_fid;
@@ -252,6 +243,86 @@ DIRECT_FN int gnix_mr_reg(struct fid *fid, const void *buf, size_t len,
 
 err:
 	return rc;
+}
+
+DIRECT_FN int gnix_mr_reg(struct fid *fid, const void *buf, size_t len,
+	uint64_t access, uint64_t offset,
+	uint64_t requested_key, uint64_t flags,
+	struct fid_mr **mr, void *context)
+{
+	const struct iovec mr_iov = {
+		.iov_base = (void *) buf,
+		.iov_len = len,
+	};
+	const struct fi_mr_attr attr = {
+		.mr_iov = &mr_iov,
+		.iov_count = 1,
+		.access = access,
+		.offset = offset,
+		.requested_key = requested_key,
+		.context = context,
+		.auth_key = NULL,
+		.auth_key_size = 0,
+	};
+
+	return gnix_mr_regattr(fid, &attr, flags, mr);
+}
+
+DIRECT_FN int gnix_mr_regv(struct fid *fid, const struct iovec *iov,
+	size_t count, uint64_t access,
+	uint64_t offset, uint64_t requested_key,
+	uint64_t flags, struct fid_mr **mr, void *context)
+{
+	const struct fi_mr_attr attr = {
+		.mr_iov = iov,
+		.iov_count = count,
+		.access = access,
+		.offset = offset,
+		.requested_key = requested_key,
+		.context = context,
+		.auth_key = NULL,
+		.auth_key_size = 0,
+	};
+
+	return gnix_mr_regattr(fid, &attr, flags, mr);
+}
+
+DIRECT_FN int gnix_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
+	uint64_t flags, struct fid_mr **mr)
+{
+	struct gnix_fid_domain *domain = container_of(fid,
+		struct gnix_fid_domain, domain_fid.fid);
+	struct gnix_auth_key *auth_key;
+
+	if (!attr)
+		return -FI_EINVAL;
+	if (!attr->mr_iov || !attr->iov_count)
+		return -FI_EINVAL;
+
+	if (domain->mr_iov_limit < attr->iov_count)
+		return -FI_EOPNOTSUPP;
+
+	if (FI_VERSION_LT(domain->fabric->fab_fid.api_version,
+		FI_VERSION(1, 5)) &&
+		(attr->auth_key || attr->auth_key_size))
+		return -FI_EINVAL;
+
+	if (attr->auth_key_size) {
+		auth_key = GNIX_GET_AUTH_KEY(attr->auth_key, attr->auth_key_size);
+		if (!auth_key)
+			return -FI_EINVAL;
+	} else {
+		auth_key = domain->auth_key;
+	}
+
+	if (attr->iov_count == 1)
+		return __mr_reg(fid, attr->mr_iov[0].iov_base,
+			attr->mr_iov[0].iov_len, attr->access, attr->offset,
+			attr->requested_key, flags, mr,
+			attr->context, auth_key);
+
+	/* regv limited to one iov at this time */
+	return -FI_EOPNOTSUPP;
 }
 
 /**
@@ -270,7 +341,7 @@ static int fi_gnix_mr_close(fid_t fid)
 	struct gnix_fid_mem_desc *mr;
 	gni_return_t ret;
 	struct gnix_fid_domain *domain;
-	struct gnix_nic *nic;
+	struct gnix_mr_cache_info *info;
 
 	GNIX_TRACE(FI_LOG_MR, "\n");
 
@@ -280,18 +351,17 @@ static int fi_gnix_mr_close(fid_t fid)
 	mr = container_of(fid, struct gnix_fid_mem_desc, mr_fid.fid);
 
 	domain = mr->domain;
-	nic = mr->nic;
+	info = &domain->mr_cache_info[mr->auth_key->ptag];
 
 	/* call cache deregister op */
-	fastlock_acquire(&domain->mr_cache_lock);
+	fastlock_acquire(&info->mr_cache_lock);
 	ret = domain->mr_ops->dereg_mr(domain, mr);
-	fastlock_release(&domain->mr_cache_lock);
+	fastlock_release(&info->mr_cache_lock);
 
 	/* check retcode */
 	if (likely(ret == FI_SUCCESS)) {
 		/* release references to the domain and nic */
 		_gnix_ref_put(domain);
-		_gnix_ref_put(nic);
 	} else {
 		GNIX_INFO(FI_LOG_MR, "failed to deregister memory, "
 			  "ret=%i\n", ret);
@@ -307,25 +377,55 @@ static inline void *__gnix_generic_register(
 		size_t length,
 		gni_cq_handle_t dst_cq_hndl,
 		int flags,
-		int vmdh_index)
+		int vmdh_index,
+		struct gnix_auth_key *auth_key)
 {
 	struct gnix_nic *nic;
+	struct gnix_nic_attr nic_attr = {0};
 	gni_return_t grc = GNI_RC_SUCCESS;
+	int rc;
 
-	dlist_for_each(&domain->nic_list, nic, dom_nic_list)
-	{
-		COND_ACQUIRE(nic->requires_lock, &nic->lock);
-		grc = GNI_MemRegister(nic->gni_nic_hndl, (uint64_t) address,
-					  length,	dst_cq_hndl, flags,
-					  vmdh_index, &md->mem_hndl);
-		COND_RELEASE(nic->requires_lock, &nic->lock);
-		if (grc == GNI_RC_SUCCESS)
-			break;
-	}
+	pthread_mutex_lock(&gnix_nic_list_lock);
+
+	/* If the nic list is empty, create a nic */
+	if (unlikely((dlist_empty(&gnix_nic_list_ptag[auth_key->ptag])))) {
+		/* release the lock because we are not checking the list after
+			this point. Additionally, gnix_nic_alloc takes the
+			lock to add the nic. */
+		pthread_mutex_unlock(&gnix_nic_list_lock);
+		nic_attr.auth_key = auth_key;
+
+		rc = gnix_nic_alloc(domain, &nic_attr, &nic);
+		if (rc) {
+			GNIX_INFO(FI_LOG_MR,
+				  "could not allocate nic to do mr_reg,"
+				  " ret=%i\n", rc);
+			return NULL;
+		}
+	} else {
+		nic = dlist_first_entry(&gnix_nic_list_ptag[auth_key->ptag],
+			struct gnix_nic, ptag_nic_list);
+		if (unlikely(nic == NULL)) {
+			GNIX_ERR(FI_LOG_MR, "Failed to find nic on "
+				"ptag list\n");
+			pthread_mutex_unlock(&gnix_nic_list_lock);
+			return NULL;
+		}
+		_gnix_ref_get(nic);
+		pthread_mutex_unlock(&gnix_nic_list_lock);
+	    }
+
+	COND_ACQUIRE(nic->requires_lock, &nic->lock);
+	grc = GNI_MemRegister(nic->gni_nic_hndl, (uint64_t) address,
+				  length,	dst_cq_hndl, flags,
+				  vmdh_index, &md->mem_hndl);
+	COND_RELEASE(nic->requires_lock, &nic->lock);
 
 	if (unlikely(grc != GNI_RC_SUCCESS)) {
 		GNIX_INFO(FI_LOG_MR, "failed to register memory with uGNI, "
 			  "ret=%s\n", gni_err_str[grc]);
+		_gnix_ref_put(nic);
+
 		return NULL;
 	}
 
@@ -333,9 +433,8 @@ static inline void *__gnix_generic_register(
 	md->nic = nic;
 	md->domain = domain;
 
-	/* take references on domain and nic */
+	/* take references on domain */
 	_gnix_ref_get(md->domain);
-	_gnix_ref_get(md->nic);
 
 	return md;
 }
@@ -359,8 +458,10 @@ static void *__gnix_register_region(
 	else
 		flags |= GNI_MEM_READ_ONLY;
 
+	GNIX_DEBUG(FI_LOG_MR, "addr %p len %d flags 0x%x\n", address, length,
+		   flags);
 	return __gnix_generic_register(domain, md, address, length, dst_cq_hndl,
-			flags, vmdh_index);
+			flags, vmdh_index, fi_reg_context->auth_key);
 }
 
 static int __gnix_deregister_region(
@@ -368,13 +469,15 @@ static int __gnix_deregister_region(
 		void *context)
 {
 	struct gnix_fid_mem_desc *mr = (struct gnix_fid_mem_desc *) handle;
-	gni_return_t ret;
+	gni_return_t ret = GNI_RC_SUCCESS;
 	struct gnix_fid_domain *domain;
 	struct gnix_nic *nic;
 
 	domain = mr->domain;
 	nic = mr->nic;
 
+	GNIX_DEBUG(FI_LOG_MR,
+		"Params: deregister md=%p\n", handle);
 	COND_ACQUIRE(nic->requires_lock, &nic->lock);
 	ret = GNI_MemDeregister(nic->gni_nic_hndl, &mr->mem_hndl);
 	COND_RELEASE(nic->requires_lock, &nic->lock);
@@ -385,7 +488,7 @@ static int __gnix_deregister_region(
 		/* release reference to nic */
 		_gnix_ref_put(nic);
 	} else {
-		GNIX_INFO(FI_LOG_MR, "failed to deregister memory"
+		GNIX_WARN(FI_LOG_MR, "failed to deregister memory"
 			  " region, entry=%p ret=%i\n", handle, ret);
 	}
 
@@ -415,26 +518,29 @@ static int __gnix_destruct_registration(void *context)
 	return GNI_RC_SUCCESS;
 }
 
-
 #ifdef HAVE_UDREG
 void *__udreg_register(void *addr, uint64_t length, void *context)
 {
 	struct gnix_fid_mem_desc *md;
-	struct gnix_fid_domain *domain;
+	struct gnix_mr_cache_info *info = (struct gnix_mr_cache_info *) context;
+	struct gnix_auth_key *auth_key = info->auth_key;
+	struct gnix_fid_domain *domain = info->domain;
 
-	domain = (struct gnix_fid_domain *) context;
+	/* Allocate an udreg info block for this registration. */
+	md = calloc(1, sizeof(*md));
+	if (!md) {
+		GNIX_WARN(FI_LOG_MR,
+			"failed to allocate memory for registration\n");
+		return NULL;
+	}
 
-    /* Allocate an udreg info block for this registration. */
-    md = calloc(1, sizeof(*md));
-    if (!md) {
-	GNIX_WARN(FI_LOG_MR, "failed to allocate memory for registration\n");
-	return NULL;
-    }
+	GNIX_INFO(FI_LOG_MR, "info=%p auth_key=%p\n",
+		info, auth_key);
+	GNIX_INFO(FI_LOG_MR, "ptag=%d\n", auth_key->ptag);
 
-    return __gnix_generic_register(domain, md, addr, length, NULL,
-		GNI_MEM_READWRITE, -1);
+	return __gnix_generic_register(domain, md, addr, length, NULL,
+		GNI_MEM_READWRITE, -1, auth_key);
 }
-
 
 uint32_t __udreg_deregister(void *registration, void *context)
 {
@@ -442,19 +548,23 @@ uint32_t __udreg_deregister(void *registration, void *context)
 
 	grc = __gnix_deregister_region(registration, NULL);
 
+	free(registration);
+
 	return (grc == GNI_RC_SUCCESS) ? 0 : 1;
 }
-
 
 /* Called via dreg when a cache is destroyed. */
 void __udreg_cache_destructor(void *context)
 {
-    /*  Nothing needed here. */
+	/*  Nothing needed here. */
 }
 
-static int __udreg_init(struct gnix_fid_domain *domain)
+static int __udreg_init(struct gnix_fid_domain *domain,
+		struct gnix_auth_key *auth_key)
 {
 	udreg_return_t urc;
+	struct gnix_mr_cache_info *info =
+		GNIX_GET_MR_CACHE_INFO(domain, auth_key);
 
 	udreg_cache_attr_t udreg_cache_attr = {
 		.cache_name =           {"gnix_app_cache"},
@@ -462,7 +572,7 @@ static int __udreg_init(struct gnix_fid_domain *domain)
 		.modes =                UDREG_CC_MODE_USE_LARGE_PAGES,
 		.debug_mode =           0,
 		.debug_rank =           0,
-		.reg_context =          (void *) domain,
+		.reg_context =          (void *) info,
 		.dreg_context =         (void *) domain,
 		.destructor_context =   (void *) domain,
 		.device_reg_func =      __udreg_register,
@@ -483,21 +593,29 @@ static int __udreg_init(struct gnix_fid_domain *domain)
 				urc);
 	}
 
-	urc = UDREG_CacheAccess(udreg_cache_attr.cache_name, &domain->udreg_cache);
+	urc = UDREG_CacheAccess(udreg_cache_attr.cache_name,
+		&info->udreg_cache);
 	if (urc != UDREG_RC_SUCCESS) {
 		GNIX_FATAL(FI_LOG_MR,
 				"Could not access udreg application cache, urc=%d",
 				urc);
 	}
 
-	domain->mr_is_init = 1;
+	info->inuse = 1;
+	info->auth_key = auth_key;
+	GNIX_INFO(FI_LOG_MR, "info=%p auth_key=%p ptag=%d\n",
+		info, info->auth_key, auth_key->ptag);
 
 	return FI_SUCCESS;
 }
 
-static int __udreg_is_init(struct gnix_fid_domain *domain)
+static int __udreg_is_init(struct gnix_fid_domain *domain,
+		struct gnix_auth_key *auth_key)
 {
-	return domain->udreg_cache != NULL;
+	struct gnix_mr_cache_info *info =
+		GNIX_GET_MR_CACHE_INFO(domain, auth_key);
+
+	return info->inuse;
 }
 
 static int __udreg_reg_mr(
@@ -510,8 +628,12 @@ static int __udreg_reg_mr(
 	udreg_return_t urc;
 	udreg_entry_t *udreg_entry;
 	struct gnix_fid_mem_desc *md;
+	struct gnix_mr_cache_info *info =
+		GNIX_GET_MR_CACHE_INFO(domain,
+			fi_reg_context->auth_key);
 
-	urc = UDREG_Register(domain->udreg_cache, (void *) address, length, &udreg_entry);
+	urc = UDREG_Register(info->udreg_cache, (void *) address,
+			length, &udreg_entry);
 	if (unlikely(urc != UDREG_RC_SUCCESS))
 		return -FI_EIO;
 
@@ -527,8 +649,11 @@ static int __udreg_dereg_mr(struct gnix_fid_domain *domain,
 		struct gnix_fid_mem_desc *md)
 {
 	udreg_return_t urc;
+	struct gnix_mr_cache_info *info =
+		GNIX_GET_MR_CACHE_INFO(domain,
+			md->auth_key);
 
-	urc = UDREG_Unregister(domain->udreg_cache,
+	urc = UDREG_Unregister(info->udreg_cache,
 			(udreg_entry_t *) md->entry);
 	if (urc != UDREG_RC_SUCCESS) {
 		GNIX_WARN(FI_LOG_MR, "UDREG_Unregister() returned %d\n", urc);
@@ -538,33 +663,41 @@ static int __udreg_dereg_mr(struct gnix_fid_domain *domain,
 	return urc;
 }
 
-static int __udreg_close(struct gnix_fid_domain *domain)
+static int __udreg_close(struct gnix_fid_domain *domain,
+		struct gnix_mr_cache_info *info)
 {
 	udreg_return_t ret;
 
-	if (domain->udreg_cache) {
-		ret = UDREG_CacheRelease(domain->udreg_cache);
+	if (!info->inuse)
+		return FI_SUCCESS; /* nothing to close */
+
+	if (info->udreg_cache) {
+		ret = UDREG_CacheRelease(info->udreg_cache);
 		if (unlikely(ret != UDREG_RC_SUCCESS))
 			GNIX_FATAL(FI_LOG_DOMAIN, "failed to release from "
 					"mr cache during domain destruct, dom=%p rc=%d\n",
 					domain, ret);
 
-		ret = UDREG_CacheDestroy(domain->udreg_cache);
+		ret = UDREG_CacheDestroy(info->udreg_cache);
 		if (unlikely(ret != UDREG_RC_SUCCESS))
 			GNIX_FATAL(FI_LOG_DOMAIN, "failed to destroy mr "
 					"cache during domain destruct, dom=%p rc=%d\n",
 					domain, ret);
 	}
 
+	info->inuse = 0;
+
 	return FI_SUCCESS;
 }
 #else
-static int __udreg_init(struct gnix_fid_domain *domain)
+static int __udreg_init(struct gnix_fid_domain *domain,
+		struct gnix_auth_key *auth_key)
 {
 	return -FI_ENOSYS;
 }
 
-static int __udreg_is_init(struct gnix_fid_domain *domain)
+static int __udreg_is_init(struct gnix_fid_domain *domain
+		struct gnix_auth_key *auth_key)
 {
 	return FI_SUCCESS;
 }
@@ -584,7 +717,8 @@ static int __udreg_dereg_mr(struct gnix_fid_domain *domain,
 	return -FI_ENOSYS;
 }
 
-static int __udreg_close(struct gnix_fid_domain *domain)
+static int __udreg_close(struct gnix_fid_domain *domain,
+		struct gnix_mr_cache_info *info)
 {
 	return FI_SUCCESS;
 }
@@ -599,19 +733,35 @@ struct gnix_mr_ops udreg_mr_ops = {
 	.flush_cache = NULL, // UDREG doesn't support cache flush
 };
 
-static int __cache_init(struct gnix_fid_domain *domain) {
+static int __cache_init(struct gnix_fid_domain *domain,
+		struct gnix_auth_key *auth_key)
+{
 	int ret;
+	struct gnix_mr_cache_info *info =
+		GNIX_GET_MR_CACHE_INFO(domain, auth_key);
 
-	ret = _gnix_mr_cache_init(&domain->mr_cache,
+	ret = _gnix_mr_cache_init(&info->mr_cache_ro,
 			&domain->mr_cache_attr);
+
+	if (ret)
+		return ret;
+
+	ret = _gnix_mr_cache_init(&info->mr_cache_rw,
+				&domain->mr_cache_attr);
+
 	if (ret == FI_SUCCESS)
-		domain->mr_is_init = 1;
+		info->inuse = 1;
 
 	return ret;
 }
 
-static int __cache_is_init(struct gnix_fid_domain *domain) {
-	return domain->mr_cache != NULL;
+static int __cache_is_init(struct gnix_fid_domain *domain,
+		struct gnix_auth_key *auth_key)
+{
+	struct gnix_mr_cache_info *info =
+		GNIX_GET_MR_CACHE_INFO(domain, auth_key);
+
+	return info->inuse;
 }
 
 static int __cache_reg_mr(
@@ -619,39 +769,98 @@ static int __cache_reg_mr(
 		uint64_t                    address,
 		uint64_t                    length,
 		struct _gnix_fi_reg_context *fi_reg_context,
-		void                        **handle) {
+		void                        **handle)
+{
+	struct gnix_mr_cache *cache;
+	struct gnix_auth_key *auth_key = fi_reg_context->auth_key;
+	struct gnix_mr_cache_info *info =
+		GNIX_GET_MR_CACHE_INFO(domain, auth_key);
 
-	return _gnix_mr_cache_register(domain->mr_cache, address, length,
+	if (fi_reg_context->access & (FI_RECV | FI_READ | FI_REMOTE_WRITE))
+		cache = info->mr_cache_rw;
+	else
+		cache = info->mr_cache_ro;
+
+	return _gnix_mr_cache_register(cache, address, length,
 			fi_reg_context, handle);
 }
 
 static int __cache_dereg_mr(struct gnix_fid_domain *domain,
 		struct gnix_fid_mem_desc *md)
 {
-	return _gnix_mr_cache_deregister(domain->mr_cache, md);
+	gnix_mr_cache_t *cache;
+	struct gnix_mr_cache_info *info = GNIX_GET_MR_CACHE_INFO(domain,
+			md->auth_key);
+
+	if (GNI_MEMHNDL_GET_FLAGS((md->mem_hndl)) &
+	    GNI_MEMHNDL_FLAG_READONLY)
+		cache = info->mr_cache_ro;
+	else
+		cache = info->mr_cache_rw;
+
+	return _gnix_mr_cache_deregister(cache, md);
 }
 
-static int __cache_close(struct gnix_fid_domain *domain)
+static int __cache_close(struct gnix_fid_domain *domain,
+		struct gnix_mr_cache_info *info)
 {
 	int ret;
 
-	if (domain->mr_cache) {
-		ret = _gnix_mr_cache_destroy(domain->mr_cache);
+	if (!info->inuse)
+		return FI_SUCCESS;
+
+	if (info->mr_cache_ro) {
+		ret = _gnix_mr_cache_destroy(info->mr_cache_ro);
 		if (ret != FI_SUCCESS)
-			GNIX_FATAL(FI_LOG_DOMAIN, "failed to destroy mr cache "
-					"during domain destruct, dom=%p ret=%d\n",
+			GNIX_FATAL(FI_LOG_DOMAIN, "failed to destroy ro mr "
+					"cache dom=%p ret=%d\n",
 					domain, ret);
 	}
 
+	if (info->mr_cache_rw) {
+		ret = _gnix_mr_cache_destroy(info->mr_cache_rw);
+		if (ret != FI_SUCCESS)
+			GNIX_FATAL(FI_LOG_DOMAIN, "failed to destroy rw mr "
+					"cache dom=%p ret=%d\n",
+					domain, ret);
+	}
+
+	info->inuse = 0;
 	return FI_SUCCESS;
 }
 
 static int __cache_flush(struct gnix_fid_domain *domain)
 {
-	int ret;
+	int ret = FI_SUCCESS;
+	int i;
+	struct gnix_mr_cache_info *info;
 
 	fastlock_acquire(&domain->mr_cache_lock);
-	ret = _gnix_mr_cache_flush(domain->mr_cache);
+
+	for (i = 0; i < 256; i++) {
+		info = &domain->mr_cache_info[i];
+
+		fastlock_acquire(&info->mr_cache_lock);
+		if (!info->inuse) {
+			fastlock_release(&info->mr_cache_lock);
+			continue;
+		}
+
+		ret = _gnix_mr_cache_flush(info->mr_cache_ro);
+		if (ret) {
+			fastlock_release(&info->mr_cache_lock);
+			break;
+		}
+
+		ret = _gnix_mr_cache_flush(info->mr_cache_rw);
+		if (ret) {
+			fastlock_release(&info->mr_cache_lock);
+			break;
+		}
+
+		fastlock_release(&info->mr_cache_lock);
+	}
+
 	fastlock_release(&domain->mr_cache_lock);
 
 	return ret;
@@ -666,14 +875,21 @@ struct gnix_mr_ops cache_mr_ops = {
 	.flush_cache = __cache_flush,
 };
 
+static int __basic_mr_init(struct gnix_fid_domain *domain,
+		struct gnix_auth_key *auth_key)
+{
+	struct gnix_mr_cache_info *info = domain->mr_cache_info;
 
-static int __basic_mr_init(struct gnix_fid_domain *domain) {
-	domain->mr_is_init = 1;
+	info->inuse = 1;
 	return FI_SUCCESS;
 }
 
-static int __basic_mr_is_init(struct gnix_fid_domain *domain) {
-	return domain->mr_is_init;
+static int __basic_mr_is_init(struct gnix_fid_domain *domain,
+		struct gnix_auth_key *auth_key)
+{
+	struct gnix_mr_cache_info *info = domain->mr_cache_info;
+
+	return info->inuse;
 }
 
 static int __basic_mr_reg_mr(
@@ -681,8 +897,8 @@ static int __basic_mr_reg_mr(
 		uint64_t                    address,
 		uint64_t                    length,
 		struct _gnix_fi_reg_context *fi_reg_context,
-		void                        **handle) {
-
+		void                        **handle)
+{
 	struct gnix_fid_mem_desc *md, *ret;
 
 	md = calloc(1, sizeof(*md));
@@ -690,6 +906,7 @@ static int __basic_mr_reg_mr(
 		GNIX_WARN(FI_LOG_MR, "failed to allocate memory");
 		return -FI_ENOMEM;
 	}
+
 	ret = __gnix_register_region((void *) md, (void *) address, length,
 			fi_reg_context, (void *) domain);
 	if (!ret) {
@@ -706,8 +923,8 @@ static int __basic_mr_reg_mr(
 static int __basic_mr_dereg_mr(struct gnix_fid_domain *domain,
 		struct gnix_fid_mem_desc *md)
 {
-	int ret; 
-	
+	int ret;
+
 	ret = __gnix_deregister_region((void *) md, NULL);
 	if (ret == FI_SUCCESS)
 		free((void *) md);
@@ -723,13 +940,12 @@ struct gnix_mr_ops basic_mr_ops = {
 	.flush_cache = NULL, // unsupported since there is no caching here
 };
 
-
 int _gnix_open_cache(struct gnix_fid_domain *domain, int type)
 {
 	if (type < 0 || type >= GNIX_MR_MAX_TYPE)
 		return -FI_EINVAL;
 
-	if (domain->mr_ops && domain->mr_ops->is_init(domain))
+	if (domain->mr_ops && domain->mr_ops->is_init(domain, domain->auth_key))
 		return -FI_EBUSY;
 
 	switch(type) {
@@ -748,7 +964,6 @@ int _gnix_open_cache(struct gnix_fid_domain *domain, int type)
 	return FI_SUCCESS;
 }
 
-
 int _gnix_flush_registration_cache(struct gnix_fid_domain *domain)
 {
 	if (domain->mr_ops && domain->mr_ops->flush_cache)
@@ -757,13 +972,14 @@ int _gnix_flush_registration_cache(struct gnix_fid_domain *domain)
 	return FI_SUCCESS;  // if no flush was present, silently pass
 }
 
-int _gnix_close_cache(struct gnix_fid_domain *domain)
+int _gnix_close_cache(struct gnix_fid_domain *domain,
+		struct gnix_mr_cache_info *info)
 {
 	/* if the domain isn't being destructed by close, we need to check the
 	 * cache again. This isn't a likely case. Destroy must succeed since we
 	 * are in the destruct path */
 	if (domain->mr_ops && domain->mr_ops->destroy_cache)
-		return domain->mr_ops->destroy_cache(domain);
+		return domain->mr_ops->destroy_cache(domain, info);
 
 	return FI_SUCCESS;
 }
@@ -772,7 +988,11 @@ gnix_mr_cache_attr_t _gnix_default_mr_cache_attr = {
 		.soft_reg_limit      = 4096,
 		.hard_reg_limit      = -1,
 		.hard_stale_limit    = 128,
+#if HAVE_KDREG
 		.lazy_deregistration = 1,
+#else
+		.lazy_deregistration = 0,
+#endif
 		.reg_callback        = __gnix_register_region,
 		.dereg_callback      = __gnix_deregister_region,
 		.destruct_callback   = __gnix_destruct_registration,

@@ -176,34 +176,42 @@ static int fi_ibv_msg_ep_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 static int fi_ibv_msg_ep_enable(struct fid_ep *ep)
 {
 	struct ibv_qp_init_attr attr;
+	struct fi_info *verbs_info;
 	struct fi_ibv_msg_ep *_ep;
 	struct ibv_pd *pd;
 
 	_ep = container_of(ep, struct fi_ibv_msg_ep, ep_fid);
 	if (!_ep->eq) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_EP_CTRL, "Endpoint is not bound to an event queue\n");
+		VERBS_WARN(FI_LOG_EP_CTRL,
+			   "Endpoint is not bound to an event queue\n");
 		return -FI_ENOEQ;
 	}
 
 	if (!_ep->scq && !_ep->rcq) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_EP_CTRL, "Endpoint is not bound to "
-				"a send or receive completion queue\n");
+		VERBS_WARN(FI_LOG_EP_CTRL, "Endpoint is not bound to "
+			   "a send or receive completion queue\n");
 		return -FI_ENOCQ;
 	}
 
 	if (!_ep->scq && (ofi_send_allowed(_ep->info->caps) ||
 				ofi_rma_initiate_allowed(_ep->info->caps))) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_EP_CTRL, "Endpoint is not bound to "
-				"a send completion queue when it has transmit "
-				"capabilities enabled (FI_SEND | FI_RMA).\n");
+		VERBS_WARN(FI_LOG_EP_CTRL, "Endpoint is not bound to "
+			   "a send completion queue when it has transmit "
+			   "capabilities enabled (FI_SEND | FI_RMA).\n");
 		return -FI_ENOCQ;
 	}
 
 	if (!_ep->rcq && ofi_recv_allowed(_ep->info->caps)) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_EP_CTRL, "Endpoint is not bound to "
-				"a receive completion queue when it has receive "
-				"capabilities enabled. (FI_RECV)\n");
+		VERBS_WARN(FI_LOG_EP_CTRL, "Endpoint is not bound to "
+			   "a receive completion queue when it has receive "
+			   "capabilities enabled. (FI_RECV)\n");
 		return -FI_ENOCQ;
+	}
+
+	verbs_info = fi_ibv_get_verbs_info(_ep->info->domain_attr->name);
+	if (!verbs_info) {
+		VERBS_INFO(FI_LOG_EP_CTRL, "Unable to find matching verbs_info\n");
+		return -FI_EINVAL;
 	}
 
 	memset(&attr, 0, sizeof attr);
@@ -285,13 +293,13 @@ int fi_ibv_open_ep(struct fid_domain *domain, struct fi_info *info,
 
 	dom = container_of(domain, struct fi_ibv_domain, domain_fid);
 	if (strcmp(dom->verbs->device->name, info->domain_attr->name)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_DOMAIN, "Invalid info->domain_attr->name\n");
+		VERBS_INFO(FI_LOG_DOMAIN, "Invalid info->domain_attr->name\n");
 		return -FI_EINVAL;
 	}
 
 	fi = fi_ibv_get_verbs_info(info->domain_attr->name);
 	if (!fi) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_DOMAIN, "Unable to find matching verbs_info\n");
+		VERBS_INFO(FI_LOG_DOMAIN, "Unable to find matching verbs_info\n");
 		return -FI_EINVAL;
 	}
 
@@ -332,13 +340,13 @@ int fi_ibv_open_ep(struct fid_domain *domain, struct fi_info *info,
 		if (rdma_resolve_addr(_ep->id, info->src_addr, info->dest_addr,
 				      VERBS_RESOLVE_TIMEOUT)) {
 			ret = -errno;
-			FI_INFO(&fi_ibv_prov, FI_LOG_DOMAIN, "Unable to rdma_resolve_addr\n");
+			VERBS_INFO(FI_LOG_DOMAIN, "Unable to rdma_resolve_addr\n");
 			goto err;
 		}
 
 		if (rdma_resolve_route(_ep->id, VERBS_RESOLVE_TIMEOUT)) {
 			ret = -errno;
-			FI_INFO(&fi_ibv_prov, FI_LOG_DOMAIN, "Unable to rdma_resolve_route\n");
+			VERBS_INFO(FI_LOG_DOMAIN, "Unable to rdma_resolve_route\n");
 			goto err;
 		}
 	} else {
@@ -357,9 +365,10 @@ int fi_ibv_open_ep(struct fid_domain *domain, struct fi_info *info,
 	_ep->ep_fid.rma = fi_ibv_msg_ep_ops_rma(_ep);
 	_ep->ep_fid.atomic = fi_ibv_msg_ep_ops_atomic(_ep);
 
-	atomic_initialize(&_ep->unsignaled_send_cnt, 0);
-	atomic_initialize(&_ep->comp_pending, 0);
+	ofi_atomic_initialize32(&_ep->unsignaled_send_cnt, 0);
+	ofi_atomic_initialize32(&_ep->comp_pending, 0);
 
+	_ep->domain = dom;
 	*ep = &_ep->ep_fid;
 
 	return 0;
@@ -420,6 +429,7 @@ static int fi_ibv_pep_close(fid_t fid)
 	if (pep->id)
 		rdma_destroy_ep(pep->id);
 
+	fi_freeinfo(pep->info);
 	free(pep);
 	return 0;
 }
@@ -452,17 +462,22 @@ int fi_ibv_passive_ep(struct fid_fabric *fabric, struct fi_info *info,
 	if (!_pep)
 		return -FI_ENOMEM;
 
+	if (!(_pep->info = fi_dupinfo(info))) {
+		ret = -FI_ENOMEM;
+		goto err1;
+	}
+
 	ret = rdma_create_id(NULL, &_pep->id, &_pep->pep_fid.fid, RDMA_PS_TCP);
 	if (ret) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_DOMAIN, "Unable to create rdma_cm_id\n");
-		goto err1;
+		VERBS_INFO(FI_LOG_DOMAIN, "Unable to create rdma_cm_id\n");
+		goto err2;
 	}
 
 	if (info->src_addr) {
 		ret = rdma_bind_addr(_pep->id, (struct sockaddr *)info->src_addr);
 		if (ret) {
-			FI_INFO(&fi_ibv_prov, FI_LOG_DOMAIN, "Unable to bind address to rdma_cm_id\n");
-			goto err2;
+			VERBS_INFO(FI_LOG_DOMAIN, "Unable to bind address to rdma_cm_id\n");
+			goto err3;
 		}
 		_pep->bound = 1;
 	}
@@ -478,8 +493,10 @@ int fi_ibv_passive_ep(struct fid_fabric *fabric, struct fi_info *info,
 	*pep = &_pep->pep_fid;
 	return 0;
 
-err2:
+err3:
 	rdma_destroy_id(_pep->id);
+err2:
+	fi_freeinfo(_pep->info);
 err1:
 	free(_pep);
 	return ret;

@@ -44,8 +44,15 @@
  * prototypes
  */
 
-int gnix_resolve_name(IN const char *node, IN const char *service,
-		      IN uint64_t flags, INOUT struct gnix_ep_name
-		      *resolved_addr);
+int _gnix_local_ipaddr(struct sockaddr_in *sin);
+
+int _gnix_pe_to_ip(const struct gnix_ep_name *ep_name,
+		   struct sockaddr_in *saddr);
+
+int _gnix_resolve_name(IN const char *node, IN const char *service,
+		       IN uint64_t flags, INOUT struct gnix_ep_name
+		       *resolved_addr);
+
+int _gnix_src_addr(struct gnix_ep_name *resolved_addr);
 
 #endif /* _GNIX_NAMESERVER_H_ */

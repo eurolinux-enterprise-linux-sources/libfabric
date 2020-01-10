@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015 Cray Inc. All rights reserved.
+ * Copyright (c) 2015-2016 Cray Inc. All rights reserved.
  * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -55,6 +55,7 @@
  *                           is associated
  * @var cookie               RDMA cookie credential for the endpoint
  *                           this entry corresponds to
+ * @var rx_ctx_cnt           number of contexts associated with this AV
  */
 struct gnix_av_addr_entry {
 	struct gnix_address gnix_addr;
@@ -62,6 +63,10 @@ struct gnix_av_addr_entry {
 		uint32_t name_type : 8;
 		uint32_t cm_nic_cdm_id : 24;
 		uint32_t cookie;
+	};
+	struct {
+		uint32_t rx_ctx_cnt : 8;
+		uint32_t unused1 : 24;
 	};
 };
 
@@ -97,36 +102,6 @@ int _gnix_av_reverse_lookup(struct gnix_fid_av *gnix_av,
  * If the caller already knows the av type they can call the lookups directly
  * using the following functions.
  ******************************************************************************/
-
-/**
- * @brief (FI_AV_TABLE) Return the gnix address using its corresponding
- * fi_addr.
- *
- * @param[in] int_av		The AV to use for the lookup.
- * @param[in] fi_addr		The corresponding fi_addr_t.
- * @param[in/out] entry_ptr	pointer to an av entry struct
- *
- * @return FI_SUCCESS on successfully looking up the entry in the entry table.
- * @return -FI_EINVAL upon passing an invalid parameter.
- */
-int _gnix_table_lookup(struct gnix_fid_av *int_av,
-		       fi_addr_t fi_addr,
-		       struct gnix_av_addr_entry *entry_ptr);
-
-/**
- * @brief (FI_AV_MAP) Return the gnix address using its corresponding
- * fi_addr.
- *
- * @param[in] int_av		The AV to use for the lookup.
- * @param[in] fi_addr		The corresponding fi_addr_t.
- * @param[in/out] entry_ptr	pointer to an av entry struct
- *
- * @return FI_SUCCESS on successfully looking up the entry in the entry table.
- * @return -FI_EINVAL upon passing an invalid parameter.
- */
-int _gnix_map_lookup(struct gnix_fid_av *int_av,
-		     fi_addr_t fi_addr,
-		     struct gnix_av_addr_entry *entry_ptr);
 
 /**
  * @brief (FI_AV_TABLE) Return fi_addr using its corresponding gnix address.

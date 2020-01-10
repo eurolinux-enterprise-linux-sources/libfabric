@@ -51,17 +51,24 @@ dnl
 dnl HAVE_$1_DL: same value as $1_dl
 dnl
 AC_DEFUN([FI_PROVIDER_SETUP],[
-	AC_MSG_NOTICE([*** Configuring $1 provider])
-	AC_ARG_ENABLE([$1],
-	      [AS_HELP_STRING([--enable-$1@<:@=yes|no|auto|dl|PATH@:>@],
-			      [Enable $1 provider @<:@default=auto@:>@
-				(yes: enable $1 provider; no: disable $1 provider;
-				auto: enable $1 provider if possible;
-				dl: enable $1 provider and build as a loadable library;
-				PATH: enable $1 provider and use $1 installed under PATH)])
-	      ],
-	      [],
-	      [enable_$1=auto])
+
+dnl
+dnl Check if --enable-direct is being used.  If yes, exclude all other providers
+dnl
+	AS_IF([test x"$enable_direct" != x"no" && test x"$enable_direct" != x"$1"],
+	      [enable_$1=no
+               AC_MSG_NOTICE([*** Skipping $1 provider because $enable_direct direct requested])],
+	      [AC_MSG_NOTICE([*** Configuring $1 provider])
+	       AC_ARG_ENABLE([$1],
+			     [AS_HELP_STRING([--enable-$1@<:@=yes|no|auto|dl|PATH@:>@],
+					[Enable $1 provider @<:@default=auto@:>@
+					(yes: enable $1 provider; no: disable $1 provider;
+					auto: enable $1 provider if possible;
+					dl: enable $1 provider and build as a loadable library;
+					PATH: enable $1 provider and use $1 installed under PATH)])
+			     ],
+			     [],
+			     [enable_$1=auto])])
 
 	# Save CPPFLAGS and LDFLAGS before they are modified by FI_CHECK_PREFIX_DIR.
 	# Provider's local macros could use the value if needed.
@@ -98,6 +105,11 @@ AC_DEFUN([FI_PROVIDER_SETUP],[
 				 AC_MSG_WARN([but libfabric is being built as static-only])
 				 AC_MSG_ERROR([This is an impossible situation. Cannot continue.])])
 			 AC_MSG_NOTICE([$1 provider: build as plugin])
+
+			 # See if this provider has a specfile that
+			 # needs to be generated
+			 m4_ifnblank(m4_esyscmd(ls prov/$1/libfabric-$1.spec.in 2> /dev/null),
+			       [AC_CONFIG_FILES([prov/$1/libfabric-$1.spec])])
 			],
 			[PROVIDERS_STATIC="prov/$1/lib$1.la $PROVIDERS_STATIC"
 			 AC_MSG_NOTICE([$1 provider: include in libfabric])])
@@ -127,8 +139,15 @@ AC_DEFUN([FI_PROVIDER_SETUP],[
 		 AS_IF([test -f "$srcdir/prov/$1/include/rdma/fi_direct.h"],
 			[AC_MSG_RESULT(yes)],
 			[AC_MSG_RESULT(no)
-			  AC_MSG_ERROR([$1 provider was requested as direct, but is missing fi_direct.h])]
-			)])
+			 AC_MSG_CHECKING(for $srcdir/prov/$1/include/rdma/fi_direct.h.in)
+			 AS_IF([test -f "$srcdir/prov/$1/include/rdma/fi_direct.h.in"],
+				[AC_MSG_RESULT(yes)],
+				[AC_MSG_RESULT(no)
+				 AC_MSG_ERROR([$1 provider was requested as direct, but is missing fi_direct.h and fi_direct.h.in])]
+			      )])])
+
+	AM_CONDITIONAL([FI_DIRECT_H_IN], [test -f "$srcdir/prov/$1/include/rdma/fi_direct.h.in"])
+
 
 	# Restore CPPFLAGS/LDFLAGS/LIBS
 	CPPFLAGS=$$1_orig_CPPFLAGS

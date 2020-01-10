@@ -190,6 +190,10 @@ int sock_msg_verify_ep_attr(struct fi_ep_attr *ep_attr,
 		if ((ep_attr->rx_ctx_cnt > SOCK_EP_MAX_RX_CNT) &&
 		    ep_attr->rx_ctx_cnt != FI_SHARED_CONTEXT)
 			return -FI_ENODATA;
+
+		if (ep_attr->auth_key_size &&
+		    (ep_attr->auth_key_size != sock_msg_ep_attr.auth_key_size))
+			return -FI_ENODATA;
 	}
 
 	if (sock_msg_verify_tx_attr(tx_attr) || sock_msg_verify_rx_attr(rx_attr))
@@ -198,10 +202,10 @@ int sock_msg_verify_ep_attr(struct fi_ep_attr *ep_attr,
 	return 0;
 }
 
-int sock_msg_fi_info(void *src_addr, void *dest_addr, struct fi_info *hints,
-		     struct fi_info **info)
+int sock_msg_fi_info(uint32_t version, void *src_addr, void *dest_addr,
+		     struct fi_info *hints, struct fi_info **info)
 {
-	*info = sock_fi_info(FI_EP_MSG, hints, src_addr, dest_addr);
+	*info = sock_fi_info(version, FI_EP_MSG, hints, src_addr, dest_addr);
 	if (!*info)
 		return -FI_ENOMEM;
 
@@ -281,8 +285,8 @@ static int sock_pep_create_listener(struct sock_pep *pep)
 	struct sockaddr_in addr;
 	struct addrinfo *s_res = NULL, *p;
 	struct addrinfo hints;
-	char sa_ip[INET_ADDRSTRLEN] = {0};
-	char sa_port[NI_MAXSERV] = {0};
+	char sa_ip[INET_ADDRSTRLEN];
+	char sa_port[NI_MAXSERV];
 
 	pep->cm.do_listen = 1;
 	memset(&hints, 0, sizeof(hints));
@@ -292,6 +296,8 @@ static int sock_pep_create_listener(struct sock_pep *pep)
 
 	memcpy(sa_ip, inet_ntoa(pep->src_addr.sin_addr), INET_ADDRSTRLEN);
 	sprintf(sa_port, "%d", ntohs(pep->src_addr.sin_port));
+	sa_ip[INET_ADDRSTRLEN - 1] = '\0';
+	sa_port[NI_MAXSERV - 1] = '\0';
 
 	ret = getaddrinfo(sa_ip, sa_port, &hints, &s_res);
 	if (ret) {
@@ -302,7 +308,7 @@ static int sock_pep_create_listener(struct sock_pep *pep)
 
 	SOCK_LOG_DBG("binding pep listener to %s\n", sa_port);
 	for (p = s_res; p; p = p->ai_next) {
-		pep->cm.sock = socket(p->ai_family, p->ai_socktype,
+		pep->cm.sock = ofi_socket(p->ai_family, p->ai_socktype,
 				     p->ai_protocol);
 		if (pep->cm.sock >= 0) {
 			sock_set_sockopts(pep->cm.sock);
@@ -372,7 +378,6 @@ static int sock_ep_cm_setname(fid_t fid, void *addr, size_t addrlen)
 		SOCK_LOG_ERROR("Invalid argument\n");
 		return -FI_EINVAL;
 	}
-	return 0;
 }
 
 static int sock_ep_cm_getpeer(struct fid_ep *ep, void *addr, size_t *addrlen)
@@ -390,8 +395,9 @@ static int sock_ep_cm_getpeer(struct fid_ep *ep, void *addr, size_t *addrlen)
 static int sock_cm_send(int fd, const void *buf, int len)
 {
 	int ret, done = 0;
+
 	while (done != len) {
-		ret = ofi_write_socket(fd, (const char*) buf + done, len - done);
+		ret = ofi_send_socket(fd, (const char*) buf + done, len - done, MSG_NOSIGNAL);
 		if (ret < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				continue;
@@ -491,7 +497,7 @@ static void *sock_ep_cm_connect_handler(void *data)
 	struct fi_eq_cm_entry *cm_entry = NULL;
 	int cm_data_sz, response_port;
 
-	sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+	sock_fd = ofi_socket(AF_INET, SOCK_STREAM, 0);
 	if (sock_fd < 0) {
 		SOCK_LOG_ERROR("no socket\n");
 		sock_ep_cm_report_connect_fail(handle->ep, NULL, 0);
@@ -741,6 +747,7 @@ struct fi_ops_cm sock_ep_cm_ops = {
 	.accept = sock_ep_cm_accept,
 	.reject = fi_no_reject,
 	.shutdown = sock_ep_cm_shutdown,
+	.join = fi_no_join,
 };
 
 static int sock_msg_endpoint(struct fid_domain *domain, struct fi_info *info,
@@ -873,8 +880,8 @@ static struct fi_info *sock_ep_msg_get_info(struct sock_pep *pep,
 
 	hints = pep->info;
 	hints.caps = req->caps;
-	return sock_fi_info(FI_EP_MSG, &hints,
-			    &pep->src_addr, &req->src_addr);
+	return sock_fi_info(pep->sock_fab->fab_fid.api_version, FI_EP_MSG,
+			    &hints, &pep->src_addr, &req->src_addr);
 }
 
 static void *sock_pep_req_handler(void *data)
@@ -1108,7 +1115,9 @@ static struct fi_ops_cm sock_pep_cm_ops = {
 	.accept = fi_no_accept,
 	.reject = sock_pep_reject,
 	.shutdown = fi_no_shutdown,
+	.join = fi_no_join,
 };
+
 
 int sock_pep_getopt(fid_t fid, int level, int optname,
 		      void *optval, size_t *optlen)
@@ -1157,7 +1166,7 @@ int sock_msg_passive_ep(struct fid_fabric *fabric, struct fi_info *info,
 	struct addrinfo hints, *result;
 
 	if (info) {
-		ret = sock_verify_info(info);
+		ret = sock_verify_info(fabric->api_version, info);
 		if (ret) {
 			SOCK_LOG_DBG("Cannot support requested options!\n");
 			return ret;

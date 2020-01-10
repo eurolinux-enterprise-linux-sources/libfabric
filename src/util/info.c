@@ -34,6 +34,8 @@
 #include <string.h>
 #include <getopt.h>
 
+#include <fi_osd.h>
+
 #include <rdma/fabric.h>
 #include <rdma/fi_errno.h>
 
@@ -112,6 +114,7 @@ static int str2cap(char *inputstr, uint64_t *value)
 	ORCASE(FI_RMA);
 	ORCASE(FI_TAGGED);
 	ORCASE(FI_ATOMIC);
+	ORCASE(FI_MULTICAST);
 
 	ORCASE(FI_READ);
 	ORCASE(FI_WRITE);
@@ -127,15 +130,13 @@ static int str2cap(char *inputstr, uint64_t *value)
 	ORCASE(FI_TRIGGER);
 	ORCASE(FI_FENCE);
 
-	ORCASE(FI_EVENT);
-	ORCASE(FI_INJECT);
-	ORCASE(FI_INJECT_COMPLETE);
-	ORCASE(FI_TRANSMIT_COMPLETE);
-	ORCASE(FI_DELIVERY_COMPLETE);
-
+	ORCASE(FI_SOURCE_ERR);
+	ORCASE(FI_LOCAL_COMM);
+	ORCASE(FI_REMOTE_COMM);
+	ORCASE(FI_SHARED_AV);
 	ORCASE(FI_RMA_EVENT);
-	ORCASE(FI_NAMED_RX_CTX);
 	ORCASE(FI_SOURCE);
+	ORCASE(FI_NAMED_RX_CTX);
 	ORCASE(FI_DIRECTED_RECV);
 
 	fprintf(stderr, "error: Unrecognized capability: %s\n", inputstr);
@@ -146,10 +147,13 @@ static int str2cap(char *inputstr, uint64_t *value)
 static int str2mode(char *inputstr, uint64_t *value)
 {
 	ORCASE(FI_CONTEXT);
-	ORCASE(FI_LOCAL_MR);
 	ORCASE(FI_MSG_PREFIX);
 	ORCASE(FI_ASYNC_IOV);
 	ORCASE(FI_RX_CQ_DATA);
+	ORCASE(FI_LOCAL_MR);
+	ORCASE(FI_NOTIFY_FLAGS_ONLY);
+	ORCASE(FI_RESTRICTED_COMP);
+	ORCASE(FI_CONTEXT2);
 
 	fprintf(stderr, "error: Unrecognized mode: %s\n", inputstr);
 
@@ -162,6 +166,8 @@ static int str2ep_type(char *inputstr, enum fi_ep_type *value)
 	ORCASE(FI_EP_MSG);
 	ORCASE(FI_EP_DGRAM);
 	ORCASE(FI_EP_RDM);
+	ORCASE(FI_EP_SOCK_STREAM);
+	ORCASE(FI_EP_SOCK_DGRAM);
 
 	fprintf(stderr, "error: Unrecognized endpoint type: %s\n", inputstr);
 
@@ -176,6 +182,11 @@ static int str2addr_format(char *inputstr, uint32_t *value)
 	ORCASE(FI_SOCKADDR_IN6);
 	ORCASE(FI_SOCKADDR_IB);
 	ORCASE(FI_ADDR_PSMX);
+	ORCASE(FI_ADDR_GNI);
+	ORCASE(FI_ADDR_BGQ);
+	ORCASE(FI_ADDR_MLX);
+	ORCASE(FI_ADDR_STR);
+	ORCASE(FI_ADDR_PSMX2);
 
 	fprintf(stderr, "error: Unrecognized address format: %s\n", inputstr);
 
@@ -217,7 +228,7 @@ static const char *param_type(enum fi_param_type type)
 
 static int print_vars(void)
 {
-	int ret, count;
+	int ret, count, i;
 	struct fi_param *params;
 	char delim;
 
@@ -225,7 +236,7 @@ static int print_vars(void)
 	if (ret)
 		return ret;
 
-	for (int i = 0; i < count; ++i) {
+	for (i = 0; i < count; ++i) {
 		printf("# %s: %s\n", params[i].name, param_type(params[i].type));
 		printf("# %s\n", params[i].help_string);
 
@@ -244,7 +255,8 @@ static int print_vars(void)
 
 static int print_providers(struct fi_info *info)
 {
-	for (struct fi_info *cur = info; cur; cur = cur->next) {
+	struct fi_info *cur;
+	for (cur = info; cur; cur = cur->next) {
 		printf("%s:\n", cur->fabric_attr->prov_name);
 		printf("    version: %d.%d\n",
 			FI_MAJOR(cur->fabric_attr->prov_version),
@@ -255,7 +267,8 @@ static int print_providers(struct fi_info *info)
 
 static int print_short_info(struct fi_info *info)
 {
-	for (struct fi_info *cur = info; cur; cur = cur->next) {
+	struct fi_info *cur;
+	for (cur = info; cur; cur = cur->next) {
 		printf("provider: %s\n", cur->fabric_attr->prov_name);
 		printf("    fabric: %s\n", cur->fabric_attr->name),
 		printf("    domain: %s\n", cur->domain_attr->name),
@@ -271,7 +284,8 @@ static int print_short_info(struct fi_info *info)
 
 static int print_long_info(struct fi_info *info)
 {
-	for (struct fi_info *cur = info; cur; cur = cur->next) {
+	struct fi_info *cur;
+	for (cur = info; cur; cur = cur->next) {
 		printf("---\n");
 		printf("%s", fi_tostr(cur, FI_TYPE_INFO));
 	}
@@ -313,6 +327,8 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 
 	hints->mode = ~0;
+	hints->domain_attr->mode = ~0;
+	hints->domain_attr->mr_mode = ~(FI_MR_BASIC | FI_MR_SCALABLE);
 
 	while ((op = getopt_long(argc, argv, "n:P:c:m:t:a:p:d:f:elhv", longopts,
 				 &option_index)) != -1) {

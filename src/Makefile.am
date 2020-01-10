@@ -1,11 +1,11 @@
 #
-# Copyright (c) 2016-2017 Cisco Systems, Inc.  All rights reserved.
+# Copyright (c) 2016 Cisco Systems, Inc.  All rights reserved.
 #
 # Makefile.am for libfabric
 
 AM_CPPFLAGS = \
 	-I$(srcdir)/include \
-	-D_GNU_SOURCE \
+	-D_GNU_SOURCE -D__USE_XOPEN2K8 \
 	-DSYSCONFDIR=\"$(sysconfdir)\" \
 	-DRDMADIR=\"@rdmadir@\" \
 	-DPROVDLDIR=\"$(pkglibdir)\"
@@ -23,7 +23,7 @@ pkglib_LTLIBRARIES = $(DL_PROVIDERS)
 
 
 ACLOCAL_AMFLAGS = -I config
-AM_CFLAGS = -g -Wall
+AM_CFLAGS = -Wall
 
 if HAVE_LD_VERSION_SCRIPT
     libfabric_version_script = -Wl,--version-script=$(builddir)/libfabric.map
@@ -42,18 +42,22 @@ common_srcs = \
 	src/rbtree.c \
 	src/fasthash.c \
 	src/indexer.c \
+	src/iov.c \
+	prov/util/src/util_atomic.c \
 	prov/util/src/util_attr.c   \
 	prov/util/src/util_av.c     \
 	prov/util/src/util_cq.c     \
+	prov/util/src/util_cntr.c   \
 	prov/util/src/util_domain.c \
-	prov/util/src/util_ep.c \
+	prov/util/src/util_ep.c     \
 	prov/util/src/util_eq.c     \
 	prov/util/src/util_fabric.c \
 	prov/util/src/util_main.c   \
 	prov/util/src/util_poll.c   \
 	prov/util/src/util_wait.c   \
 	prov/util/src/util_buf.c    \
-	prov/util/src/util_mr.c
+	prov/util/src/util_mr.c     \
+	prov/util/src/util_ns.c
 
 if MACOS
 common_srcs += src/unix/osd.c
@@ -95,6 +99,7 @@ util_fi_pingpong_SOURCES = \
 	util/pingpong.c
 util_fi_pingpong_LDADD = $(linkback)
 
+nodist_src_libfabric_la_SOURCES =
 src_libfabric_la_SOURCES = \
 	include/fi.h \
 	include/fi_abi.h \
@@ -102,6 +107,7 @@ src_libfabric_la_SOURCES = \
 	include/fi_enosys.h \
 	include/fi_file.h \
 	include/fi_indexer.h \
+	include/fi_iov.h \
 	include/fi_list.h \
 	include/fi_lock.h \
 	include/fi_mem.h \
@@ -110,6 +116,7 @@ src_libfabric_la_SOURCES = \
 	include/fi_rbuf.h \
 	include/fi_signal.h \
 	include/fi_util.h \
+	include/ofi_atomic.h \
 	include/fasthash.h \
 	include/rbtree.h \
 	include/prov.h \
@@ -119,6 +126,7 @@ src_libfabric_la_SOURCES = \
 	src/fi_tostr.c \
 	src/log.c \
 	src/var.c \
+	src/abi_1_0.c \
 	$(common_srcs)
 
 src_libfabric_la_CPPFLAGS = $(AM_CPPFLAGS)
@@ -126,7 +134,10 @@ src_libfabric_la_LDFLAGS =
 src_libfabric_la_LIBADD =
 src_libfabric_la_DEPENDENCIES = libfabric.map
 
-src_libfabric_la_LDFLAGS += -version-info 3:3:2 -export-dynamic \
+if !EMBEDDED
+src_libfabric_la_LDFLAGS += -version-info 10:3:9
+endif
+src_libfabric_la_LDFLAGS += -export-dynamic \
 			   $(libfabric_version_script)
 rdmainclude_HEADERS += \
 	$(top_srcdir)/include/rdma/fabric.h \
@@ -142,7 +153,6 @@ rdmainclude_HEADERS += \
 
 if HAVE_DIRECT
 nodist_rdmainclude_HEADERS = \
-	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct.h \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_domain.h \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_endpoint.h \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_tagged.h \
@@ -152,6 +162,11 @@ nodist_rdmainclude_HEADERS = \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_cm.h \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_eq.h \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_trigger.h
+if FI_DIRECT_H_IN
+nodist_rdmainclude_HEADERS += $(top_builddir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct.h
+else
+nodist_rdmainclude_HEADERS += $(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct.h
+endif
 endif HAVE_DIRECT
 
 real_man_pages = \
@@ -298,7 +313,7 @@ pkgconfig_DATA = libfabric.pc
 nroff:
 	@for file in $(real_man_pages) $(prov_install_man_pages); do \
 	    source=`echo $$file | sed -e 's@/man[0-9]@@'`; \
-	    config/md2nroff.pl --source=$$source.md; \
+	    $(top_srcdir)/config/md2nroff.pl --source=$(top_srcdir)/$$source.md; \
 	done
 
 dist-hook: libfabric.spec
@@ -323,10 +338,11 @@ include prov/verbs/Makefile.include
 include prov/usnic/Makefile.include
 include prov/psm/Makefile.include
 include prov/psm2/Makefile.include
-include prov/mxm/Makefile.include
 include prov/gni/Makefile.include
 include prov/rxm/Makefile.include
 include prov/rxd/Makefile.include
+include prov/bgq/Makefile.include
+include prov/mlx/Makefile.include
 
 man_MANS = $(real_man_pages) $(prov_install_man_pages) $(dummy_man_pages)
 

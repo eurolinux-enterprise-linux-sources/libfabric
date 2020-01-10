@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2016, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -67,7 +67,7 @@
 static inline int
 usdf_eq_empty(struct usdf_eq *eq)
 {
-	return (atomic_get(&eq->eq_num_events) == 0);
+	return (ofi_atomic_get32(&eq->eq_num_events) == 0);
 }
 
 static inline int
@@ -107,7 +107,7 @@ static inline ssize_t usdf_eq_read_event(struct usdf_eq *eq, uint32_t *event,
 
 	if (!(flags & FI_PEEK)) {
 		/* update count */
-		atomic_dec(&eq->eq_num_events);
+		ofi_atomic_dec32(&eq->eq_num_events);
 
 		/* Free the event buf if needed */
 		if (ev->ue_flags & USDF_EVENT_FLAG_FREE_BUF)
@@ -165,47 +165,9 @@ usdf_eq_write_event(struct usdf_eq *eq, uint32_t event,
 	}
 
 	/* increment queued event count */
-	atomic_inc(&eq->eq_num_events);
+	ofi_atomic_inc32(&eq->eq_num_events);
 
 	return len;
-}
-
-static ssize_t usdf_eq_readerr(struct fid_eq *feq,
-		struct fi_eq_err_entry *entry, uint64_t flags)
-{
-	struct usdf_err_data_entry *err_data_entry;
-	struct usdf_eq *eq;
-	ssize_t ret;
-
-	USDF_TRACE_SYS(EQ, "\n");
-
-	if (!feq) {
-		USDF_DBG_SYS(EQ, "invalid input\n");
-		return -FI_EINVAL;
-	}
-
-	eq = eq_ftou(feq);
-
-	pthread_spin_lock(&eq->eq_lock);
-
-	/* make sure there is an error on top */
-	if (usdf_eq_empty(eq) || !usdf_eq_error(eq)) {
-		ret = -FI_EAGAIN;
-		goto done;
-	}
-
-	ret = usdf_eq_read_event(eq, NULL, entry, sizeof(*entry), flags);
-
-	/* Mark as seen so it can be cleaned on the next iteration of read. */
-	if (entry->err_data_size) {
-		err_data_entry = container_of(entry->err_data,
-				struct usdf_err_data_entry, err_data);
-		err_data_entry->seen = 1;
-	}
-
-done:
-	pthread_spin_unlock(&eq->eq_lock);
-	return ret;
 }
 
 static void usdf_eq_clean_err(struct usdf_eq *eq, uint8_t destroy)
@@ -227,6 +189,76 @@ static void usdf_eq_clean_err(struct usdf_eq *eq, uint8_t destroy)
 			break;
 		}
 	}
+}
+
+static ssize_t usdf_eq_readerr(struct fid_eq *feq,
+		struct fi_eq_err_entry *given_buffer, uint64_t flags)
+{
+	struct usdf_err_data_entry *err_data_entry;
+	struct fi_eq_err_entry entry;
+	struct usdf_eq *eq;
+	ssize_t ret, err_data_size;
+	uint32_t api_version;
+	void *err_data = NULL;
+
+	USDF_TRACE_SYS(EQ, "\n");
+
+	if (!feq) {
+		USDF_DBG_SYS(EQ, "invalid input\n");
+		return -FI_EINVAL;
+	}
+
+	eq = eq_ftou(feq);
+
+	pthread_spin_lock(&eq->eq_lock);
+
+	/* make sure there is an error on top */
+	if (usdf_eq_empty(eq) || !usdf_eq_error(eq)) {
+		pthread_spin_unlock(&eq->eq_lock);
+		ret = -FI_EAGAIN;
+		goto done;
+	}
+
+	ret = usdf_eq_read_event(eq, NULL, &entry, sizeof(entry), flags);
+
+	pthread_spin_unlock(&eq->eq_lock);
+
+	/* read the user's setting for err_data. */
+	err_data = given_buffer->err_data;
+	err_data_size = given_buffer->err_data_size;
+
+	/* Copy the entry. */
+	*given_buffer = entry;
+
+	/* Mark as seen so it can be cleaned on the next iteration of read. */
+	if (entry.err_data_size) {
+		err_data_entry = container_of(entry.err_data,
+				struct usdf_err_data_entry, err_data);
+		err_data_entry->seen = 1;
+	}
+
+
+	/* For release > 1.5, we will copy the err_data directly
+	 * to the user's buffer.
+	 */
+	api_version = eq->eq_fabric->fab_attr.fabric->api_version;
+	if (FI_VERSION_GE(api_version, FI_VERSION(1, 5))) {
+		given_buffer->err_data = err_data;
+		given_buffer->err_data_size =
+			MIN(err_data_size, entry.err_data_size);
+		memcpy(given_buffer->err_data, entry.err_data,
+				given_buffer->err_data_size);
+
+		if (err_data_size < entry.err_data_size) {
+			USDF_DBG_SYS(EQ, "err_data truncated by %zd bytes.\n",
+				entry.err_data_size - err_data_size);
+		}
+
+		usdf_eq_clean_err(eq, 0);
+	}
+
+done:
+	return ret;
 }
 
 static ssize_t _usdf_eq_read(struct usdf_eq *eq, uint32_t *event, void *buf,
@@ -317,7 +349,7 @@ ssize_t usdf_eq_write_internal(struct usdf_eq *eq, uint32_t event,
 	/* Return -FI_EAGAIN if the EQ is full.
 	 * TODO: Disable the EQ.
 	 */
-	if (atomic_get(&eq->eq_num_events) == eq->eq_ev_ring_size) {
+	if (ofi_atomic_get32(&eq->eq_num_events) == eq->eq_ev_ring_size) {
 		ret = -FI_EAGAIN;
 		goto done;
 	}
@@ -462,7 +494,7 @@ static int usdf_eq_unbind_wait(struct usdf_eq *eq)
 
 	fid_list_remove(&wait_priv->list, &wait_priv->lock, &eq->eq_fid.fid);
 
-	atomic_dec(&wait_priv->wait_refcnt);
+	ofi_atomic_dec32(&wait_priv->wait_refcnt);
 
 	USDF_DBG_SYS(EQ,
 			"dissasociated EQ FD %d from epoll FD %d using FID: %p\n",
@@ -481,10 +513,10 @@ usdf_eq_close(fid_t fid)
 
 	eq = eq_fidtou(fid);
 
-	if (atomic_get(&eq->eq_refcnt) > 0) {
+	if (ofi_atomic_get32(&eq->eq_refcnt) > 0) {
 		return -FI_EBUSY;
 	}
-	atomic_dec(&eq->eq_fabric->fab_refcnt);
+	ofi_atomic_dec32(&eq->eq_fabric->fab_refcnt);
 
 	/* release wait obj */
 	switch (eq->eq_attr.wait_obj) {
@@ -550,7 +582,7 @@ usdf_eq_open(struct fid_fabric *fabric, struct fi_eq_attr *attr,
 	eq->eq_fid.ops = &eq->eq_ops_data;
 
 	eq->eq_fabric = fab;
-	atomic_initialize(&eq->eq_refcnt, 0);
+	ofi_atomic_initialize32(&eq->eq_refcnt, 0);
 	ret = pthread_spin_init(&eq->eq_lock, PTHREAD_PROCESS_PRIVATE);
 	if (ret != 0) {
 		ret = -ret;
@@ -614,9 +646,9 @@ usdf_eq_open(struct fid_fabric *fabric, struct fi_eq_attr *attr,
 	eq->eq_ev_tail = eq->eq_ev_ring;
 	eq->eq_ev_ring_size = attr->size;
 	eq->eq_ev_end = eq->eq_ev_ring + eq->eq_ev_ring_size;
-	atomic_initialize(&eq->eq_num_events, 0);
+	ofi_atomic_initialize32(&eq->eq_num_events, 0);
 
-	atomic_inc(&eq->eq_fabric->fab_refcnt);
+	ofi_atomic_inc32(&eq->eq_fabric->fab_refcnt);
 
 	eq->eq_attr = *attr;
 	*feq = eq_utof(eq);

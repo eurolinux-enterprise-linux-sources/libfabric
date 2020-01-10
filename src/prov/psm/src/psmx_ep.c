@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -175,17 +175,17 @@ static int psmx_ep_close(fid_t fid)
 	ep = container_of(fid, struct psmx_fid_ep, ep.fid);
 
 	if (ep->base_ep) {
-		atomic_dec(&ep->base_ep->ref);
+		ofi_atomic_dec32(&ep->base_ep->ref);
 		return 0;
 	}
 
-	if (atomic_get(&ep->ref))
+	if (ofi_atomic_get32(&ep->ref))
 		return -FI_EBUSY;
 
+	ofi_ns_del_local_name(&ep->domain->fabric->name_server,
+			      &ep->service, &ep->domain->psm_epid);
 	psmx_domain_disable_ep(ep->domain, ep);
-
 	psmx_domain_release(ep->domain);
-
 	free(ep);
 
 	return 0;
@@ -328,7 +328,7 @@ static int psmx_ep_control(fid_t fid, int command, void *arg)
 			return err;
 		}
 		new_ep->base_ep = ep;
-		atomic_inc(&ep->ref);
+		ofi_atomic_inc32(&ep->ref);
 		psmx_ep_optimize_ops(new_ep);
 		*alias->fid = &new_ep->ep.fid;
 		break;
@@ -418,6 +418,24 @@ int psmx_ep_open(struct fid_domain *domain, struct fi_info *info,
 	if (!domain_priv)
 		return -FI_EINVAL;
 
+	if (info && info->ep_attr && info->ep_attr->auth_key) {
+		if (info->ep_attr->auth_key_size != sizeof(psm_uuid_t)) {
+			FI_WARN(&psmx_prov, FI_LOG_EP_CTRL,
+				"Invalid auth_key_len %"PRIu64
+				", should be %"PRIu64".\n",
+				info->ep_attr->auth_key_size,
+				sizeof(psm_uuid_t));
+			return -FI_EINVAL;
+		}
+		if (memcmp(domain_priv->fabric->uuid, info->ep_attr->auth_key,
+			   sizeof(psm_uuid_t))) {
+			FI_WARN(&psmx_prov, FI_LOG_EP_CTRL,
+				"Invalid auth_key: %s\n",
+				psmx_uuid_to_string((void *)info->ep_attr->auth_key));
+			return -FI_EINVAL;
+		}
+	}
+
 	err = psmx_domain_check_features(domain_priv, ep_cap);
 	if (err)
 		return err; 
@@ -432,7 +450,7 @@ int psmx_ep_open(struct fid_domain *domain, struct fi_info *info,
 	ep_priv->ep.ops = &psmx_ep_ops;
 	ep_priv->ep.cm = &psmx_cm_ops;
 	ep_priv->domain = domain_priv;
-	atomic_initialize(&ep_priv->ref, 0);
+	ofi_atomic_initialize32(&ep_priv->ref, 0);
 
 	PSMX_CTXT_TYPE(&ep_priv->nocomp_send_context) = PSMX_NOCOMP_SEND_CONTEXT;
 	PSMX_CTXT_EP(&ep_priv->nocomp_send_context) = ep_priv;
@@ -468,6 +486,17 @@ int psmx_ep_open(struct fid_domain *domain, struct fi_info *info,
 	}
 
 	psmx_ep_optimize_ops(ep_priv);
+
+	ep_priv->service = PSMX_ANY_SERVICE;
+	if (info && info->src_addr)
+		ep_priv->service = ((struct psmx_src_name *)info->src_addr)->service;
+
+	if (ep_priv->service == PSMX_ANY_SERVICE)
+		ep_priv->service = ((getpid() & 0x7FFF) << 16) +
+				   ((uintptr_t)ep_priv & 0xFFFF);
+
+	ofi_ns_add_local_name(&ep_priv->domain->fabric->name_server,
+			      &ep_priv->service, &ep_priv->domain->psm_epid);
 
 	*ep = &ep_priv->ep;
 

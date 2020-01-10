@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -35,27 +35,46 @@
 static int psmx2_cm_getname(fid_t fid, void *addr, size_t *addrlen)
 {
 	struct psmx2_fid_ep *ep;
-	struct psmx2_ep_name *epname = addr;
+	struct psmx2_fid_sep *sep;
+	struct psmx2_ep_name epname;
+	size_t	addr_size;
+	int err = 0;
 
 	ep = container_of(fid, struct psmx2_fid_ep, ep.fid);
 	if (!ep->domain)
 		return -FI_EBADF;
 
-	if (*addrlen < sizeof(struct psmx2_ep_name)) {
-		*addrlen = sizeof(struct psmx2_ep_name);
-		return -FI_ETOOSMALL;
+	memset(&epname, 0, sizeof(epname));
+
+	if (ep->type == PSMX2_EP_REGULAR) {
+		epname.epid = ep->trx_ctxt->psm2_epid;
+		epname.vlane = ep->vlane;
+		epname.type = ep->type;
+	} else {
+		sep = (struct psmx2_fid_sep *)ep;
+		epname.epid = sep->domain->base_trx_ctxt->psm2_epid;
+		epname.sep_id = sep->id;
+		epname.type = sep->type;
 	}
 
-	memset(epname, 0, sizeof(*epname));
-	epname->epid = ep->domain->psm2_epid;
-	epname->vlane = ep->vlane;
-	*addrlen = sizeof(struct psmx2_ep_name);
+	if (ep->domain->addr_format == FI_ADDR_STR) {
+		addr_size = *addrlen;
+		ofi_straddr(addr, &addr_size, FI_ADDR_PSMX2, &epname);
+	} else {
+		addr_size = sizeof(epname);
+		memcpy(addr, &epname, MIN(*addrlen, addr_size));
+	}
 
-	return 0;
+	if (*addrlen < addr_size)
+		err = -FI_ETOOSMALL;
+
+	*addrlen = addr_size;
+	return err;
 }
 
 struct fi_ops_cm psmx2_cm_ops = {
 	.size = sizeof(struct fi_ops_cm),
+	.setname = fi_no_setname,
 	.getname = psmx2_cm_getname,
 	.getpeer = fi_no_getpeer,
 	.connect = fi_no_connect,
@@ -63,5 +82,6 @@ struct fi_ops_cm psmx2_cm_ops = {
 	.accept = fi_no_accept,
 	.reject = fi_no_reject,
 	.shutdown = fi_no_shutdown,
+	.join = fi_no_join,
 };
 

@@ -38,6 +38,13 @@
 #include "gnix.h"
 #include "gnix_eq.h"
 #include "gnix_util.h"
+#include "gnix_cm.h"
+
+/*******************************************************************************
+ * Global declarations
+ ******************************************************************************/
+DLIST_HEAD(gnix_eq_list);
+pthread_mutex_t gnix_eq_list_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*******************************************************************************
  * Forward declaration for ops structures.
@@ -49,6 +56,19 @@ static struct fi_ops gnix_fi_eq_ops;
 /*******************************************************************************
  * Helper functions.
  ******************************************************************************/
+
+static void gnix_eq_cleanup_err_bufs(struct gnix_fid_eq *eq, int free_all)
+{
+	struct gnix_eq_err_buf *ebuf, *tmp;
+
+	dlist_for_each_safe(&eq->err_bufs, ebuf, tmp, dlist) {
+		if (free_all || ebuf->do_free) {
+			dlist_remove(&ebuf->dlist);
+			free(ebuf);
+		}
+	}
+}
+
 static int gnix_eq_set_wait(struct gnix_fid_eq *eq)
 {
 	int ret = FI_SUCCESS;
@@ -61,18 +81,14 @@ static int gnix_eq_set_wait(struct gnix_fid_eq *eq)
 	};
 
 	switch (eq->attr.wait_obj) {
-	case FI_WAIT_FD:
-	case FI_WAIT_MUTEX_COND:
+	case FI_WAIT_UNSPEC:
 		ret = gnix_wait_open(&eq->fabric->fab_fid, &requested,
 				     &eq->wait);
 		break;
 	case FI_WAIT_SET:
 		ret = _gnix_wait_set_add(eq->attr.wait_set, &eq->eq_fid.fid);
-
-		if (ret)
-			return ret;
-
-		eq->wait = eq->attr.wait_set;
+		if (!ret)
+			eq->wait = eq->attr.wait_set;
 		break;
 	default:
 		break;
@@ -93,7 +109,7 @@ static int gnix_verify_eq_attr(struct fi_eq_attr *attr)
 		attr->size = GNIX_EQ_DEFAULT_SIZE;
 
 	/*
-	 * Initial implementation doesn't support any type of wait object.
+	 * We only support FI_WAIT_SET and FI_WAIT_UNSPEC
 	 */
 	switch (attr->wait_obj) {
 	case FI_WAIT_NONE:
@@ -106,15 +122,13 @@ static int gnix_verify_eq_attr(struct fi_eq_attr *attr)
 		}
 		break;
 	case FI_WAIT_UNSPEC:
-		attr->wait_obj = FI_WAIT_FD;
 		break;
 	case FI_WAIT_FD:
 	case FI_WAIT_MUTEX_COND:
-		break;
 	default:
 		GNIX_WARN(FI_LOG_EQ, "wait type: %d unsupported.\n",
 			  attr->wait_obj);
-		return -FI_EINVAL;
+		return -FI_ENOSYS;
 	}
 
 	return FI_SUCCESS;
@@ -155,26 +169,24 @@ err:
 	return NULL;
 }
 
-ssize_t _gnix_eq_write_error(struct fid_eq *eq, fid_t fid,
+ssize_t _gnix_eq_write_error(struct gnix_fid_eq *eq, fid_t fid,
 			     void *context, uint64_t index, int err,
 			     int prov_errno, void *err_data,
 			     size_t err_size)
 {
 	struct fi_eq_err_entry *error;
 	struct gnix_eq_entry *event;
-	struct gnix_fid_eq *eq_priv;
 	struct slist_entry *item;
+	struct gnix_eq_err_buf *err_buf;
 
 	ssize_t ret = FI_SUCCESS;
 
 	if (!eq)
 		return -FI_EINVAL;
 
-	eq_priv = container_of(eq, struct gnix_fid_eq, eq_fid);
+	fastlock_acquire(&eq->lock);
 
-	fastlock_acquire(&eq_priv->lock);
-
-	item = _gnix_queue_get_free(eq_priv->errors);
+	item = _gnix_queue_get_free(eq->errors);
 	if (!item) {
 		GNIX_WARN(FI_LOG_EQ, "error creating error entry\n");
 		ret = -FI_ENOMEM;
@@ -190,13 +202,33 @@ ssize_t _gnix_eq_write_error(struct fid_eq *eq, fid_t fid,
 	error->data = index;
 	error->err = err;
 	error->prov_errno = prov_errno;
-	error->err_data = err_data;
-	error->err_data_size = err_size;
 
-	_gnix_queue_enqueue(eq_priv->errors, &event->item);
+	if (err_size) {
+		err_buf = malloc(sizeof(struct gnix_eq_err_buf) + err_size);
+		if (!err_buf) {
+			_gnix_queue_enqueue_free(eq->errors, &event->item);
+			ret = -FI_ENOMEM;
+			goto err;
+		}
+		err_buf->do_free = 0;
+
+		memcpy(err_buf->buf, err_data, err_size);
+		error->err_data = err_buf->buf;
+		error->err_data_size = err_size;
+
+		dlist_insert_tail(&err_buf->dlist, &eq->err_bufs);
+	} else {
+		error->err_data = NULL;
+		error->err_data_size = 0;
+	}
+
+	_gnix_queue_enqueue(eq->errors, &event->item);
+
+	if (eq->wait)
+		_gnix_signal_wait_obj(eq->wait);
 
 err:
-	fastlock_release(&eq_priv->lock);
+	fastlock_release(&eq->lock);
 
 	return ret;
 }
@@ -204,6 +236,9 @@ err:
 static void __eq_destruct(void *obj)
 {
 	struct gnix_fid_eq *eq = (struct gnix_fid_eq *) obj;
+	pthread_mutex_lock(&gnix_eq_list_lock);
+	dlist_remove(&eq->gnix_fid_eq_list);
+	pthread_mutex_unlock(&gnix_eq_list_lock);
 
 	_gnix_ref_put(eq->fabric);
 
@@ -230,7 +265,102 @@ static void __eq_destruct(void *obj)
 	_gnix_queue_destroy(eq->events);
 	_gnix_queue_destroy(eq->errors);
 
+	gnix_eq_cleanup_err_bufs(eq, 1);
+
 	free(eq);
+}
+
+int _gnix_eq_poll_obj_add(struct gnix_fid_eq *eq, struct fid *obj_fid)
+{
+	struct gnix_eq_poll_obj *pobj;
+
+	COND_WRITE_ACQUIRE(eq->requires_lock, &eq->poll_obj_lock);
+
+	pobj = malloc(sizeof(struct gnix_eq_poll_obj));
+	if (!pobj) {
+		GNIX_WARN(FI_LOG_EQ, "Failed to add object to EQ poll list.\n");
+		COND_RW_RELEASE(eq->requires_lock, &eq->poll_obj_lock);
+		return -FI_ENOMEM;
+	}
+
+	pobj->obj_fid = obj_fid;
+	dlist_init(&pobj->list);
+	dlist_insert_tail(&pobj->list, &eq->poll_objs);
+
+	COND_RW_RELEASE(eq->requires_lock, &eq->poll_obj_lock);
+
+	GNIX_INFO(FI_LOG_EQ, "Added object(%d, %p) to EQ(%p) poll list\n",
+		  obj_fid->fclass, obj_fid, eq);
+
+	return FI_SUCCESS;
+}
+
+int _gnix_eq_poll_obj_rem(struct gnix_fid_eq *eq, struct fid *obj_fid)
+{
+	struct gnix_eq_poll_obj *pobj, *tmp;
+
+	COND_WRITE_ACQUIRE(eq->requires_lock, &eq->poll_obj_lock);
+
+	dlist_for_each_safe(&eq->poll_objs, pobj, tmp, list) {
+		if (pobj->obj_fid == obj_fid) {
+			dlist_remove(&pobj->list);
+			free(pobj);
+			GNIX_INFO(FI_LOG_EQ,
+				  "Removed object(%d, %p) from EQ(%p) poll list\n",
+				  pobj->obj_fid->fclass, pobj, eq);
+			COND_RW_RELEASE(eq->requires_lock, &eq->poll_obj_lock);
+			return FI_SUCCESS;
+		}
+	}
+
+	COND_RW_RELEASE(eq->requires_lock, &eq->poll_obj_lock);
+
+	GNIX_WARN(FI_LOG_EQ, "object not found on EQ poll list.\n");
+	return -FI_EINVAL;
+}
+
+int _gnix_eq_progress(struct gnix_fid_eq *eq)
+{
+	struct gnix_eq_poll_obj *pobj, *tmp;
+	int rc;
+	struct gnix_fid_pep *pep;
+	struct gnix_fid_ep *ep;
+
+	COND_READ_ACQUIRE(eq->requires_lock, &eq->poll_obj_lock);
+
+	dlist_for_each_safe(&eq->poll_objs, pobj, tmp, list) {
+		switch (pobj->obj_fid->fclass) {
+		case FI_CLASS_PEP:
+			pep = container_of(pobj->obj_fid, struct gnix_fid_pep,
+					   pep_fid.fid);
+			rc = _gnix_pep_progress(pep);
+			if (rc) {
+				GNIX_WARN(FI_LOG_EQ,
+					  "_gnix_pep_progress failed: %d\n",
+					  rc);
+			}
+			break;
+		case FI_CLASS_EP:
+			ep = container_of(pobj->obj_fid, struct gnix_fid_ep,
+					  ep_fid.fid);
+			rc = _gnix_ep_progress(ep);
+			if (rc) {
+				GNIX_WARN(FI_LOG_EP_CTRL,
+					  "_gnix_ep_progress failed: %d\n",
+					  rc);
+			}
+			break;
+		default:
+			GNIX_WARN(FI_LOG_EQ,
+				  "invalid poll object: %d %p\n",
+				  pobj->obj_fid->fclass, pobj);
+			break;
+		}
+	}
+
+	COND_RW_RELEASE(eq->requires_lock, &eq->poll_obj_lock);
+
+	return FI_SUCCESS;
 }
 
 /*******************************************************************************
@@ -271,9 +401,15 @@ DIRECT_FN int gnix_eq_open(struct fid_fabric *fabric, struct fi_eq_attr *attr,
 	eq_priv->eq_fid.fid.context = context;
 	eq_priv->eq_fid.fid.ops = &gnix_fi_eq_ops;
 	eq_priv->eq_fid.ops = &gnix_eq_ops;
+	eq_priv->requires_lock = 1;
 	eq_priv->attr = *attr;
 
 	fastlock_init(&eq_priv->lock);
+
+	rwlock_init(&eq_priv->poll_obj_lock);
+	dlist_init(&eq_priv->poll_objs);
+
+	dlist_init(&eq_priv->err_bufs);
 
 	ret = gnix_eq_set_wait(eq_priv);
 	if (ret)
@@ -291,6 +427,11 @@ DIRECT_FN int gnix_eq_open(struct fid_fabric *fabric, struct fi_eq_attr *attr,
 		goto err2;
 
 	*eq = &eq_priv->eq_fid;
+
+	pthread_mutex_lock(&gnix_eq_list_lock);
+	dlist_insert_tail(&eq_priv->gnix_fid_eq_list, &gnix_eq_list);
+	pthread_mutex_unlock(&gnix_eq_list_lock);
+
 	return ret;
 
 err2:
@@ -325,8 +466,9 @@ DIRECT_FN STATIC int gnix_eq_close(struct fid *fid)
 	return FI_SUCCESS;
 }
 
-DIRECT_FN STATIC ssize_t gnix_eq_read(struct fid_eq *eq, uint32_t *event,
-				      void *buf, size_t len, uint64_t flags)
+static ssize_t __gnix_eq_sread(int blocking, struct fid_eq *eq,
+			       uint32_t *event, void *buf, size_t len,
+			       uint64_t flags, int timeout)
 {
 	struct gnix_fid_eq *eq_priv;
 	struct gnix_eq_entry *entry;
@@ -338,10 +480,28 @@ DIRECT_FN STATIC ssize_t gnix_eq_read(struct fid_eq *eq, uint32_t *event,
 
 	eq_priv = container_of(eq, struct gnix_fid_eq, eq_fid);
 
+	if ((blocking && !eq_priv->wait) ||
+	    (blocking && eq_priv->attr.wait_obj == FI_WAIT_SET)) {
+		GNIX_WARN(FI_LOG_EQ, "Invalid wait type\n");
+		return -FI_EINVAL;
+	}
+
+	gnix_eq_cleanup_err_bufs(eq_priv, 0);
+
+	_gnix_eq_progress(eq_priv);
+
 	if (_gnix_queue_peek(eq_priv->errors))
 		return -FI_EAVAIL;
 
+	if (eq_priv->wait)
+		gnix_wait_wait((struct fid_wait *) eq_priv->wait, timeout);
+
 	fastlock_acquire(&eq_priv->lock);
+
+	if (_gnix_queue_peek(eq_priv->errors)) {
+		read_size = -FI_EAVAIL;
+		goto err;
+	}
 
 	item = _gnix_queue_peek(eq_priv->events);
 
@@ -377,36 +537,17 @@ err:
 	return read_size;
 }
 
+DIRECT_FN STATIC ssize_t gnix_eq_read(struct fid_eq *eq, uint32_t *event,
+				      void *buf, size_t len, uint64_t flags)
+{
+	return __gnix_eq_sread(0, eq, event, buf, len, flags, 0);
+}
+
 DIRECT_FN STATIC ssize_t gnix_eq_sread(struct fid_eq *eq, uint32_t *event,
 				       void *buf, size_t len, int timeout,
 				       uint64_t flags)
 {
-	double start_ms = 0.0, end_ms = 0.0;
-	int ret;
-
-	ret = gnix_eq_read(eq, event, buf, len, flags);
-	if (ret != -FI_EAGAIN)
-		return ret;
-
-	if (timeout > 0)
-		start_ms = fi_gettime_ms();
-
-	do {
-		usleep(1000);
-
-		ret = gnix_eq_read(eq, event, buf, len, flags);
-		if (ret != -FI_EAGAIN)
-			return ret;
-
-		if (timeout > 0) {
-			end_ms = fi_gettime_ms();
-			timeout -=  (end_ms - start_ms);
-			timeout = timeout < 0 ? 0 : timeout;
-			start_ms = end_ms;
-		}
-	} while (timeout);
-
-	return -FI_EAGAIN;
+	return __gnix_eq_sread(1, eq, event, buf, len, flags, timeout);
 }
 
 DIRECT_FN STATIC int gnix_eq_control(struct fid *eq, int command, void *arg)
@@ -416,7 +557,6 @@ DIRECT_FN STATIC int gnix_eq_control(struct fid *eq, int command, void *arg)
 
 	eq_priv = container_of(eq, struct gnix_fid_eq, eq_fid);
 	*/
-
 	switch (command) {
 	case FI_GETWAIT:
 		/* return _gnix_get_wait_obj(eq_priv->wait, arg); */
@@ -433,6 +573,8 @@ DIRECT_FN STATIC ssize_t gnix_eq_readerr(struct fid_eq *eq,
 	struct gnix_fid_eq *eq_priv;
 	struct gnix_eq_entry *entry;
 	struct slist_entry *item;
+	struct gnix_eq_err_buf *err_buf;
+	struct fi_eq_err_entry *fi_err;
 
 	ssize_t read_size = sizeof(*buf);
 
@@ -451,8 +593,17 @@ DIRECT_FN STATIC ssize_t gnix_eq_readerr(struct fid_eq *eq,
 	}
 
 	entry = container_of(item, struct gnix_eq_entry, item);
+	fi_err = (struct fi_eq_err_entry *)entry->the_entry;
 
 	memcpy(buf, entry->the_entry, read_size);
+
+	/* If removing an event with err_data, mark err buf to be freed during
+	 * the next EQ read. */
+	if (!(flags & FI_PEEK) && fi_err->err_data) {
+		err_buf = container_of(fi_err->err_data,
+				       struct gnix_eq_err_buf, buf);
+		err_buf->do_free = 1;
+	}
 
 	_gnix_queue_enqueue_free(eq_priv->errors, &entry->item);
 
@@ -487,6 +638,7 @@ DIRECT_FN STATIC ssize_t gnix_eq_write(struct fid_eq *eq, uint32_t event,
 
 	entry->the_entry = calloc(1, len);
 	if (!entry->the_entry) {
+		_gnix_queue_enqueue_free(eq_priv->events, &entry->item);
 		GNIX_WARN(FI_LOG_EQ, "error allocating buffer\n");
 		ret = -FI_ENOMEM;
 		goto err;

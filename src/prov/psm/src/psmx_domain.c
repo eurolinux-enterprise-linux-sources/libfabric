@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -182,7 +182,7 @@ static int psmx_domain_close(fid_t fid)
 			      util_domain.domain_fid.fid);
 
 	FI_INFO(&psmx_prov, FI_LOG_DOMAIN, "refcnt=%d\n",
-		atomic_get(&domain->util_domain.ref));
+		ofi_atomic_get32(&domain->util_domain.ref));
 
 	psmx_domain_release(domain);
 
@@ -245,6 +245,7 @@ static struct fi_ops_domain psmx_domain_ops = {
 	.poll_open = fi_poll_create,
 	.stx_ctx = psmx_stx_ctx,
 	.srx_ctx = fi_no_srx_context,
+	.query_atomic = psmx_query_atomic,
 };
 
 static int psmx_key_compare(void *key1, void *key2)
@@ -421,9 +422,12 @@ err_out:
 int psmx_domain_check_features(struct psmx_fid_domain *domain, int ep_cap)
 {
 	if ((domain->caps & ep_cap & ~PSMX_SUB_CAPS) != (ep_cap & ~PSMX_SUB_CAPS)) {
+		uint64_t mask = ~PSMX_SUB_CAPS;
 		FI_INFO(&psmx_prov, FI_LOG_CORE,
-			"caps mismatch: domain->caps=%llx, ep->caps=%llx, mask=%llx\n",
-			domain->caps, ep_cap, ~PSMX_SUB_CAPS);
+			"caps mismatch: domain->caps=%s,\n ep->caps=%s,\n mask=%s\n",
+			fi_tostr(&domain->caps, FI_TYPE_CAPS),
+			fi_tostr(&ep_cap, FI_TYPE_CAPS),
+			fi_tostr(&mask, FI_TYPE_CAPS));
 		return -FI_EOPNOTSUPP;
 	}
 
@@ -454,9 +458,12 @@ int psmx_domain_enable_ep(struct psmx_fid_domain *domain, struct psmx_fid_ep *ep
 		ep_cap = ep->caps;
 
 	if ((domain->caps & ep_cap & ~PSMX_SUB_CAPS) != (ep_cap & ~PSMX_SUB_CAPS)) {
+		uint64_t mask = ~PSMX_SUB_CAPS;
 		FI_INFO(&psmx_prov, FI_LOG_CORE,
-			"caps mismatch: domain->caps=%llx, ep->caps=%llx, mask=%llx\n",
-			domain->caps, ep_cap, ~PSMX_SUB_CAPS);
+			"caps mismatch: domain->caps=%s,\n ep->caps=%s,\n mask=%s\n",
+			fi_tostr(&domain->caps, FI_TYPE_CAPS),
+			fi_tostr(&ep_cap, FI_TYPE_CAPS),
+			fi_tostr(&mask, FI_TYPE_CAPS));
 		return -FI_EOPNOTSUPP;
 	}
 

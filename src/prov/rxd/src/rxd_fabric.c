@@ -82,7 +82,7 @@ int rxd_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
 		return -FI_ENOMEM;
 
 	ret = ofi_fabric_init(&rxd_prov, &rxd_fabric_attr, attr,
-			     &rxd_fabric->util_fabric, context, FI_MATCH_PREFIX);
+			      &rxd_fabric->util_fabric, context);
 	if (ret)
 		goto err1;
 
@@ -93,9 +93,8 @@ int rxd_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
 	}
 	hints.fabric_attr->name = attr->name;
 
-	ret = ofix_getinfo(rxd_prov.version, NULL, NULL, 0, &rxd_util_prov,
-			&hints, rxd_alter_layer_info,
-			rxd_alter_base_info, 1, &dg_info);
+	ret = ofi_get_core_info(attr->api_version, NULL, NULL, 0, &rxd_util_prov,
+				&hints, rxd_info_to_core, &dg_info);
 	if (ret) {
 		ret = -FI_EINVAL;
 		goto err3;
@@ -112,6 +111,9 @@ int rxd_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
 
 	free(hints.fabric_attr);
 	fi_freeinfo(dg_info);
+
+	fi_param_get_int(&rxd_prov, "spin_count", &rxd_progress_spin_count);
+
 	return 0;
 err4:
 	fi_freeinfo(dg_info);

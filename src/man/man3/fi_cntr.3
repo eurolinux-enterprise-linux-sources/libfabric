@@ -1,4 +1,4 @@
-.TH "fi_cntr" "3" "2016\-02\-28" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.4.2"
+.TH "fi_cntr" "3" "2017\-03\-09" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.5.3"
 .SH NAME
 .PP
 fi_cntr \- Completion and event counter operations
@@ -33,7 +33,11 @@ uint64_t\ fi_cntr_readerr(struct\ fid_cntr\ *cntr);
 
 int\ fi_cntr_add(struct\ fid_cntr\ *cntr,\ uint64_t\ value);
 
+int\ fi_cntr_adderr(struct\ fid_cntr\ *cntr,\ uint64_t\ value);
+
 int\ fi_cntr_set(struct\ fid_cntr\ *cntr,\ uint64_t\ value);
+
+int\ fi_cntr_seterr(struct\ fid_cntr\ *cntr,\ uint64_t\ value);
 
 int\ fi_cntr_wait(struct\ fid_cntr\ *cntr,\ uint64_t\ threshold,
 \ \ \ \ int\ timeout);
@@ -69,6 +73,8 @@ to a request.
 Counters typically only count successful completions.
 However, if an operation completes in error, it may increment an
 associated error value.
+That is, a counter actually stores two distinct values, with error
+completions updating an error specific value.
 .SS fi_cntr_open
 .PP
 fi_cntr_open allocates a new fabric counter.
@@ -93,7 +99,7 @@ The specific type which is to counted are one of the following:
 successful completion that occurs on an associated bound endpoint.
 The type of completions \-\- sends and/or receives \-\- which are
 counted may be restricted using control flags when binding the counter
-an the endpoint.
+and the endpoint.
 Counters increment on all successful completions, separately from
 whether the operation generates an entry in an event queue.
 .PP
@@ -106,6 +112,7 @@ associated with a counter, in order to use it in other system calls.
 The following values may be used to specify the type of wait object
 associated with a counter: FI_WAIT_NONE, FI_WAIT_UNSPEC, FI_WAIT_SET,
 FI_WAIT_FD, and FI_WAIT_MUTEX_COND.
+The default is FI_WAIT_NONE.
 .IP \[bu] 2
 \f[I]FI_WAIT_NONE\f[] : Used to indicate that the user will not block
 (wait) for events on the counter.
@@ -181,9 +188,15 @@ error and were unable to update the counter.
 .SS fi_cntr_add
 .PP
 This adds the user\-specified value to the counter.
+.SS fi_cntr_adderr
+.PP
+This adds the user\-specified value to the error value of the counter.
 .SS fi_cntr_set
 .PP
 This sets the counter to the specified value.
+.SS fi_cntr_seterr
+.PP
+This sets the error value of the counter to the specified value.
 .SS fi_cntr_wait
 .PP
 This call may be used to wait until the counter reaches the specified

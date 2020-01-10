@@ -1,4 +1,4 @@
-.TH "fi_provider" "7" "2016\-02\-28" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.4.2"
+.TH "fi_provider" "7" "2017\-07\-24" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.5.3"
 .SH NAME
 .PP
 Fabric Interface Providers
@@ -15,6 +15,7 @@ referred to as fabric providers, or simply providers.
 .PP
 This distribution of libfabric contains the following providers
 (although more may be available via run\-time plug\-ins):
+.SS Core providers
 .PP
 \f[I]GNI\f[] : A provider for the Aries interconnect in Cray XC(TM)
 systems utilizing the user\-space \f[I]Generic Networking Interface\f[].
@@ -43,6 +44,38 @@ Analogous to the Sockets provider, the Verbs provider is intended to
 enable developers to write, test, and debug application code on
 platforms that only have Linux Verbs\-based networking.
 See \f[C]fi_verbs\f[](7) for more information.
+.PP
+\f[I]Blue Gene/Q\f[] : See \f[C]fi_bgq\f[](7) for more information.
+.SS Utility providers
+.PP
+\f[I]RxM\f[] : The RxM provider (ofi_rxm) is an utility provider that
+supports RDM endpoints emulated over MSG endpoints of a core provider.
+See \f[C]fi_rxm\f[](7) for more information.
+.SH CORE VERSUS UTILITY PROVIDERS
+.PP
+Core providers implement the libfabric interfaces directly over
+low\-level hardware and software interfaces.
+They are designed to support a specific class of hardware, and may be
+limited to supporting a single NIC.
+Core providers often only support libfabric features and interfaces that
+map efficiently to their underlying hardware.
+.PP
+Utility providers are distinct from core providers in that they are not
+associated with specific classes of devices.
+They instead work with core providers to expand their features, and
+interact with core providers through libfabric interfaces internally.
+Utility providers are often used to support a specific endpoint type
+over a simpler endpoint type.
+For example, the RXD provider implements reliability over unreliable
+datagram endpoints.
+The utility providers will not layer over the sockets provider unless it
+is explicitly requested.
+.PP
+Utility providers show up as a component in the core provider\[aq]s
+component list.
+See \f[C]fi_fabric\f[](3).
+Utility providers are enabled automatically for core providers that do
+not support the feature set requested by an application.
 .SH PROVIDER REQUIREMENTS
 .PP
 Libfabric provides a general framework for supporting multiple types of
@@ -173,6 +206,6 @@ flag.
 .SH SEE ALSO
 .PP
 \f[C]fi_gni\f[](7), \f[C]fi_psm\f[](7), \f[C]fi_sockets\f[](7),
-\f[C]fi_usnic\f[](7), \f[C]fi_verbs\f[](7),
+\f[C]fi_usnic\f[](7), \f[C]fi_verbs\f[](7), \f[C]fi_bgq\f[](7),
 .SH AUTHORS
 OpenFabrics.

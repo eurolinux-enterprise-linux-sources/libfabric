@@ -42,6 +42,7 @@
 #include <string.h>
 #include <sys/param.h>
 #include <netinet/in.h>
+#include <ifaddrs.h>
 
 #include <fi_abi.h>
 #include <fi_file.h>
@@ -60,6 +61,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define OFI_CORE_PROV_ONLY	(1ULL << 59)
 
 /*
  * OS X doesn't have __BYTE_ORDER, Linux usually has BYTE_ORDER but not under
@@ -112,6 +115,7 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 /* Restrict to size of struct fi_context */
 struct fi_prov_context {
 	int disable_logging;
+	int is_util_prov;
 };
 
 struct fi_filter {
@@ -122,17 +126,17 @@ struct fi_filter {
 extern struct fi_filter prov_log_filter;
 extern struct fi_provider core_prov;
 
-void fi_create_filter(struct fi_filter *filter, const char *env_name);
-void fi_free_filter(struct fi_filter *filter);
-int fi_apply_filter(struct fi_filter *filter, const char *name);
+void ofi_create_filter(struct fi_filter *filter, const char *env_name);
+void ofi_free_filter(struct fi_filter *filter);
+int ofi_apply_filter(struct fi_filter *filter, const char *name);
 
-void fi_util_init(void);
-void fi_util_fini(void);
 void fi_log_init(void);
 void fi_log_fini(void);
 void fi_param_init(void);
 void fi_param_fini(void);
 void fi_param_undefine(const struct fi_provider *provider);
+
+const char *ofi_hex_str(const uint8_t *data, size_t len);
 
 static inline uint64_t roundup_power_of_two(uint64_t n)
 {
@@ -158,15 +162,16 @@ static inline size_t fi_get_aligned_sz(size_t size, size_t alignment)
 #define FI_TAG_GENERIC	0xAAAAAAAAAAAAAAAAULL
 
 
-size_t fi_datatype_size(enum fi_datatype datatype);
 uint64_t fi_tag_bits(uint64_t mem_tag_format);
 uint64_t fi_tag_format(uint64_t tag_bits);
+int fi_size_bits(uint64_t num);
 
 int ofi_send_allowed(uint64_t caps);
 int ofi_recv_allowed(uint64_t caps);
 int ofi_rma_initiate_allowed(uint64_t caps);
 int ofi_rma_target_allowed(uint64_t caps);
-int ofi_ep_bind_valid(struct fi_provider *prov, struct fid *bfid, uint64_t flags);
+int ofi_ep_bind_valid(const struct fi_provider *prov, struct fid *bfid,
+		      uint64_t flags);
 
 uint64_t fi_gettime_ms(void);
 uint64_t fi_gettime_us(void);
@@ -179,17 +184,36 @@ uint64_t fi_gettime_us(void);
 #define AF_IB 27
 #endif
 
-static inline int ofi_equals_ipaddr(struct sockaddr_in *addr1,
-                             struct sockaddr_in *addr2)
+#define ofi_sin_addr(addr) (((struct sockaddr_in *)(addr))->sin_addr)
+#define ofi_sin_port(addr) (((struct sockaddr_in *)(addr))->sin_port)
+
+#define ofi_sin6_addr(addr) (((struct sockaddr_in6 *)(addr))->sin6_addr)
+#define ofi_sin6_port(addr) (((struct sockaddr_in6 *)(addr))->sin6_port)
+
+#define OFI_ADDRSTRLEN (INET6_ADDRSTRLEN + 50)
+
+#define OFI_ENUM_VAL(X) X
+#define OFI_STR(X) #X
+#define OFI_STR_INT(X) OFI_STR(X)
+
+static inline size_t ofi_sizeofaddr(const struct sockaddr *address)
+{
+	return (address->sa_family == AF_INET ?
+		sizeof(struct sockaddr_in) :
+		sizeof(struct sockaddr_in6));
+}
+
+static inline int ofi_equals_ipaddr(const struct sockaddr_in *addr1,
+				    const struct sockaddr_in *addr2)
 {
         return (addr1->sin_addr.s_addr == addr2->sin_addr.s_addr);
 }
 
-static inline int ofi_equals_sockaddr(struct sockaddr_in *addr1,
-                             struct sockaddr_in *addr2)
+static inline int ofi_equals_sockaddr(const struct sockaddr_in *addr1,
+				      const struct sockaddr_in *addr2)
 {
         return (ofi_equals_ipaddr(addr1, addr2) &&
-                (addr1->sin_port == addr2->sin_port));
+        	(addr1->sin_port == addr2->sin_port));
 }
 
 static inline int ofi_translate_addr_format(int family)
@@ -205,6 +229,51 @@ static inline int ofi_translate_addr_format(int family)
 		return FI_FORMAT_UNSPEC;
 	}
 }
+
+const char *ofi_straddr(char *buf, size_t *len,
+			uint32_t addr_format, const void *addr);
+
+/* Returns allocated address to caller.  Caller must free.  */
+int ofi_str_toaddr(const char *str, uint32_t *addr_format,
+		   void **addr, size_t *len);
+
+int ofi_addr_cmp(const struct fi_provider *prov, const struct sockaddr *sa1,
+		const struct sockaddr *sa2);
+/*
+ * Key Index
+ */
+
+/*
+ * The key_idx object and related functions can be used to generate unique keys
+ * from an index. The key and index would refer to an object defined by the user.
+ * A local endpoint can exchange this key with a remote endpoint in the first message.
+ * The remote endpoint would then use this key in subsequent messages to reference
+ * the correct object at the local endpoint.
+ */
+struct ofi_key_idx {
+	uint64_t seq_no;
+	/* The uniqueness of the generated key would depend on how many bits are
+	 * used for the index */
+	uint8_t idx_bits;
+};
+
+static inline void ofi_key_idx_init(struct ofi_key_idx *key_idx, uint8_t idx_bits)
+{
+	key_idx->seq_no = 0;
+	key_idx->idx_bits = idx_bits;
+}
+
+static inline uint64_t ofi_idx2key(struct ofi_key_idx *key_idx, uint64_t idx)
+{
+	return ((++(key_idx->seq_no)) << key_idx->idx_bits) | idx;
+}
+
+static inline uint64_t ofi_key2idx(struct ofi_key_idx *key_idx, uint64_t key)
+{
+	return key & ((1ULL << key_idx->idx_bits) - 1);
+}
+
+int ofi_getifaddrs(struct ifaddrs **ifap);
 
 #ifdef __cplusplus
 }

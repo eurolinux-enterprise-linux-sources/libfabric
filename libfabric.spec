@@ -1,15 +1,17 @@
 Name: libfabric
-Version: 1.4.2
+Version: 1.5.3
 Release: 1%{?dist}
 Summary: User-space RDMA Fabric Interfaces
 Group: System Environment/Libraries
 License: GPLv2 or BSD
 Url: http://www.github.com/ofiwg/libfabric
-Source: https://github.com/ofiwg/%{name}/releases/download/v%{version}/%{name}-%{version}.tar.bz2
+Source: %{name}-%{version}.tar.gz
+Patch2: 0001-prov-verbs-Add-support-of-different-CQ-formats-for-t.patch
 
 BuildRequires: librdmacm-devel
 BuildRequires: libibverbs-devel >= 1.2.0
 BuildRequires: libnl3-devel
+
 # infinipath-psm-devel only available for x86_64
 %ifarch x86_64
 BuildRequires: infinipath-psm-devel
@@ -40,8 +42,10 @@ Development files for the libfabric library.
 
 %prep
 %setup -q
+%patch2 -p1
 
 %build
+
 # defaults: with-dlopen can be over-rode:
 %configure %{?_without_dlopen} %{configopts} \
 %ifnarch s390
@@ -75,6 +79,22 @@ rm -f %{buildroot}%{_libdir}/*.la
 %{_mandir}/man7/*
 
 %changelog
+* Wed Jan 10 2018 Honggang Li <honli@redhat.com> - 1.5.3-1
+- Rebase to latest release 1.5.3
+- Resolves: bz1533293
+
+* Thu Jan  4 2018 Honggang Li <honli@redhat.com> - 1.5.1-3
+- Add support of different CQ formats for the verbs/RDM
+- Resolves: bz1530715
+
+* Fri Oct 20 2017 Honggang Li <honli@redhat.com> - 1.5.1-2
+- Fix PPC32 compiling issue
+- Resolves: bz1504395
+
+* Tue Oct 17 2017 Honggang Li <honli@redhat.com> - 1.5.1-1
+- Rebase to v1.5.1
+- Resolves: bz1452791
+
 * Tue May 16 2017 Honggang Li <honli@redhat.com> - 1.4.2-1
 - Update to upstream v1.4.2 release
 - Related: bz1451100

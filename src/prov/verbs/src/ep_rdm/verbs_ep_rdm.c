@@ -169,9 +169,6 @@ static int fi_ibv_rdm_ep_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 		}
 
 		ep->av = av;
-
-		/* TODO: this is wrong, AV to EP is 1:n */
-		ep->av->ep = ep;
 		break;
 	case FI_CLASS_CNTR:
 		cntr = container_of(bfid, struct fi_ibv_rdm_cntr, fid.fid);
@@ -185,19 +182,19 @@ static int fi_ibv_rdm_ep_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 
 		if (flags & FI_SEND) {
 			ep->send_cntr = cntr;
-			atomic_inc(&ep->send_cntr->ep_ref);
+			ofi_atomic_inc32(&ep->send_cntr->ep_ref);
 		}
 		if (flags & FI_RECV) {
 			ep->recv_cntr = cntr;
-			atomic_inc(&ep->recv_cntr->ep_ref);
+			ofi_atomic_inc32(&ep->recv_cntr->ep_ref);
 		}
 		if (flags & FI_READ) {
 			ep->read_cntr = cntr;
-			atomic_inc(&ep->read_cntr->ep_ref);
+			ofi_atomic_inc32(&ep->read_cntr->ep_ref);
 		}
 		if (flags & FI_WRITE) {
 			ep->write_cntr = cntr;
-			atomic_inc(&ep->write_cntr->ep_ref);
+			ofi_atomic_inc32(&ep->write_cntr->ep_ref);
 		}
 
 		break;
@@ -208,12 +205,12 @@ static int fi_ibv_rdm_ep_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 	return 0;
 }
 
-static ssize_t fi_ibv_rdm_tagged_ep_cancel(fid_t fid, void *ctx)
+static ssize_t fi_ibv_rdm_cancel(fid_t fid, void *ctx)
 {
 	struct fi_context *context = (struct fi_context *)ctx;
 	struct fi_ibv_rdm_ep *ep_rdm = 
 		container_of(fid, struct fi_ibv_rdm_ep, ep_fid);
-	int err = 1;
+	int err = -FI_ENOENT;
 
 	if (!ep_rdm->domain)
 		return -EBADF;
@@ -261,41 +258,43 @@ static ssize_t fi_ibv_rdm_tagged_ep_cancel(fid_t fid, void *ctx)
 	return err;
 }
 
-static int fi_ibv_rdm_tagged_ep_getopt(fid_t fid, int level, int optname,
-				       void *optval, size_t * optlen)
+static int fi_ibv_rdm_getopt(fid_t fid, int level, int optname, void *optval,
+			     size_t * optlen)
 {
-	switch (level) {
-	case FI_OPT_ENDPOINT:
-		return -FI_ENOPROTOOPT;
-	default:
+	struct fi_ibv_rdm_ep *ep_rdm = 
+		container_of(fid, struct fi_ibv_rdm_ep, ep_fid);
+
+	if (level != FI_OPT_ENDPOINT) {
 		return -FI_ENOPROTOOPT;
 	}
-	return 0;
-}
 
-static int fi_ibv_rdm_tagged_setopt(fid_t fid, int level, int optname,
-				    const void *optval, size_t optlen)
-{
-	switch (level) {
-	case FI_OPT_ENDPOINT:
-		return -FI_ENOPROTOOPT;
-	default:
+	if (optname != FI_OPT_MIN_MULTI_RECV) {
 		return -FI_ENOPROTOOPT;
 	}
+
+	*(size_t *)optval = ep_rdm->min_multi_recv_size;
+	*optlen = sizeof(size_t);
+
 	return 0;
 }
 
-#if 0
-static int fi_ibv_ep_enable(struct fid_ep *ep)
+static int fi_ibv_rdm_setopt(fid_t fid, int level, int optname,
+			     const void *optval, size_t optlen)
 {
-	struct fi_ibv_rdm_ep *_ep;
+	struct fi_ibv_rdm_ep *ep_rdm =
+		container_of(fid, struct fi_ibv_rdm_ep, ep_fid);
 
-	_ep = container_of(ep, struct fi_ibv_rdm_ep, ep_fid);
+	if (level != FI_OPT_ENDPOINT) {
+		return -FI_ENOPROTOOPT;
+	}
 
-	assert(_ep->type == FI_EP_RDM);
+	if (optname != FI_OPT_MIN_MULTI_RECV) {
+		return -FI_ENOPROTOOPT;
+	}
+
+	ep_rdm->min_multi_recv_size = *(size_t *)optval;
 	return 0;
 }
-#endif /* 0 */
 
 static int fi_ibv_rdm_tagged_control(fid_t fid, int command, void *arg)
 {
@@ -309,127 +308,153 @@ static int fi_ibv_rdm_tagged_control(fid_t fid, int command, void *arg)
 	return 0;
 }
 
-struct fi_ops_ep fi_ibv_rdm_tagged_ep_base_ops = {
+struct fi_ops_ep fi_ibv_rdm_ep_base_ops = {
 	.size = sizeof(struct fi_ops_ep),
-	.cancel = fi_ibv_rdm_tagged_ep_cancel,
-	.getopt = fi_ibv_rdm_tagged_ep_getopt,
-	.setopt = fi_ibv_rdm_tagged_setopt,
+	.cancel = fi_ibv_rdm_cancel,
+	.getopt = fi_ibv_rdm_getopt,
+	.setopt = fi_ibv_rdm_setopt,
 	.tx_ctx = fi_no_tx_ctx,
 	.rx_ctx = fi_no_rx_ctx,
 	.rx_size_left = fi_no_rx_size_left,
 	.tx_size_left = fi_no_tx_size_left,
 };
 
-static int _fi_ibv_rdm_tagged_cm_progress_running = 1;
-
-static void *fi_ibv_rdm_tagged_cm_progress_thread(void *ctx)
+static int fi_ibv_rdm_ep_match(struct slist_entry *item,
+			       const void *ep)
 {
-	struct fi_ibv_rdm_ep *ep = (struct fi_ibv_rdm_ep *)ctx;
-	while (_fi_ibv_rdm_tagged_cm_progress_running) {
-		if (fi_ibv_rdm_cm_progress(ep)) {
-			VERBS_INFO (FI_LOG_EP_DATA,
-			"fi_ibv_rdm_cm_progress error\n");
-			abort();
-		}
-		usleep(ep->cm_progress_timeout);
-	}
-	return NULL;
+	const struct fi_ibv_rdm_ep *ep_obj = (struct fi_ibv_rdm_ep *)ep;
+	return (item == &ep_obj->list_entry);
 }
 
 static int fi_ibv_rdm_ep_close(fid_t fid)
 {
 	int ret = FI_SUCCESS;
 	int err = FI_SUCCESS;
-	void *status = NULL;
 	struct fi_ibv_rdm_ep *ep =
 		container_of(fid, struct fi_ibv_rdm_ep, ep_fid.fid);
 
-	if (ep->fi_scq) {
+	if (ep->fi_scq)
 		ep->fi_scq->ep = NULL;
-	}
-	if (ep->fi_rcq) {
+	if (ep->fi_rcq)
 		ep->fi_rcq->ep = NULL;
-	}
 
 	ep->is_closing = 1;
-	_fi_ibv_rdm_tagged_cm_progress_running = 0;
-	pthread_join(ep->cm_progress_thread, &status);
-	pthread_mutex_destroy(&ep->cm_lock);
 
 	/* All posted sends are waiting local completions */
-	while (ep->posted_sends > 0 && ep->num_active_conns > 0) {
+	while (ep->posted_sends > 0 && ep->num_active_conns > 0)
 		fi_ibv_rdm_tagged_poll(ep);
-	}
 
 	if (ep->send_cntr) {
-		atomic_dec(&ep->send_cntr->ep_ref);
+		ofi_atomic_dec32(&ep->send_cntr->ep_ref);
 		ep->send_cntr = 0;
 	}
 
 	if (ep->recv_cntr) {
-		atomic_dec(&ep->recv_cntr->ep_ref);
+		ofi_atomic_dec32(&ep->recv_cntr->ep_ref);
 		ep->recv_cntr = 0;
 	}
 
 	if (ep->read_cntr) {
-		atomic_dec(&ep->read_cntr->ep_ref);
+		ofi_atomic_dec32(&ep->read_cntr->ep_ref);
 		ep->read_cntr = 0;
 	}
 
 	if (ep->write_cntr) {
-		atomic_dec(&ep->write_cntr->ep_ref);
+		ofi_atomic_dec32(&ep->write_cntr->ep_ref);
 		ep->write_cntr = 0;
 	}
 
-	struct fi_ibv_rdm_conn *conn = NULL, *tmp = NULL;
+	slist_remove_first_match(&ep->domain->ep_list,
+				 fi_ibv_rdm_ep_match, ep);
 
-	HASH_ITER(hh, ep->domain->rdm_cm->conn_hash, conn, tmp) {
-		HASH_DEL(ep->domain->rdm_cm->conn_hash, conn);
-		switch (conn->state) {
-		case FI_VERBS_CONN_ALLOCATED:
-		case FI_VERBS_CONN_REMOTE_DISCONNECT:
-		case FI_VERBS_CONN_ESTABLISHED:
-			ret = fi_ibv_rdm_start_disconnection(conn);
-			break;
-		case FI_VERBS_CONN_STARTED:
-			while (conn->state != FI_VERBS_CONN_ESTABLISHED &&
-			       conn->state != FI_VERBS_CONN_REJECTED) {
-				ret = fi_ibv_rdm_cm_progress(ep);
-				if (ret) {
-					VERBS_INFO(FI_LOG_AV, 
-						   "cm progress failed\n");
-					break;
+	struct fi_ibv_rdm_av_entry *av_entry = NULL, *tmp = NULL;
+
+	HASH_ITER(hh, ep->domain->rdm_cm->av_hash, av_entry, tmp) {
+		struct fi_ibv_rdm_conn *conn = NULL;
+
+		HASH_FIND(hh, av_entry->conn_hash, &ep,
+			  sizeof(struct fi_ibv_rdm_ep *), conn);
+		if (conn) {
+			switch (conn->state) {
+			case FI_VERBS_CONN_ALLOCATED:
+			case FI_VERBS_CONN_REMOTE_DISCONNECT:
+			case FI_VERBS_CONN_ESTABLISHED:
+				ret = fi_ibv_rdm_start_disconnection(conn);
+				break;
+			case FI_VERBS_CONN_STARTED:
+				while (conn->state != FI_VERBS_CONN_ESTABLISHED &&
+				       conn->state != FI_VERBS_CONN_REJECTED) {
+					ret = fi_ibv_rdm_cm_progress(ep);
+					if (ret) {
+						VERBS_INFO(FI_LOG_AV, 
+							   "cm progress failed\n");
+						break;
+					}
+				}
+				break;
+			default:
+				break;
+		}
+		}
+	}
+
+        /* ok, all connections are initiated to disconnect. now wait
+	 * till all connections are switch to state 'closed' */
+	HASH_ITER(hh, ep->domain->rdm_cm->av_hash, av_entry, tmp) {
+		struct fi_ibv_rdm_conn *conn = NULL;
+
+		HASH_FIND(hh, av_entry->conn_hash, &ep,
+			  sizeof(struct fi_ibv_rdm_ep *), conn);
+		if (conn) {
+			while(conn->state != FI_VERBS_CONN_CLOSED &&
+			      conn->state != FI_VERBS_CONN_ALLOCATED) {
+				fi_ibv_rdm_tagged_poll_recv(ep);
+				err = fi_ibv_rdm_cm_progress(ep);
+				if (err) {
+					VERBS_INFO(FI_LOG_AV, "cm progress failed\n");
+					ret = (ret == FI_SUCCESS) ? err : ret;
 				}
 			}
-			break;
-		default:
-			break;
-		}
-	}
-	while (ep->num_active_conns) {
-		err = fi_ibv_rdm_cm_progress(ep);
-		if (err) {
-			VERBS_INFO(FI_LOG_AV, "cm progress failed\n");
-			ret = (ret == FI_SUCCESS) ? err : ret;
 		}
 	}
 
-	assert(HASH_COUNT(ep->domain->rdm_cm->conn_hash) == 0 &&
-	       ep->domain->rdm_cm->conn_hash == NULL);
-	free(ep->domain->rdm_cm->conn_table);
+        /* now destroy all connections */
+	HASH_ITER(hh, ep->domain->rdm_cm->av_hash, av_entry, tmp) {
+		struct fi_ibv_rdm_conn *conn = NULL;
+
+		HASH_FIND(hh, av_entry->conn_hash, &ep,
+			  sizeof(struct fi_ibv_rdm_ep *), conn);
+		if (conn) {
+			HASH_DEL(av_entry->conn_hash, conn);
+			fi_ibv_rdm_conn_cleanup(conn);
+		}
+	}
+
+	/* TODO: MUST be removed in DOMAIN_CLOSE */
+	/*assert(HASH_COUNT(av_entry->conn_hash) == 0 &&
+	       av_entry->conn_hash == NULL);*/
+	free(ep->domain->rdm_cm->av_table);
 
 	VERBS_INFO(FI_LOG_AV, "DISCONNECT complete\n");
 	assert(ep->scq && ep->rcq);
-	if (ibv_destroy_cq(ep->scq) || ibv_destroy_cq(ep->rcq)) {
-		VERBS_INFO_ERRNO(FI_LOG_AV, "ibv_destroy_cq failed\n", errno);
+	if (ibv_destroy_cq(ep->scq)) {
+		VERBS_INFO_ERRNO(FI_LOG_AV, "ep->scq: ibv_destroy_cq failed",
+				 errno);
 		ret = (ret == FI_SUCCESS) ? -errno : ret;
 	}
 
-	rdma_freeaddrinfo(ep->rai);
+	if (ibv_destroy_cq(ep->rcq)) {
+		VERBS_INFO_ERRNO(FI_LOG_AV, "ep->rcq: ibv_destroy_cq failed",
+				 errno);
+		ret = (ret == FI_SUCCESS) ? -errno : ret;
+	}
+
 	errno = 0;
+	rdma_freeaddrinfo(ep->rai);
 	if (errno) {
-		VERBS_INFO_ERRNO(FI_LOG_AV, "rdma_freeaddrinfo failed\n", errno);
-		ret = (ret == FI_SUCCESS) ? -ret : ret;
+		VERBS_INFO_ERRNO(FI_LOG_AV, "rdma_freeaddrinfo failed",
+				 errno);
+		ret = (ret == FI_SUCCESS) ? -errno : ret;
 	}
 
 	/* TODO: move queues & related pools cleanup to close CQ*/
@@ -439,42 +464,12 @@ static int fi_ibv_rdm_ep_close(fid_t fid)
 	util_buf_pool_destroy(fi_ibv_rdm_extra_buffers_pool);
 	util_buf_pool_destroy(fi_ibv_rdm_postponed_pool);
 
+	fi_freeinfo(ep->info);
+
 	free(ep);
 
 	return ret;
 }
-
-#if 0
-static int fi_ibv_ep_sync(fid_t fid, uint64_t flags, void *context)
-{
-	struct fi_ibv_rdm_ep *ep;
-
-	ep = container_of(fid, struct fi_ibv_rdm_ep, ep_fid);
-
-	if (ep->type == FI_EP_MSG) {
-		return 0;
-	} else if (ep->type == FI_EP_RDM) {
-		if (!flags || (flags & FI_SEND)) {
-			while (ep->pend_send) {
-				fi_ibv_rdm_tagged_poll(ep);
-			}
-		}
-
-		if (!flags || (flags & FI_RECV)) {
-			while (ep->pend_recv) {
-				fi_ibv_rdm_tagged_poll(ep);
-			}
-		}
-
-		if (!flags || (flags & FI_READ)) {
-		}
-
-		if (!flags || (flags & FI_WRITE) || (flags & FI_WRITE)) {
-		}
-	}
-	return 0;
-}
-#endif /* 0 */
 
 struct fi_ops fi_ibv_rdm_ep_ops = {
 	.size = sizeof(struct fi_ops),
@@ -489,8 +484,7 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 {
 	struct fi_ibv_domain *_domain = 
 		container_of(domain, struct fi_ibv_domain, domain_fid);
-	int ret = 0;
-	int param = 0;
+	int ret = 0, param = 0;
 	char *str_param = NULL;
 
 	if (!info || !info->ep_attr || !info->domain_attr ||
@@ -502,15 +496,19 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 
 	struct fi_ibv_rdm_ep *_ep;
 	_ep = calloc(1, sizeof *_ep);
-	if (!_ep) {
+	if (!_ep)
 		return -FI_ENOMEM;
-	}
 
+	_ep->info = fi_dupinfo(info);
+	if (!_ep->info) {
+		ret = -FI_ENOMEM;
+		goto err1;
+	}
 	_ep->domain = _domain;
 	_ep->ep_fid.fid.fclass = FI_CLASS_EP;
 	_ep->ep_fid.fid.context = context;
 	_ep->ep_fid.fid.ops = &fi_ibv_rdm_ep_ops;
-	_ep->ep_fid.ops = &fi_ibv_rdm_tagged_ep_base_ops;
+	_ep->ep_fid.ops = &fi_ibv_rdm_ep_base_ops;
 	_ep->ep_fid.cm = &fi_ibv_rdm_tagged_ep_cm_ops;
 	_ep->ep_fid.msg = fi_ibv_rdm_ep_ops_msg();
 	_ep->ep_fid.rma = fi_ibv_rdm_ep_ops_rma();
@@ -522,44 +520,63 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 		FI_IBV_RDM_TAGGED_DFLT_BUFFER_NUM : param;
 
 	if (_ep->n_buffs & (_ep->n_buffs - 1)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"invalid value of rdm_buffer_num\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "invalid value of rdm_buffer_num\n");
 		ret = -FI_EINVAL;
-		goto err;
+		goto err2;
 	}
 
-	FI_INFO(&fi_ibv_prov, FI_LOG_EP_CTRL, "inject_size: %d\n",
-		info->tx_attr->inject_size);
+	VERBS_INFO(FI_LOG_EP_CTRL, "inject_size: %d\n",
+		   info->tx_attr->inject_size);
 
 	_ep->rndv_threshold = info->tx_attr->inject_size;
-	FI_INFO(&fi_ibv_prov, FI_LOG_EP_CTRL, "rndv_threshold: %d\n",
-		_ep->rndv_threshold);
+	VERBS_INFO(FI_LOG_EP_CTRL, "rndv_threshold: %d\n",
+		   _ep->rndv_threshold);
 
 	_ep->buff_len = rdm_buffer_size(info->tx_attr->inject_size);
-	FI_INFO(&fi_ibv_prov, FI_LOG_EP_CTRL, "buff_len: %d\n", _ep->buff_len);
+	VERBS_INFO(FI_LOG_EP_CTRL, "buff_len: %d\n", _ep->buff_len);
+
+	_ep->tx_op_flags = info->tx_attr->op_flags;
+	_ep->rx_op_flags = info->rx_attr->op_flags;
+	_ep->min_multi_recv_size = (_ep->rx_op_flags & FI_MULTI_RECV) ?
+				   info->tx_attr->inject_size : 0;
 
 	_ep->rndv_seg_size = FI_IBV_RDM_SEG_MAXSIZE;
 	if (!fi_param_get_int(&fi_ibv_prov, "rdm_rndv_seg_size", &param)) {
 		if (param > 0) {
 			_ep->rndv_seg_size = param;
 		} else {
-			FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-				"invalid value of rdm_rndv_seg_size\n");
+			VERBS_INFO(FI_LOG_CORE,
+				   "invalid value of rdm_rndv_seg_size\n");
 			ret = -FI_EINVAL;
-			goto err;
+			goto err2;
 		}
 	}
 
-	_ep->cm_progress_timeout = FI_IBV_RDM_CM_THREAD_TIMEOUT;
-	if (!fi_param_get_int(&fi_ibv_prov, "rdm_thread_timeout", &param)) {
-		if (param < 0) {
-			FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-				"invalid value of rdm_thread_timeout\n");
-			ret = -FI_EINVAL;
-			goto err;
+#ifdef HAVE_VERBS_EXP_H
+	struct ibv_exp_device_attr exp_attr;
+	exp_attr.comp_mask = IBV_EXP_DEVICE_ATTR_ODP | IBV_EXP_DEVICE_ATTR_EXP_CAP_FLAGS;
+	ret = ibv_exp_query_device(_ep->domain->verbs, &exp_attr);
+	if (!ret && exp_attr.exp_device_cap_flags & IBV_EXP_DEVICE_ODP) {
+		_ep->use_odp = 1;
+	} else {
+		_ep->use_odp = 0;
+	}
+#else /* HAVE_VERBS_EXP_H */
+	_ep->use_odp = 0;
+#endif /* HAVE_VERBS_EXP_H */
+	if (!fi_param_get_bool(&fi_ibv_prov, "rdm_use_odp", &param)) {
+		if (!_ep->use_odp && param) {
+			VERBS_WARN(FI_LOG_CORE, "ODP is not supported on this "
+				   "configuration, ignore \n");
 		} else {
-			_ep->cm_progress_timeout = param;
+			_ep->use_odp = param;
 		}
+	} else {
+		/* Disable by default. Because this feature may corrupt
+		 * data due to IBV_EXP_ACCESS_RELAXED flag. But usage
+		 * this feature w/o this flag leads to poor bandwidth */
+		_ep->use_odp = 0;
 	}
 
 	_ep->rq_wr_depth = info->rx_attr->size;
@@ -573,10 +590,10 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 				    strlen("IBV_WR_SEND"))) {
 			_ep->eopcode = IBV_WR_SEND;
 		} else {
-			FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-				"invalid value of rdm_eager_send_opcode\n");
+			VERBS_INFO(FI_LOG_CORE,
+				   "invalid value of rdm_eager_send_opcode\n");
 			ret = -FI_EINVAL;
-			goto err;
+			goto err2;
 		}
 	} else {
 		_ep->eopcode = IBV_WR_SEND;
@@ -586,33 +603,33 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 	case FI_PROTO_IB_RDM:
 		if (_ep->eopcode != IBV_WR_RDMA_WRITE_WITH_IMM &&
 		    _ep->eopcode != IBV_WR_SEND) {
-			FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Unsupported eager operation code\n");
+			VERBS_INFO(FI_LOG_CORE,
+				   "Unsupported eager operation code\n");
 			ret = -FI_ENODATA;
-			goto err;
+			goto err2;
 		}
 		break;
 	case FI_PROTO_IWARP_RDM:
 		if (_ep->eopcode != IBV_WR_SEND) {
-			FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Unsupported eager operation code\n");
+			VERBS_INFO(FI_LOG_CORE,
+				   "Unsupported eager operation code\n");
 			ret = -FI_ENODATA;
-			goto err;
+			goto err1;
 		}
 		break;
 	default:
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE, "Unsupported protocol\n");
+		VERBS_INFO(FI_LOG_CORE, "Unsupported protocol\n");
 		ret = -FI_ENODATA;
-		goto err;
+		goto err2;
 	}
 
 	ret = fi_ibv_get_rdma_rai(NULL, NULL, 0, info, &_ep->rai);
 	if (ret) {
-		goto err;
+		goto err2;
 	}
 	ret = fi_ibv_rdm_cm_bind_ep(_ep->domain->rdm_cm, _ep);
 	if (ret) {
-		goto err;
+		goto err2;
 	}
 
 	_ep->posted_sends = 0;
@@ -643,7 +660,7 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 	if (_ep->scq == NULL) {
 		VERBS_INFO_ERRNO(FI_LOG_EP_CTRL, "ibv_create_cq", errno);
 		ret = -FI_EOTHER;
-		goto err;
+		goto err2;
 	}
 
 	_ep->rcq =
@@ -651,7 +668,7 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 	if (_ep->rcq == NULL) {
 		VERBS_INFO_ERRNO(FI_LOG_EP_CTRL, "ibv_create_cq", errno);
 		ret = -FI_EOTHER;
-		goto err;
+		goto err2;
 	}
 
 	*ep = &_ep->ep_fid;
@@ -659,20 +676,12 @@ int fi_ibv_rdm_open_ep(struct fid_domain *domain, struct fi_info *info,
 	_ep->is_closing = 0;
 	fi_ibv_rdm_req_hndls_init();
 
-	pthread_mutex_init(&_ep->cm_lock, NULL);
-	_fi_ibv_rdm_tagged_cm_progress_running = 1;
-	ret = pthread_create(&_ep->cm_progress_thread, NULL,
-			     &fi_ibv_rdm_tagged_cm_progress_thread,
-			     (void *)_ep);
-	if (ret) {
-		VERBS_INFO(FI_LOG_EP_CTRL,
-			"Failed to launch CM progress thread, err :%d\n", ret);
-		ret = -FI_EOTHER;
-		goto err;
-	}
+	slist_insert_tail(&_ep->list_entry, &_domain->ep_list);
 
 	return ret;
-err:
+err2:
+	fi_freeinfo(_ep->info);
+err1:
 	free(_ep);
 	return ret;
 }

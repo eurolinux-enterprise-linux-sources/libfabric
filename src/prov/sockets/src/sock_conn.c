@@ -62,9 +62,8 @@ ssize_t sock_conn_send_src_addr(struct sock_ep_attr *ep_attr, struct sock_tx_ctx
 {
 	int ret;
 	uint64_t total_len;
-	struct sock_op tx_op;
+	struct sock_op tx_op = { 0 };
 
-	memset(&tx_op, 0, sizeof(struct sock_op));
 	tx_op.op = SOCK_OP_CONN_MSG;
 	SOCK_LOG_DBG("New conn msg on TX: %p using conn: %p\n", tx_ctx, conn);
 
@@ -73,7 +72,7 @@ ssize_t sock_conn_send_src_addr(struct sock_ep_attr *ep_attr, struct sock_tx_ctx
 	total_len = tx_op.src_iov_len + sizeof(struct sock_op_send);
 
 	sock_tx_ctx_start(tx_ctx);
-	if (rbavail(&tx_ctx->rb) < total_len) {
+	if (ofi_rbavail(&tx_ctx->rb) < total_len) {
 		ret = -FI_EAGAIN;
 		goto err;
 	}
@@ -182,6 +181,7 @@ static struct sock_conn *sock_conn_map_insert(struct sock_ep_attr *ep_attr,
 		map->used++;
 	}
 
+	map->table[index].av_index = FI_ADDR_NOTAVAIL;
 	map->table[index].connected = 1;
 	map->table[index].addr = *addr;
 	map->table[index].sock_fd = conn_fd;
@@ -189,8 +189,8 @@ static struct sock_conn *sock_conn_map_insert(struct sock_ep_attr *ep_attr,
 	sock_set_sockopts(conn_fd);
 
 
-	if (idm_set(&ep_attr->conn_idm, conn_fd, &map->table[index]) < 0)
-		SOCK_LOG_ERROR("idm_set failed\n");
+	if (ofi_idm_set(&ep_attr->conn_idm, conn_fd, &map->table[index]) < 0)
+		SOCK_LOG_ERROR("ofi_idm_set failed\n");
 
 	if (sock_epoll_add(&map->epoll_set, conn_fd))
 		SOCK_LOG_ERROR("failed to add to epoll set: %d\n", conn_fd);
@@ -299,15 +299,15 @@ err:
 int sock_conn_listen(struct sock_ep_attr *ep_attr)
 {
 	struct addrinfo *s_res = NULL, *p;
-	struct addrinfo hints;
+	struct addrinfo hints = { 0 };
 	int listen_fd = 0, ret;
 	socklen_t addr_size;
 	struct sockaddr_in addr;
 	struct sock_conn_listener *listener = &ep_attr->listener;
 	char service[NI_MAXSERV] = {0};
 	char *port;
+	char ipaddr[24];
 
-	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_flags = AI_PASSIVE;
@@ -327,7 +327,8 @@ int sock_conn_listen(struct sock_ep_attr *ep_attr)
 	} else
 		port = listener->service;
 
-	ret = getaddrinfo(inet_ntoa(addr.sin_addr), port, &hints, &s_res);
+	inet_ntop(addr.sin_family, &addr.sin_addr, ipaddr, sizeof(ipaddr));
+	ret = getaddrinfo(ipaddr, port, &hints, &s_res);
 	if (ret) {
 		SOCK_LOG_ERROR("no available AF_INET address, service %s, %s\n",
 			       listener->service, gai_strerror(ret));
@@ -336,7 +337,7 @@ int sock_conn_listen(struct sock_ep_attr *ep_attr)
 
 	SOCK_LOG_DBG("Binding listener thread to port: %s\n", listener->service);
 	for (p = s_res; p; p = p->ai_next) {
-		listen_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+		listen_fd = ofi_socket(p->ai_family, p->ai_socktype, p->ai_protocol);
 		if (listen_fd >= 0) {
 			sock_set_sockopts(listen_fd);
 
@@ -411,6 +412,9 @@ struct sock_conn *sock_ep_connect(struct sock_ep_attr *ep_attr, fi_addr_t index)
 	struct pollfd poll_fd;
 
 	if (ep_attr->ep_type == FI_EP_MSG) {
+		/* Need to check that destination address has been
+		   passed to endpoint */
+		assert(ep_attr->dest_addr);
 		addr = *ep_attr->dest_addr;
 		addr.sin_port = htons(ep_attr->msg_dest_port);
 	} else {
@@ -425,7 +429,7 @@ do_connect:
 	if (conn != SOCK_CM_CONN_IN_PROGRESS)
 		return conn;
 
-	conn_fd = socket(AF_INET, SOCK_STREAM, 0);
+	conn_fd = ofi_socket(AF_INET, SOCK_STREAM, 0);
 	if (conn_fd == -1) {
 		SOCK_LOG_ERROR("failed to create conn_fd, errno: %d\n", errno);
 		errno = FI_EOTHER;
@@ -437,7 +441,7 @@ do_connect:
 		SOCK_LOG_ERROR("failed to set conn_fd nonblocking, errno: %d\n", errno);
 		errno = FI_EOTHER;
 		ofi_close_socket(conn_fd);
-                return NULL;
+		return NULL;
 	}
 
 	SOCK_LOG_DBG("Connecting to: %s:%d\n", inet_ntoa(addr.sin_addr),
@@ -511,10 +515,10 @@ out:
 		goto err;
 	}
 	new_conn->av_index = (ep_attr->ep_type == FI_EP_MSG) ? FI_ADDR_NOTAVAIL : index;
-	conn = idm_lookup(&ep_attr->av_idm, index);
+	conn = ofi_idm_lookup(&ep_attr->av_idm, index);
 	if (conn == SOCK_CM_CONN_IN_PROGRESS) {
-		if (idm_set(&ep_attr->av_idm, index, new_conn) < 0)
-			SOCK_LOG_ERROR("idm_set failed\n");
+		if (ofi_idm_set(&ep_attr->av_idm, index, new_conn) < 0)
+			SOCK_LOG_ERROR("ofi_idm_set failed\n");
 		conn = new_conn;
 	}
 	fastlock_release(&ep_attr->cmap.lock);

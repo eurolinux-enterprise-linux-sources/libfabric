@@ -33,6 +33,28 @@
 #ifndef _FI_OSD_H_
 #define _FI_OSD_H_
 
+
+/* We use macros to create atomic and complex function definitions,
+ * and we can't have spaces in function names */
+typedef long double long_double;
+
+
+/* Complex data type support:
+ *
+ * Complex data types are operating system.  For portability, each osd.h file
+ * must define the following datatypes and operations:
+ *
+ * Datatype:
+ * ofi_complex_XXX
+ *
+ * Operations:
+ * ofi_complex_eq_XXX, ofi_complex_sum_XXX, ofi_complex_prod_XXX,
+ * ofi_complex_land_XXX, ofi_complex_lor_XXX, ofi_complex_lxor_XXX
+ *
+ * Where XXX = float, double, or long_double
+ */
+
+
 #ifdef __APPLE__
 #include <osx/osd.h>
 #include <unix/osd.h>
@@ -44,6 +66,14 @@
 #else
 #include <linux/osd.h>
 #include <unix/osd.h>
+#endif
+
+#ifdef __GNUC__
+#define OFI_LIKELY(x)	__builtin_expect((x), 1)
+#define OFI_UNLIKELY(x)	__builtin_expect((x), 0)
+#else
+#define OFI_LIKELY(x)	(x)
+#define OFI_UNLIKELY(x)	(x)
 #endif
 
 #endif /* _FI_OSD_H_ */

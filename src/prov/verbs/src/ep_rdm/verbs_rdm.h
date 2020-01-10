@@ -108,6 +108,16 @@ do {									\
 #define RMA_RESOURCES_IS_BUSY(_connection, _ep)				\
 	(OUTGOING_POST_LIMIT(_connection, _ep) || PEND_POST_LIMIT(_ep))
 
+#define GET_TX_COMP(ep_rdm)						\
+	(!ep_rdm->rx_selective_completion ||		\
+	(ep_rdm->rx_op_flags & FI_COMPLETION) ?		\
+	FI_COMPLETION : 0ULL)
+
+#define GET_TX_COMP_FLAG(ep_rdm, flag)			\
+	(!ep_rdm->rx_selective_completion ||		\
+	(ep_rdm->rx_op_flags & FI_COMPLETION) ?		\
+	FI_COMPLETION : (flags & FI_COMPLETION))
+
 struct fi_ibv_rdm_header {
 /*	uint64_t imm_data; TODO: not implemented */
 	uint64_t tag;
@@ -124,13 +134,23 @@ struct fi_ibv_rdm_rndv_header {
 	uint32_t is_tagged;
 };
 
+struct fi_ibv_rdm_multi_request {
+	/* working request, will be renewed for every data arriving */
+	struct fi_ibv_rdm_request *prepost;
+	uint8_t *buf;
+	uint64_t len;
+	uint64_t offset;
+	uint64_t min_size;
+};
+
 struct fi_ibv_rdm_request {
 
 	/* Accessors and match info */
 
 	/* Request can be an element of only one queue at the moment */
 	struct dlist_entry queue_entry;
-
+	/* multi recv handling */
+	struct fi_ibv_rdm_multi_request *parent;
 	struct {
 		enum fi_ibv_rdm_request_eager_state eager;
 		enum fi_ibv_rdm_request_rndv_state rndv;
@@ -181,7 +201,7 @@ struct fi_ibv_rdm_request {
 		
 		/* RMA info */
 		struct {
-			/* registered buffer on sender side */
+			struct ibv_mr* mr;
 			uint64_t remote_addr;
 			uint32_t rkey;
 			uint32_t lkey;
@@ -200,7 +220,7 @@ void fi_ibv_rdm_print_request(char *buf, struct fi_ibv_rdm_request *request);
 
 #define BUF_STATUS_FREE 	((uint16_t) 0)
 #define BUF_STATUS_BUSY 	((uint16_t) 1)
-#define BUF_STATUS_RECVED 	((uint16_t) 2)
+#define BUF_STATUS_RECEIVED 	((uint16_t) 2)
 
 struct fi_ibv_rdm_buf_service_data {
 	volatile uint16_t status;
@@ -214,24 +234,30 @@ struct fi_ibv_rdm_buf_service_data {
 struct fi_ibv_rdm_buf {
 	struct fi_ibv_rdm_buf_service_data service_data;
 	struct fi_ibv_rdm_header header;
-	uint8_t payload;
+	uint64_t payload;
 };
 
 struct fi_ibv_rdm_cm {
-	struct rdma_event_channel *ec;
-	struct rdma_cm_id *listener;
-	int is_bound;
+	struct rdma_event_channel*	ec;
+	struct rdma_cm_id*		listener;
+	int				is_bound;
 
-	/* conn_hash has a sockaddr_in -> conn associative */
-	struct fi_ibv_rdm_conn *conn_hash;
+	/* av_hash has a sockaddr_in -> [ep - conn] associative */
+	struct fi_ibv_rdm_av_entry*	av_hash;
 	/* Used only for FI_AV_TABLE */
-	struct fi_ibv_rdm_conn **conn_table;
+	struct fi_ibv_rdm_av_entry**	av_table;
+
+	struct slist			av_removed_entry_head;
+	pthread_mutex_t			cm_lock;
+	pthread_t			cm_progress_thread;
+	int				cm_progress_timeout;
+	int				fi_ibv_rdm_tagged_cm_progress_running;
 };
 
 struct fi_ibv_rdm_cntr {
 	struct fid_cntr		fid;
 	struct fi_ibv_domain	*domain;
-	atomic_t		ep_ref;
+	ofi_atomic32_t		ep_ref;
 	uint64_t		value;
 	struct fi_cntr_attr	attr;
 	uint64_t		err_count;
@@ -239,53 +265,57 @@ struct fi_ibv_rdm_cntr {
 
 struct fi_ibv_rdm_ep {
 	struct fid_ep ep_fid;
-	struct fi_ibv_domain *domain;
-	struct fi_ibv_rdm_cq *fi_scq;
-	struct fi_ibv_rdm_cq *fi_rcq;
+	struct fi_ibv_domain*	domain;
+	struct slist_entry	list_entry;
+	struct fi_ibv_rdm_cq*	fi_scq;
+	struct fi_ibv_rdm_cq*	fi_rcq;
 
-	struct fi_ibv_rdm_cntr *send_cntr;
-	struct fi_ibv_rdm_cntr *recv_cntr;
-	struct fi_ibv_rdm_cntr *read_cntr;
-	struct fi_ibv_rdm_cntr *write_cntr;
+	struct fi_ibv_rdm_cntr*	send_cntr;
+	struct fi_ibv_rdm_cntr*	recv_cntr;
+	struct fi_ibv_rdm_cntr*	read_cntr;
+	struct fi_ibv_rdm_cntr*	write_cntr;
 
-	size_t addrlen;
-	struct rdma_addrinfo *rai;
-	struct sockaddr_in my_addr;
+	struct fi_info*	info;
 
-	struct fi_ibv_av *av;
-	int tx_selective_completion;
-	int rx_selective_completion;
+	size_t			addrlen;
+	struct rdma_addrinfo*	rai;
+	struct sockaddr_in	my_addr;
+
+	struct fi_ibv_av*	av;
+	int		tx_selective_completion;
+	int 		rx_selective_completion;
+	size_t 		min_multi_recv_size;
+	uint64_t 	tx_op_flags;
+	uint64_t 	rx_op_flags;
 
 	/*
 	 * ibv_post_send opcode for eager messaging.
 	 * It must generate work completion in receive CQ
 	 */
-	enum ibv_wr_opcode eopcode;
-	int buff_len;
-	int n_buffs;
-	int rq_wr_depth;    // RQ depth
-	int sq_wr_depth;    // SQ depth
-	int posted_sends;
-	int posted_recvs;
-	int num_active_conns;
-	int max_inline_rc;
-	int rndv_threshold;
-	int rndv_seg_size;
-	struct ibv_cq *scq;
-	struct ibv_cq *rcq;
-	int scq_depth;
-	int rcq_depth;
-	int cqread_bunch_size;
+	enum ibv_wr_opcode	eopcode;
+	struct ibv_cq*		scq;
+	struct ibv_cq*		rcq;
 
-	/* TODO: move all CM things to domain */
-	pthread_t cm_progress_thread;
-	pthread_mutex_t cm_lock;
-	int cm_progress_timeout;
-	int is_closing;
-	int recv_preposted_threshold;
+	int	buff_len;
+	int	n_buffs;
+	int	rq_wr_depth;    // RQ depth
+	int	sq_wr_depth;    // SQ depth
+	int	posted_sends;
+	int	posted_recvs;
+	int	num_active_conns;
+	int	max_inline_rc;
+	int	rndv_threshold;
+	int	rndv_seg_size;
+	int	use_odp;
+	int	scq_depth;
+	int	rcq_depth;
+	int	cqread_bunch_size;
+
+	int	is_closing;
+	int	recv_preposted_threshold;
 };
 
-enum {
+enum fi_rdm_cm_conn_state {
 	FI_VERBS_CONN_ALLOCATED,
 	FI_VERBS_CONN_STARTED,
 	FI_VERBS_CONN_REJECTED,
@@ -296,9 +326,18 @@ enum {
 };
 
 enum fi_rdm_cm_role {
+	FI_VERBS_CM_UNDEFINED,
 	FI_VERBS_CM_ACTIVE,
 	FI_VERBS_CM_PASSIVE,
 	FI_VERBS_CM_SELF,
+};
+
+struct fi_ibv_rdm_av_entry {
+	/* association of conn and EPs */
+	struct fi_ibv_rdm_conn		*conn_hash;
+	struct sockaddr_in		addr;
+	struct slist_entry		removed_next;
+	UT_hash_handle			hh;
 };
 
 struct fi_ibv_rdm_conn {
@@ -311,8 +350,9 @@ struct fi_ibv_rdm_conn {
 	struct ibv_qp *qp[2];
 	struct rdma_cm_id *id[2];
 	struct sockaddr_in addr;
+	struct fi_ibv_rdm_ep *ep;
 	enum fi_rdm_cm_role cm_role;
-	int state;
+	enum fi_rdm_cm_conn_state state;
 
 	char *sbuf_mem_reg;
 	struct fi_ibv_rdm_buf *sbuf_head;
@@ -345,6 +385,8 @@ struct fi_ibv_rdm_conn {
 	uint16_t recv_completions;
 	/* counter to control OOO behaviour, works in pair with recv_completions */
 	uint16_t recv_processed;
+
+	struct fi_ibv_rdm_av_entry *av_entry;
 	UT_hash_handle hh;
 #if ENABLE_DEBUG
 	size_t unexp_counter;
@@ -357,6 +399,8 @@ struct fi_ibv_rdm_postponed_entry {
 
 	struct fi_ibv_rdm_conn *conn;
 };
+
+extern struct util_buf_pool* fi_ibv_rdm_request_pool;
 
 static inline void
 fi_ibv_rdm_set_buffer_status(struct fi_ibv_rdm_buf *buff, uint16_t status)
@@ -492,9 +536,13 @@ static inline void fi_ibv_rdm_cntr_inc_err(struct fi_ibv_rdm_cntr *cntr)
 }
 
 int fi_ibv_rdm_tagged_poll(struct fi_ibv_rdm_ep *ep);
+int fi_ibv_rdm_tagged_poll_recv(struct fi_ibv_rdm_ep *ep);
 ssize_t fi_ibv_rdm_cm_progress(struct fi_ibv_rdm_ep *ep);
+ssize_t
+fi_ibv_rdm_start_overall_disconnection(struct fi_ibv_rdm_av_entry *av_entry);
 ssize_t fi_ibv_rdm_start_disconnection(struct fi_ibv_rdm_conn *conn);
 ssize_t fi_ibv_rdm_conn_cleanup(struct fi_ibv_rdm_conn *conn);
+ssize_t fi_ibv_rdm_overall_conn_cleanup(struct fi_ibv_rdm_av_entry *av_entry);
 ssize_t fi_ibv_rdm_start_connection(struct fi_ibv_rdm_ep *ep,
                                 struct fi_ibv_rdm_conn *conn);
 ssize_t fi_ibv_rdm_repost_receives(struct fi_ibv_rdm_conn *conn,
@@ -546,13 +594,13 @@ fi_ibv_rdm_get_sbuf_head(struct fi_ibv_rdm_conn *conn, struct fi_ibv_rdm_ep *ep)
 		}
 
 		/* notification for receiver */
-		fi_ibv_rdm_set_buffer_status(conn->sbuf_head, BUF_STATUS_RECVED);
+		fi_ibv_rdm_set_buffer_status(conn->sbuf_head, BUF_STATUS_RECEIVED);
 
 		sbuf = conn->sbuf_head;
 		fi_ibv_rdm_push_sbuff_head(conn, ep);
 	}
 #if ENABLE_DEBUG
-	assert(sbuf ? (sbuf->service_data.status == BUF_STATUS_RECVED) : 1);
+	assert(sbuf ? (sbuf->service_data.status == BUF_STATUS_RECEIVED) : 1);
 	{
 		int i;
 		char s[1024];
@@ -603,11 +651,11 @@ fi_ibv_rdm_check_connection(struct fi_ibv_rdm_conn *conn,
 {
 	const int status = (conn->state == FI_VERBS_CONN_ESTABLISHED);
 	if (!status) {
-		pthread_mutex_lock(&ep->cm_lock);
+		pthread_mutex_lock(&ep->domain->rdm_cm->cm_lock);
 		if (conn->state == FI_VERBS_CONN_ALLOCATED) {
 			fi_ibv_rdm_start_connection(ep, conn);
 		}
-		pthread_mutex_unlock(&ep->cm_lock);
+		pthread_mutex_unlock(&ep->domain->rdm_cm->cm_lock);
 	}
 
 	return status;
@@ -633,6 +681,60 @@ fi_ibv_rdm_rma_prepare_resources(struct fi_ibv_rdm_conn *conn,
 			fi_ibv_rdm_rma_get_buf_head(conn, ep) : NULL;
 	}
 	return NULL;
+}
+
+static inline int
+fi_ibv_rdm_process_send_wc(struct fi_ibv_rdm_ep *ep,
+			   struct ibv_wc *wc)
+{
+	if (wc->status != IBV_WC_SUCCESS) {
+		return 1;
+	}
+
+	if (FI_IBV_RDM_CHECK_SERVICE_WR_FLAG(wc->wr_id)) {
+		VERBS_DBG(FI_LOG_EP_DATA, "CQ COMPL: SEND -> 0x1\n");
+		struct fi_ibv_rdm_conn *conn =
+			(struct fi_ibv_rdm_conn *)
+			FI_IBV_RDM_UNPACK_SERVICE_WR(wc->wr_id);
+		FI_IBV_RDM_DEC_SIG_POST_COUNTERS(conn, ep);
+
+		return 0;
+	} else {
+		FI_IBV_DBG_OPCODE(wc->opcode, "SEND");
+		struct fi_ibv_rdm_request *request =
+			(void *)FI_IBV_RDM_UNPACK_WR(wc->wr_id);
+
+		struct fi_ibv_rdm_tagged_send_completed_data data =
+			{ .ep = ep };
+
+		return fi_ibv_rdm_req_hndl(request, FI_IBV_EVENT_POST_LC,
+					   &data);
+	}
+}
+
+static inline void
+fi_ibv_rdm_process_err_send_wc(struct fi_ibv_rdm_ep *ep,
+			       struct ibv_wc *wc)
+{
+	if (wc->status != IBV_WC_SUCCESS) {
+		struct fi_ibv_rdm_conn *conn;
+		if (FI_IBV_RDM_CHECK_SERVICE_WR_FLAG(wc->wr_id)) {
+			conn = FI_IBV_RDM_UNPACK_SERVICE_WR(
+					wc->wr_id);
+		} else {
+			struct fi_ibv_rdm_request *req =
+					(void *)wc->wr_id;
+			conn = req->minfo.conn;
+			FI_IBV_RDM_DBG_REQUEST("to_pool: ", req,
+					       FI_LOG_DEBUG);
+			util_buf_release(fi_ibv_rdm_request_pool, req);
+		}
+		VERBS_INFO(FI_LOG_EP_DATA, "got ibv_wc.status = %d:%s, "
+			   "pend_send: %d, connection: %p\n",
+			   wc->status,
+			   ibv_wc_status_str(wc->status),
+			   ep->posted_sends, conn);
+	}
 }
 
 #endif /* _VERBS_RDM_H */

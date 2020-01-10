@@ -1,10 +1,10 @@
 dnl
-dnl Copyright (c) 2016-2017 Cisco Systems, Inc.  All rights reserved.
+dnl Copyright (c) 2016 Cisco Systems, Inc.  All rights reserved.
 dnl
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.60])
-AC_INIT([libfabric], [1.4.2], [ofiwg@lists.openfabrics.org])
+AC_INIT([libfabric], [1.5.3], [ofiwg@lists.openfabrics.org])
 AC_CONFIG_SRCDIR([src/fabric.c])
 AC_CONFIG_AUX_DIR(config)
 AC_CONFIG_MACRO_DIR(config)
@@ -38,15 +38,20 @@ AM_CONDITIONAL([LINUX], [test "x$linux" = "x1"])
 AM_CONDITIONAL([FREEBSD], [test "x$freebsd" = "x1"])
 
 base_c_warn_flags="-Wall -Wundef -Wpointer-arith"
+debug_c_warn_flags="-Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers"
+picky_c_warn_flags="-Wno-long-long -Wmissing-prototypes -Wstrict-prototypes -Wcomment -pedantic"
 
 AC_ARG_ENABLE([debug],
 	      [AS_HELP_STRING([--enable-debug],
 			      [Enable debugging @<:@default=no@:>@])
 	      ],
-	      [CFLAGS="-g -O0 ${base_c_warn_flags} -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers $CFLAGS"
-	       dbg=1],
-	      [enable_debug=no
-               dbg=0])
+	      [],
+	      [enable_debug=no])
+
+AS_IF([test x"$enable_debug" != x"no"],
+      [dbg=1
+       CFLAGS="-g -O0 ${base_c_warn_flags} ${debug_c_warn_flags} $CFLAGS"],
+      [dbg=0])
 
 AC_DEFINE_UNQUOTED([ENABLE_DEBUG],[$dbg],
                    [defined to 1 if libfabric was configured with --enable-debug, 0 otherwise])
@@ -105,6 +110,16 @@ AC_CHECK_LIB(dl, dlopen, [],
 ])
 fi
 
+dnl handle picky option
+AC_ARG_ENABLE([picky],
+    [AC_HELP_STRING([--enable-picky],
+                    [Enable developer-level compiler pickyness when building @<:@default=no@:>@])])
+AS_IF([test x"$enable_picky" = x"yes" && test x"$GCC" = x"yes"],
+      [AS_IF([test x"$enable_debug" = x"no"],
+             [CFLAGS="${base_c_warn_flags} ${debug_c_warn_flags} ${picky_c_warn_flags} $CFLAGS"],
+             [CFLAGS="${picky_c_warn_flags} $CFLAGS"])
+      ])
+
 dnl Checks for libraries
 AC_CHECK_LIB(pthread, pthread_mutex_init, [],
     AC_MSG_ERROR([pthread_mutex_init() not found.  libfabric requires libpthread.]))
@@ -144,6 +159,24 @@ AC_TRY_LINK([#include <stdatomic.h>],
     [
 	AC_MSG_RESULT(yes)
         AC_DEFINE(HAVE_ATOMICS, 1, [Set to 1 to use c11 atomic functions])
+    ],
+    [AC_MSG_RESULT(no)])
+
+dnl Check for gcc built-in atomics
+AC_MSG_CHECKING(compiler support for built-in atomics)
+AC_TRY_LINK([#include <stdint.h>],
+    [int32_t a;
+     __sync_add_and_fetch(&a, 0);
+     __sync_sub_and_fetch(&a, 0);
+     #if defined(__PPC__) && !defined(__PPC64__)
+       #error compiler built-in atomics are not supported on PowerPC 32-bit
+     #else
+       return 0;
+     #endif
+    ],
+    [
+	AC_MSG_RESULT(yes)
+        AC_DEFINE(HAVE_BUILTIN_ATOMICS, 1, [Set to 1 to use built-in intrincics atomics])
     ],
     [AC_MSG_RESULT(no)])
 
@@ -234,11 +267,12 @@ FI_PROVIDER_SETUP([verbs])
 dnl The usnic provider must be setup after the verbs provider.  See
 dnl prov/usnic/configure.m4 for details.
 FI_PROVIDER_SETUP([usnic])
-FI_PROVIDER_SETUP([mxm])
+FI_PROVIDER_SETUP([mlx])
 FI_PROVIDER_SETUP([gni])
 FI_PROVIDER_SETUP([udp])
 FI_PROVIDER_SETUP([rxm])
 FI_PROVIDER_SETUP([rxd])
+FI_PROVIDER_SETUP([bgq])
 FI_PROVIDER_FINI
 dnl Configure the .pc file
 FI_PROVIDER_SETUP_PC

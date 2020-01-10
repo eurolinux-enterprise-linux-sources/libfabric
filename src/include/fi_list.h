@@ -89,20 +89,23 @@ static inline void dlist_remove(struct dlist_entry *item)
 	item->next->prev = item->prev;
 }
 
-#define dlist_pop_front_container(head, container, member) 			\
-	do {									\
-		container = container_of((head)->next, typeof(*container),	\
-				member);					\
-		dlist_remove((head)->next);					\
+#define dlist_pop_front(head, type, container, member)			\
+	do {								\
+		container = container_of((head)->next, type, member);	\
+		dlist_remove((head)->next);				\
 	} while (0)
 
-#define dlist_foreach(head, item) \
+#define dlist_foreach(head, item) 						\
 	for ((item) = (head)->next; (item) != (head); (item) = (item)->next)
 
-#define dlist_foreach_container(head, container, member) \
-	for (container = container_of((head)->next, typeof(*container), member); \
-		&(container->member) != (head); \
-		container = container_of(container->member.next, typeof(*container), member))
+#define dlist_foreach_container(head, type, container, member)			\
+	for (container = container_of((head)->next, type, member);		\
+		&(container->member) != (head);					\
+		container = container_of(container->member.next, type, member))
+
+#define dlist_foreach_safe(head, item, tmp) \
+    for ((item) = (head)->next, (tmp) = (item)->next; (item) != (head); \
+              (item) = (tmp), (tmp) = (item)->next)
 
 typedef int dlist_func_t(struct dlist_entry *item, const void *arg);
 
@@ -192,9 +195,10 @@ static inline struct slist_entry *slist_remove_head(struct slist *list)
 	return item;
 }
 
-#define slist_foreach(list, item, prev)\
-	for ((prev) = NULL, (item) = (list)->head; (item); \
+#define slist_foreach(list, item, prev)				\
+	for ((prev) = NULL, (item) = (list)->head; (item); 	\
 			(prev) = (item), (item) = (item)->next)
+
 
 typedef int slist_func_t(struct slist_entry *item, const void *arg);
 
@@ -211,6 +215,18 @@ slist_find_first_match(const struct slist *list, slist_func_t *match,
 	return NULL;
 }
 
+static inline void slist_remove(struct slist *list,
+		struct slist_entry *item, struct slist_entry *prev)
+{
+	if (prev)
+		prev->next = item->next;
+	else
+		list->head = item->next;
+
+	if (!item->next)
+		list->tail = prev;
+}
+
 static inline struct slist_entry *
 slist_remove_first_match(struct slist *list, slist_func_t *match, const void *arg)
 {
@@ -218,14 +234,7 @@ slist_remove_first_match(struct slist *list, slist_func_t *match, const void *ar
 
 	slist_foreach(list, item, prev) {
 		if (match(item, arg)) {
-			if (prev)
-				prev->next = item->next;
-			else
-				list->head = item->next;
-
-			if (!item->next)
-				list->tail = prev;
-
+			slist_remove(list, item, prev);
 			return item;
 		}
 	}

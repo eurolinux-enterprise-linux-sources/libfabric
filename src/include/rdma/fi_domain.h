@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -48,6 +48,8 @@ extern "C" {
  */
 
 #define FI_SYMMETRIC		(1ULL << 59)
+#define FI_SYNC_ERR		(1ULL << 58)
+
 
 struct fi_av_attr {
 	enum fi_av_type		type;
@@ -101,12 +103,69 @@ struct fi_mr_attr {
 	uint64_t		offset;
 	uint64_t		requested_key;
 	void			*context;
+	size_t			auth_key_size;
+	uint8_t			*auth_key;
+};
+
+struct fi_mr_modify {
+	uint64_t		flags;
+	struct fi_mr_attr	attr;
 };
 
 
+#ifdef FABRIC_DIRECT
+#include <rdma/fi_direct_atomic_def.h>
+#endif /* FABRIC_DIRECT */
+
+#ifndef FABRIC_DIRECT_ATOMIC_DEF
+
+enum fi_datatype {
+	FI_INT8,
+	FI_UINT8,
+	FI_INT16,
+	FI_UINT16,
+	FI_INT32,
+	FI_UINT32,
+	FI_INT64,
+	FI_UINT64,
+	FI_FLOAT,
+	FI_DOUBLE,
+	FI_FLOAT_COMPLEX,
+	FI_DOUBLE_COMPLEX,
+	FI_LONG_DOUBLE,
+	FI_LONG_DOUBLE_COMPLEX,
+	FI_DATATYPE_LAST
+};
+
+enum fi_op {
+	FI_MIN,
+	FI_MAX,
+	FI_SUM,
+	FI_PROD,
+	FI_LOR,
+	FI_LAND,
+	FI_BOR,
+	FI_BAND,
+	FI_LXOR,
+	FI_BXOR,
+	FI_ATOMIC_READ,
+	FI_ATOMIC_WRITE,
+	FI_CSWAP,
+	FI_CSWAP_NE,
+	FI_CSWAP_LE,
+	FI_CSWAP_LT,
+	FI_CSWAP_GE,
+	FI_CSWAP_GT,
+	FI_MSWAP,
+	FI_ATOMIC_OP_LAST
+};
+
+#endif
+
+
+struct fi_atomic_attr;
 struct fi_cq_attr;
 struct fi_cntr_attr;
-
 
 struct fi_ops_domain {
 	size_t	size;
@@ -128,8 +187,13 @@ struct fi_ops_domain {
 	int	(*srx_ctx)(struct fid_domain *domain,
 			struct fi_rx_attr *attr, struct fid_ep **rx_ep,
 			void *context);
+	int	(*query_atomic)(struct fid_domain *domain,
+			enum fi_datatype datatype, enum fi_op op,
+			struct fi_atomic_attr *attr, uint64_t flags);
 };
 
+/* Memory registration flags */
+/* #define FI_RMA_EVENT		(1ULL << 56) */
 
 struct fi_ops_mr {
 	size_t	size;
@@ -237,9 +301,58 @@ static inline uint64_t fi_mr_key(struct fid_mr *mr)
 	return mr->key;
 }
 
+static inline int
+fi_mr_raw_attr(struct fid_mr *mr, uint64_t *base_addr,
+	       uint8_t *raw_key, size_t *key_size, uint64_t flags)
+{
+	struct fi_mr_raw_attr attr = {
+		.flags = flags,
+		.base_addr = base_addr,
+		.raw_key = raw_key,
+		.key_size = key_size
+	};
+	return mr->fid.ops->control(&mr->fid, FI_GET_RAW_MR, &attr);
+}
+
+static inline int
+fi_mr_map_raw(struct fid_domain *domain, uint64_t base_addr,
+	      uint8_t *raw_key, size_t key_size, uint64_t *key, uint64_t flags)
+{
+	struct fi_mr_map_raw map = {
+		.flags = flags,
+		.base_addr = base_addr,
+		.raw_key = raw_key,
+		.key_size = key_size,
+		.key = key
+	};
+	return domain->fid.ops->control(&domain->fid, FI_MAP_RAW_MR, &map);
+}
+
+static inline int
+fi_mr_unmap_key(struct fid_domain *domain, uint64_t key)
+{
+	return domain->fid.ops->control(&domain->fid, FI_UNMAP_KEY, &key);
+}
+
 static inline int fi_mr_bind(struct fid_mr *mr, struct fid *bfid, uint64_t flags)
 {
 	return mr->fid.ops->bind(&mr->fid, bfid, flags);
+}
+
+static inline int
+fi_mr_refresh(struct fid_mr *mr, const struct iovec *iov, size_t count,
+	      uint64_t flags)
+{
+	struct fi_mr_modify modify = {0};
+	modify.flags = flags;
+	modify.attr.mr_iov = iov;
+	modify.attr.iov_count = count;
+	return mr->fid.ops->control(&mr->fid, FI_REFRESH, &modify);
+}
+
+static inline int fi_mr_enable(struct fid_mr *mr)
+{
+	return mr->fid.ops->control(&mr->fid, FI_ENABLE, NULL);
 }
 
 static inline int

@@ -5,6 +5,282 @@ This file contains the main features as well as overviews of specific
 bug fixes (and other actions) for each version of Libfabric since
 version 1.0.
 
+v1.5.3, Wed Dec 20, 2017
+========================
+
+## Core
+
+-- Handle malloc failures
+-- Ensure global lock is initialized on Windows
+-- Fix spelling and formatting errors in man pages
+
+## GNI
+
+-- Fix segfault when using FI_MULTI_RECV
+-- Fix rcache issue handling overlapping memory regions
+
+## NetDir
+
+-- Fix fi_getname
+-- Remove FI_LOCAL_MR mode bit, being reported erronously
+-- Avoid crashing in fi_join
+
+## PSM
+
+-- Fix print format mismatches
+-- Remove 15 second startup delay when no hardware is installed
+-- Preserve FI_MR_SCALABLE mode bit for backwards compatability
+
+## PSM2
+
+-- Fix print format mismatches
+-- Allow all to all communication between scalable endpoints
+-- Preserve FI_MR_SCALABLE mode bit for backwards compatability
+-- Fix reference counting issue with opened domains
+-- Fix segfault for RMA/atomic operations to local scalable endpoints
+-- Fix resource counting related issues for Tx/Rx contexts
+-- Allow completion suppression when fi_context is non-NULL
+-- Use correct queue for triggered operations with scalable endpoints
+
+## RXM
+
+-- Fix out of bounds access to receive IOVs
+-- Serialize access to connection map
+-- Fix CQ error handling
+-- Fix issue being unable to associate an fi_addr with a connection
+-- Fix bug matching unexpected tagged messages
+-- Indicate that FI_RMA is supported
+-- Return correct r/w ordering size limits
+
+## Sockets
+
+-- Fix check for invalid connection handle
+-- Fix crash in fi_av_remove
+
+## Util
+
+-- Fix number of bits used for connection index
+
+## Verbs
+
+-- Fix incorrect CQ entry data for MSG endpoints
+-- Properly check for errors from getifaddrs
+-- Retry getifaddr on failure because of busy netlink sockets
+-- Ack CM events on error paths
+
+v1.5.2, Wed Nov 8, 2017
+=======================
+
+## Core
+
+- Fix Power PC 32-bit build
+
+## RXM
+
+-- Remove dependency on shared receive contexts
+-- Switch to automatic data progress
+-- Fix removing addresses from AV
+
+## Sockets
+
+-- Fix incorrect reporting of counter attributes
+
+## Verbs
+
+-- Fix reporting attributes based on device limits
+-- Fix incorrect CQ size reported for iWarp NICs
+-- Update man page with known issues for specific NICs
+-- Fix FI_RX_CQ_DATA mode check
+-- Disable on-demand paging by default (can cause data corruption)
+-- Disable loopback (localhost) addressing (causing failures in MPI)
+
+v1.5.1, Wed Oct 4, 2017
+=======================
+
+## Core
+
+- Fix initialization used by DL providers to avoid crash
+- Add checks for null hints and improperly terminated strings
+- Check for invalid core names passed to fabric open
+- Provide consistent provider ordering when using DL providers
+- Fix OFI_LIKELY definitions when GNUC is not present
+
+## GNI
+
+- Add ability to detect local PE rank
+- Fix compiler/config problems
+- Fix CQ read error corruption
+- Remove tests of deprecated interfaces
+
+## PSM
+
+- Fix CQ corruption reporting errors
+- Always generate a completion on error
+
+## PSM2
+
+- Fix CQ corruption reporting errors
+- Always generate a completion on error
+- Add checks to handle out of memory errors
+- Add NULL check for iov in atomic readv/writev calls
+- Fix FI_PEEK src address matching
+- Fix bug in scalable endpoint address resolution
+- Fix segfault bug in RMA completion generation
+
+## Sockets
+
+- Fix missing FI_CLAIM src address data on completion
+- Fix CQ corruption reporting errors
+- Fix serialization issue wrt out of order CPU writes to Tx ring buffer
+
+## Verbs
+
+- Allow modifying rnr retry timout to improve performance
+- Add checks to handle out of memory errors
+- Fix crash using atomic operations for MSG EPs
+
+
+v1.5.0, Wed Aug 9, 2017
+============================
+
+The 1.5 release includes updates to the libfabric API and ABI.  As a
+result, the ABI bumps from 1.0 to 1.1.  All changes are backwards
+compatible with previous versions of the interface.  The following
+features were added to the libfabric API.  (Note that individual
+providers may not support all new features).  For full details
+see the man pages.
+
+- Authorization keys
+  Authorization keys, commonly referred to as job keys, are used to
+  isolate processes from communicating with other processes for security
+  purposes.
+- Multicast support
+  Datagram endpoints can now support multicast communication.
+- (Experimental) socket-like endpoint types
+  New FI_SOCK_STREAM and FI_SOCK_DGRAM endpoint types are introduced.
+  These endpoint types target support of cloud and enterprise based
+  middleware and applications.
+- Tagged atomic support
+  Atomic operations can now target tagged receive buffers, in
+  addition to RMA buffers.
+- (Experimental) deferred work queues
+  Deferred work queues are enhanced triggerred operations.  They
+  target support for collective-based operations.
+- New mode bits: FI_RESTRICTED_COMP and FI_NOTIFY_FLAGS_ONLY
+  These mode bits support optimized completion processing to
+  minimize software overhead.
+- Multi-threaded error reporting
+  Reading CQ and EQ errors now allow the application to provide the
+  error buffer, eliminating the need for the application to synchronize
+  between multiple threads when handling errors.
+- FI_SOURCE_ERR capability
+  This feature allows the provider to validate and report the source
+  address for any received messages.
+- FI_ADDR_STR string based addressing
+  Applications can now request and use addresses provided using a
+  standardized string format.  This makes it easier to pass full
+  addressing data through a command line, or handle address exchange
+  through text files.
+- Communication scope capabilities: FI_LOCAL_COMM and FI_REMOTE_COMM
+  Used to indicate if an application requires communication with
+  peers on the same node and/or remote nodes.
+- New memory registration modes
+  The FI_BASIC_MR and FI_SCALABLE_MR memory registration modes have
+  been replaced by more refined registration mode bits.  This allows
+  applications to make better use of provider hardware capabilities
+  when dealing with registered memory regions.
+- New mode bit: FI_CONTEXT2
+  Some providers need more than the size provided by the FI_CONTEXT
+  mode bit setting.  To accomodate such providers, an FI_CONTEXT2
+  mode bit was added.  This mode bit doubles the amount of context
+  space that an application allocates on behalf of the provider.
+
+## BGQ provider notes
+
+- The OFI 1.5 BGQ provider officially supports the Open Fabrics Interfaces
+  utilized by the MPICH implementation of the MPI-3 standard.  In addition
+  to the MPICH test suite it has been tested by several scientific applications
+  running MPICH on BGQ at scale, and several bugs in the provider and MPICH
+  have been identified and fixed.  At least one INCITE project is attempting
+  to use it for production science.  Support of this provider is a high-
+  priority for ALCF, and MPICH users on BGQ are encouraged to utilize it to
+  compare function and performance against the PAMI-based default toolchain.
+  Any discovered bugs will be quickly addressed with high priority.  Results
+  so far have shown significant point-to-point and RMA latency improvements
+  over PAMI as well as RMA functional improvements at scale.  The only
+  potential drawback is collective performance degradation against the PAMI
+  optimizations, but at certain message and partition sizes, performance has
+  been observed to be comparable or even better.
+
+## MLX provider notes
+
+- New provider to replace the deprecated mxm provider.
+- Targets Mellanox InfiniBand fabrics, through the UCX library.
+- Supports RDM endpoints with the tagged interfaces.
+- Requires FI_CONTEXT mode support.
+- See fi_mlx.7 man page for more details.
+
+## NetDir provider nodes
+
+- New provider for Windows that runs over the NetworkDirect API.
+- Supports FI_EP_MSG endpoints, with FI_MSG and FI_RMA interfaces.
+
+## PSM provider notes
+
+- Improve the name server functionality and move to the utility code
+- Handle updated mr_mode definitions
+- Add support of 32 and 64 bit atomic values
+
+## PSM2 provider notes
+
+- Add option to adjust the locking level
+- Improve the name server functionality and move to the utility code
+- Add support for string address format
+- Add an environment vaiable for message inject size
+- Handle FI_DISCARD in tagged receive functions
+- Handle updated mr_mode definitions
+- Add support for scalable endpoint
+- Add support of 32 and 64 bit atomic values
+- Add FI_SOURCE_ERR to the supported caps
+- Improve the method of checking device existence
+
+## Sockets provider notes
+
+- Updated and enhanced atomic operation support.
+- Add support for experimental deferred work queue operations.
+- Fixed counter signaling when used with wait sets.
+- Improved support on Windows.
+- Cleaned up event reporting for destroyed endpoints.
+- Fixed several possible crash scenarios.
+- Fixed handling socket disconnect events which could hang the provider.
+
+## RxM provider notes
+
+- Add OFI RxM provider. It is an utility provider that supports RDM
+  endpoints emulated over a base provider that supports only MSG end-
+  points.
+- The provider was earlier experimental. It's functional from this
+  release onwards.
+- Please refer to the man page of the provider for more info.
+
+## UDP provider notes
+
+- Add support for multicast data transfers
+
+## usNIC provider notes
+
+- Only requires libibverbs when necessary
+- Updated to handle 1.5 interface changes.
+
+## Verbs provider notes
+
+- Fix an issue where if the user requests higher values for tx, rx
+  context sizes than default it wasn't honored.
+- Introduce env variables for setting default tx, rx context sizes
+  and iov limits.
+- Report correct completion ordering supported by MSG endpoints.
+
+
 v1.4.2, Fri May 12, 2017
 ========================
 

@@ -137,7 +137,7 @@ static int sock_wait_wait(struct fid_wait *wait_fid, int timeout)
 			cq = container_of(list_item->fid,
 					  struct sock_cq, cq_fid);
 			sock_cq_progress(cq);
-			if (rbused(&cq->cqerr_rb))
+			if (ofi_rbused(&cq->cqerr_rb))
 				return 1;
 			break;
 
@@ -252,7 +252,7 @@ int sock_wait_close(fid_t fid)
 		ofi_close_socket(wait->wobj.fd[WAIT_WRITE_FD]);
 	}
 
-	atomic_dec(&wait->fab->ref);
+	ofi_atomic_dec32(&wait->fab->ref);
 	free(wait);
 	return 0;
 }
@@ -315,7 +315,7 @@ int sock_wait_open(struct fid_fabric *fabric, struct fi_wait_attr *attr,
 	wait->wait_fid.ops = &sock_wait_ops;
 	wait->fab = fab;
 	wait->type = wait_obj_type;
-	atomic_inc(&fab->ref);
+	ofi_atomic_inc32(&fab->ref);
 	dlist_init(&wait->fid_list);
 
 	*waitset = &wait->wait_fid;

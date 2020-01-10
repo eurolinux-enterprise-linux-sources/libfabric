@@ -1,6 +1,7 @@
 /*
- * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
- * Copyright (c) 2015-2016 Cray Inc. All rights reserved.
+ * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
+ *                         All rights reserved.
+ * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
  * Copyright (c) 2016 Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -43,12 +44,15 @@
 #include <fi.h>
 
 extern struct fi_provider gnix_prov;
+#if HAVE_CRITERION
+extern int gnix_first_pe_on_node; /* globally visible for  criterion */
+#endif
 
 /*
- * For debug logging (#undef NDEBUG)
+ * For debug logging (ENABLE_DEBUG)
  * Q: should this just always be available?
  */
-#ifdef NDEBUG
+#ifndef ENABLE_DEBUG
 
 #define GNIX_LOG_INTERNAL(FI_LOG_FN, LEVEL, subsystem, fmt, ...)	\
 	FI_LOG_FN(&gnix_prov, subsystem, fmt, ##__VA_ARGS__)
@@ -60,7 +64,7 @@ extern struct fi_provider gnix_prov;
 /* defined in gnix_init.c */
 extern __thread pid_t gnix_debug_pid;
 extern __thread uint32_t gnix_debug_tid;
-extern atomic_t gnix_debug_next_tid;
+extern ofi_atomic32_t gnix_debug_next_tid;
 
 #define GNIX_FI_PRINT(prov, subsystem, ...)				\
 	do {								\
@@ -79,13 +83,13 @@ extern atomic_t gnix_debug_next_tid;
 			const int fmt_len = 256;			\
 			char new_fmt[fmt_len];				\
 			if (gnix_debug_tid  == ~(uint32_t) 0) {		\
-				gnix_debug_tid = atomic_inc(&gnix_debug_next_tid); \
+				gnix_debug_tid = ofi_atomic_inc32(&gnix_debug_next_tid); \
 			}						\
 			if (gnix_debug_pid == ~(uint32_t) 0) {		\
 				gnix_debug_pid = getpid();		\
 			}						\
 			snprintf(new_fmt, fmt_len, "[%%d:%%d] %s", fmt);	\
-			FI_LOG_FN(&gnix_prov, subsystem, new_fmt,		\
+			FI_LOG_FN(&gnix_prov, subsystem, new_fmt,	\
 				  gnix_debug_pid, gnix_debug_tid, ##__VA_ARGS__); \
 		} \
 	} while (0)
@@ -220,6 +224,7 @@ static inline void dlist_splice_tail(
 /*
  * prototypes
  */
+int _gnix_get_cq_limit(void);
 int gnixu_get_rdma_credentials(void *addr, uint8_t *ptag, uint32_t *cookie);
 int gnixu_to_fi_errno(int err);
 
@@ -233,12 +238,13 @@ void _gnix_app_cleanup(void);
 int _gnix_job_fma_limit(uint32_t dev_id, uint8_t ptag, uint32_t *limit);
 int _gnix_job_cq_limit(uint32_t dev_id, uint8_t ptag, uint32_t *limit);
 int _gnix_pes_on_node(uint32_t *num_pes);
+int _gnix_pe_node_rank(int *pe_node_rank);
 int _gnix_nics_per_rank(uint32_t *nics_per_rank);
 void _gnix_dump_gni_res(uint8_t ptag);
 int _gnix_get_num_corespec_cpus(uint32_t *num_core_spec_cpus);
 
 struct gnix_reference {
-	atomic_t references;
+	ofi_atomic32_t references;
 	void (*destruct)(void *obj);
 };
 
@@ -248,14 +254,18 @@ struct gnix_reference {
 #define __ref_get(ptr, var) \
 	({ \
 		struct gnix_reference *ref = &(ptr)->var; \
-		int references_held = atomic_inc(&ref->references); \
+		int references_held = ofi_atomic_inc32(&ref->references); \
+		GNIX_DEBUG(FI_LOG_CORE, "%p refs %d\n", \
+			   ref, references_held); \
 		assert(references_held > 0); \
 		references_held; })
 
 #define __ref_put(ptr, var) \
 	({ \
 		struct gnix_reference *ref = &(ptr)->var; \
-		int references_held = atomic_dec(&ref->references); \
+		int references_held = ofi_atomic_dec32(&ref->references); \
+		GNIX_DEBUG(FI_LOG_CORE, "%p refs %d\n", \
+			   ref, references_held); \
 		assert(references_held >= 0); \
 		if (references_held == 0) \
 			ref->destruct((void *) (ptr)); \
@@ -267,12 +277,23 @@ struct gnix_reference {
 #define _gnix_ref_get(ptr) __ref_get(ptr, ref_cnt)
 #define _gnix_ref_put(ptr) __ref_put(ptr, ref_cnt)
 
+/**
+ * Only allow FI_REMOTE_CQ_DATA when the EP cap, FI_RMA_EVENT, is also set.
+ *
+ * @return zero if FI_REMOTE_CQ_DATA is not permitted; otherwise one.
+ */
+#define GNIX_ALLOW_FI_REMOTE_CQ_DATA(_flags, _ep_caps) \
+					(((_flags) & FI_REMOTE_CQ_DATA) && \
+					 ((_ep_caps) & FI_RMA_EVENT))
+
 static inline void _gnix_ref_init(
 		struct gnix_reference *ref,
 		int initial_value,
 		void (*destruct)(void *))
 {
-	atomic_initialize(&ref->references, initial_value);
+	ofi_atomic_initialize32(&ref->references, initial_value);
+	GNIX_DEBUG(FI_LOG_CORE, "%p refs %d\n",
+		   ref, initial_value);
 	ref->destruct = destruct;
 }
 
@@ -299,7 +320,7 @@ static inline void _gnix_ref_init(
 	__COND_FUNC((cond), (lock), rwlock_unlock)
 #ifdef __GNUC__
 #define __PREFETCH(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
-#else 
+#else
 #define __PREFETCH(addr, rw, locality) ((void *) 0)
 #endif
 

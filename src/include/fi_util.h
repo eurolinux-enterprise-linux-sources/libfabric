@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2016 Intel Corporation, Inc.  All rights reserved.
+ * Copyright (c) 2015-2017 Intel Corporation, Inc.  All rights reserved.
  * Copyright (c) 2016 Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -56,6 +56,9 @@
 #include <fi_signal.h>
 #include <fi_enosys.h>
 #include <fi_osd.h>
+#include <fi_indexer.h>
+
+#include "rbtree.h"
 
 #ifndef _FI_UTIL_H_
 #define _FI_UTIL_H_
@@ -89,17 +92,50 @@
 	OFI_Q_READERR(prov, log, eq, "eq", fi_eq_readerr, 	\
 			fi_eq_strerror, ret, err_entry)
 
-#define ofi_sin_addr(addr) (((struct sockaddr_in *)(addr))->sin_addr)
-#define ofi_sin6_addr(addr) (((struct sockaddr_in6 *)(addr))->sin6_addr)
+#define FI_INFO_FIELD(provider, prov_attr, user_attr, prov_str, user_str, type)	\
+	do {										\
+		FI_INFO(provider, FI_LOG_CORE, prov_str ": %s\n",			\
+				fi_tostr(&prov_attr, type));				\
+		FI_INFO(provider, FI_LOG_CORE, user_str ": %s\n",			\
+				fi_tostr(&user_attr, type));				\
+	} while (0)
 
-enum fi_match_type {
-	FI_MATCH_EXACT,
-	FI_MATCH_PREFIX,
-};
+#define FI_INFO_STRING(provider, prov_attr, user_attr, prov_str, user_str)	\
+	do {									\
+		FI_INFO(provider, FI_LOG_CORE, prov_str ": %s\n", prov_attr);	\
+		FI_INFO(provider, FI_LOG_CORE, user_str ": %s\n", user_attr);	\
+	} while (0)
+
+#define FI_INFO_CHECK(provider, prov, user, field, type)		\
+	FI_INFO_FIELD(provider, prov->field, user->field, "Supported",	\
+		      "Requested", type)
+
+#define FI_INFO_CHECK_VAL(provider, prov, user, field)					\
+	do {										\
+		FI_INFO(provider, FI_LOG_CORE, "Supported: %zd\n", prov->field);	\
+		FI_INFO(provider, FI_LOG_CORE, "Requested: %zd\n", user->field);	\
+	} while (0)
+
+#define FI_INFO_MODE(provider, prov_mode, user_mode)				\
+	FI_INFO_FIELD(provider, prov_mode, user_mode, "Expected", "Given",	\
+		      FI_TYPE_MODE)
+
+#define FI_INFO_MR_MODE(provider, prov_mode, user_mode)			\
+	FI_INFO_FIELD(provider, prov_mode, user_mode, "Expected", "Given",	\
+		      FI_TYPE_MR_MODE)
+
+#define FI_INFO_NAME(provider, prov, user)				\
+	FI_INFO_STRING(provider, prov->name, user->name, "Supported",	\
+		       "Requested")
 
 enum {
 	UTIL_TX_SHARED_CTX = 1 << 0,
 	UTIL_RX_SHARED_CTX = 1 << 1,
+};
+
+struct ofi_common_locks {
+	pthread_mutex_t ini_lock;
+	pthread_mutex_t util_fabric_lock;
 };
 
 /*
@@ -115,11 +151,16 @@ struct util_prov {
 /*
  * Fabric
  */
+struct util_fabric_info {
+	const char 			*name;
+	const struct fi_provider 	*prov;
+};
+
 struct util_fabric {
 	struct fid_fabric	fabric_fid;
 	struct dlist_entry	list_entry;
 	fastlock_t		lock;
-	atomic_t		ref;
+	ofi_atomic32_t		ref;
 	const char		*name;
 	const struct fi_provider *prov;
 
@@ -127,10 +168,9 @@ struct util_fabric {
 };
 
 int ofi_fabric_init(const struct fi_provider *prov,
-		   struct fi_fabric_attr *prov_attr,
-		   struct fi_fabric_attr *user_attr,
-		   struct util_fabric *fabric, void *context,
-		   enum fi_match_type type);
+		    const struct fi_fabric_attr *prov_attr,
+		    const struct fi_fabric_attr *user_attr,
+		    struct util_fabric *fabric, void *context);
 int ofi_fabric_close(struct util_fabric *fabric);
 int ofi_trywait(struct fid_fabric *fabric, struct fid **fids, int count);
 
@@ -141,19 +181,22 @@ struct util_domain {
 	struct fid_domain	domain_fid;
 	struct dlist_entry	list_entry;
 	struct util_fabric	*fabric;
+	struct util_eq		*eq;
 	fastlock_t		lock;
-	atomic_t		ref;
+	ofi_atomic32_t		ref;
 	const struct fi_provider *prov;
 
 	char			*name;
-	uint64_t		caps;
-	uint64_t		mode;
+	uint64_t		info_domain_caps;
+	uint64_t		info_domain_mode;
+	int			mr_mode;
 	uint32_t		addr_format;
 	enum fi_av_type		av_type;
 };
 
 int ofi_domain_init(struct fid_fabric *fabric_fid, const struct fi_info *info,
 		     struct util_domain *domain, void *context);
+int ofi_domain_bind_eq(struct util_domain *domain, struct util_eq *eq);
 int ofi_domain_close(struct util_domain *domain);
 
 
@@ -162,22 +205,44 @@ int ofi_domain_close(struct util_domain *domain);
  */
 
 struct util_ep;
-typedef void (*fi_ep_progress_func)(struct util_ep *util_ep);
+typedef void (*ofi_ep_progress_func)(struct util_ep *util_ep);
 
 struct util_ep {
 	struct fid_ep		ep_fid;
 	struct util_domain	*domain;
+
 	struct util_av		*av;
+	struct dlist_entry	av_entry;
+	struct util_eq		*eq;
+	/* CQ entries */
 	struct util_cq		*rx_cq;
+	uint64_t		rx_op_flags;
 	struct util_cq		*tx_cq;
+	uint64_t		tx_op_flags;
+
+	/* CNTR entries */
+	struct util_cntr	*tx_cntr;     /* transmit/send */
+	struct util_cntr	*rx_cntr;     /* receive       */
+	struct util_cntr	*rd_cntr;     /* read          */
+	struct util_cntr	*wr_cntr;     /* write         */
+	struct util_cntr	*rem_rd_cntr; /* remote read   */
+	struct util_cntr	*rem_wr_cntr; /* remote write  */
+
 	uint64_t		caps;
 	uint64_t		flags;
-	fi_ep_progress_func	progress;
+	ofi_ep_progress_func	progress;
+	struct util_cmap	*cmap;
+	fastlock_t		lock;
 };
 
+int ofi_ep_bind_av(struct util_ep *util_ep, struct util_av *av);
+int ofi_ep_bind_eq(struct util_ep *ep, struct util_eq *eq);
+int ofi_ep_bind_cq(struct util_ep *ep, struct util_cq *cq, uint64_t flags);
+int ofi_ep_bind_cntr(struct util_ep *ep, struct util_cntr *cntr, uint64_t flags);
+int ofi_ep_bind(struct util_ep *util_ep, struct fid *fid, uint64_t flags);
 int ofi_endpoint_init(struct fid_domain *domain, const struct util_prov *util_prov,
-		struct fi_info *info, struct util_ep *ep, void *context,
-		enum fi_match_type type);
+		      struct fi_info *info, struct util_ep *ep, void *context,
+		      ofi_ep_progress_func progress);
 
 int ofi_endpoint_close(struct util_ep *util_ep);
 
@@ -199,16 +264,17 @@ struct util_cq_err_entry {
 	struct slist_entry	list_entry;
 };
 
-DECLARE_CIRQUE(struct fi_cq_tagged_entry, util_comp_cirq);
+OFI_DECLARE_CIRQUE(struct fi_cq_tagged_entry, util_comp_cirq);
 
-typedef void (*fi_cq_progress_func)(struct util_cq *cq);
+typedef void (*ofi_cq_progress_func)(struct util_cq *cq);
+
 struct util_cq {
 	struct fid_cq		cq_fid;
 	struct util_domain	*domain;
 	struct util_wait	*wait;
-	atomic_t		ref;
-	struct dlist_entry	list;
-	fastlock_t		list_lock;
+	ofi_atomic32_t		ref;
+	struct dlist_entry	ep_list;
+	fastlock_t		ep_list_lock;
 	fastlock_t		cq_lock;
 
 	struct util_comp_cirq	*cirq;
@@ -217,27 +283,61 @@ struct util_cq {
 	struct slist		err_list;
 	fi_cq_read_func		read_entry;
 	int			internal_wait;
-	fi_cq_progress_func	progress;
+	ofi_cq_progress_func	progress;
 };
 
 int ofi_cq_init(const struct fi_provider *prov, struct fid_domain *domain,
 		 struct fi_cq_attr *attr, struct util_cq *cq,
-		 fi_cq_progress_func progress, void *context);
+		 ofi_cq_progress_func progress, void *context);
+int ofi_check_bind_cq_flags(struct util_ep *ep, struct util_cq *cq,
+			    uint64_t flags);
 void ofi_cq_progress(struct util_cq *cq);
 int ofi_cq_cleanup(struct util_cq *cq);
+ssize_t ofi_cq_read(struct fid_cq *cq_fid, void *buf, size_t count);
+ssize_t ofi_cq_readfrom(struct fid_cq *cq_fid, void *buf, size_t count,
+		fi_addr_t *src_addr);
+ssize_t ofi_cq_readerr(struct fid_cq *cq_fid, struct fi_cq_err_entry *buf,
+		uint64_t flags);
+ssize_t ofi_cq_sread(struct fid_cq *cq_fid, void *buf, size_t count,
+		const void *cond, int timeout);
+ssize_t ofi_cq_sreadfrom(struct fid_cq *cq_fid, void *buf, size_t count,
+		fi_addr_t *src_addr, const void *cond, int timeout);
+int ofi_cq_signal(struct fid_cq *cq_fid);
+int ofi_cq_write_error(struct util_cq *cq,
+		       const struct fi_cq_err_entry *err_entry);
 
 /*
  * Counter
  */
+struct util_cntr;
+typedef void (*ofi_cntr_progress_func)(struct util_cntr *cntr);
+
 struct util_cntr {
 	struct fid_cntr		cntr_fid;
 	struct util_domain	*domain;
-	atomic_t		ref;
+	struct util_wait	*wait;
+	ofi_atomic32_t		ref;
+
+	ofi_atomic64_t		cnt;
+	ofi_atomic64_t		err;
+
 	uint64_t		checkpoint_cnt;
 	uint64_t		checkpoint_err;
+
+	struct dlist_entry	ep_list;
+	fastlock_t		ep_list_lock;
+
+	ofi_cntr_progress_func	progress;
 };
 
+int ofi_check_bind_cntr_flags(struct util_ep *ep, struct util_cntr *cntr,
+			      uint64_t flags);
 
+void ofi_cntr_progress(struct util_cntr *cntr);
+int ofi_cntr_init(const struct fi_provider *prov, struct fid_domain *domain,
+		  struct fi_cntr_attr *attr, struct util_cntr *cntr,
+		  ofi_cntr_progress_func progress, void *context);
+int ofi_cntr_cleanup(struct util_cntr *cntr);
 /*
  * AV / addressing
  */
@@ -257,7 +357,7 @@ struct util_av {
 	struct fid_av		av_fid;
 	struct util_domain	*domain;
 	struct util_eq		*eq;
-	atomic_t		ref;
+	ofi_atomic32_t		ref;
 	fastlock_t		lock;
 	const struct fi_provider *prov;
 
@@ -268,6 +368,7 @@ struct util_av {
 	ssize_t			free_list;
 	struct util_av_hash	hash;
 	void			*data;
+	struct dlist_entry	ep_list;
 };
 
 struct util_av_attr {
@@ -282,6 +383,7 @@ int ofi_av_init(struct util_domain *domain,
 int ofi_av_close(struct util_av *av);
 
 int ofi_av_insert_addr(struct util_av *av, const void *addr, int slot, int *index);
+int ofi_av_remove_addr(struct util_av *av, int slot, int index);
 int ofi_av_lookup_index(struct util_av *av, const void *addr, int slot);
 int ofi_av_bind(struct fid *av_fid, struct fid *eq_fid, uint64_t flags);
 void ofi_av_write_event(struct util_av *av, uint64_t data,
@@ -307,59 +409,99 @@ int ofi_av_get_index(struct util_av *av, const void *addr);
  * Connection Map
  */
 
+// TODO explore replacing this with a simple connection hash map that is common
+// for both AV and RX only connections.
+
+#define UTIL_CMAP_IDX_BITS OFI_IDX_INDEX_BITS
+
+enum ofi_cmap_signal {
+	OFI_CMAP_FREE,
+	OFI_CMAP_EXIT,
+};
+
 enum util_cmap_state {
-	CMAP_UNSPEC,
-	CMAP_CONNECTING,
-	CMAP_CONNECTED
+	CMAP_IDLE,
+	CMAP_CONNREQ_SENT,
+	CMAP_CONNREQ_RECV,
+	CMAP_ACCEPT,
+	CMAP_CONNECTED,
+	CMAP_SHUTDOWN,
 };
 
 struct util_cmap_handle {
 	struct util_cmap *cmap;
 	enum util_cmap_state state;
-	struct util_cmap_key *key;
-	size_t key_index;
+	/* Unique identifier for a connection. Can be exchanged with a peer
+	 * during connection setup and can later be used in a message header
+	 * to identify the source of the message (Used for FI_SOURCE, RNDV
+	 * protocol, etc.) */
+	uint64_t key;
+	uint64_t remote_key;
 	fi_addr_t fi_addr;
 	struct util_cmap_peer *peer;
 };
 
-struct util_cmap_key {
-	struct util_cmap_handle *handle;
-};
-DECLARE_FREESTACK(struct util_cmap_key, util_cmap_keypool);
-
 struct util_cmap_peer {
 	struct util_cmap_handle *handle;
 	struct dlist_entry entry;
-	size_t addrlen;
 	uint8_t addr[];
 };
 
-typedef void (*ofi_cmap_free_handle_func)(void *arg);
+typedef struct util_cmap_handle* (*ofi_cmap_alloc_handle_func)(void);
+typedef void (*ofi_cmap_handle_func)(struct util_cmap_handle *handle);
+typedef int (*ofi_cmap_connect_func)(struct util_ep *cmap,
+				     struct util_cmap_handle *handle,
+				     fi_addr_t fi_addr);
+typedef void *(*ofi_cmap_event_handler_func)(void *arg);
+typedef int (*ofi_cmap_signal_func)(struct util_ep *ep, void *context,
+				    enum ofi_cmap_signal signal);
+
+struct util_cmap_attr {
+	void 				*name;
+	ofi_cmap_alloc_handle_func 	alloc;
+	ofi_cmap_handle_func 		close;
+	ofi_cmap_handle_func 		free;
+	ofi_cmap_connect_func 		connect;
+	ofi_cmap_event_handler_func	event_handler;
+	ofi_cmap_signal_func		signal;
+};
 
 struct util_cmap {
+	struct util_ep *ep;
 	struct util_av *av;
-	struct util_cmap_handle **handles;
-	struct util_cmap_keypool *keypool;
+
+	/* cmap handles that correspond to addresses in AV */
+	struct util_cmap_handle **handles_av;
+
+	/* Store all cmap handles (inclusive of handles_av) in an indexer.
+	 * This allows reverse lookup of the handle using the index. */
+	struct indexer handles_idx;
+
+	struct ofi_key_idx key_idx;
+
 	struct dlist_entry peer_list;
-	ofi_cmap_free_handle_func free_handle;
+	struct util_cmap_attr attr;
+	pthread_t event_handler_thread;
 	fastlock_t lock;
 };
 
-void ofi_cmap_update_state(struct util_cmap_handle *handle,
-		enum util_cmap_state state);
-/*
- * Caller must hold cmap->lock. Either fi_addr or
- * addr and addrlen args should be present.
- */
-int ofi_cmap_add_handle(struct util_cmap *cmap, struct util_cmap_handle *handle,
-		enum util_cmap_state state, fi_addr_t fi_addr, void *addr,
-		size_t addrlen);
-/* Caller must hold cmap->lock */
-struct util_cmap_handle *ofi_cmap_get_handle(struct util_cmap *cmap, fi_addr_t fi_addr);
+struct util_cmap_handle *ofi_cmap_key2handle(struct util_cmap *cmap, uint64_t key);
+int ofi_cmap_get_handle(struct util_cmap *cmap, fi_addr_t fi_addr,
+			struct util_cmap_handle **handle);
+
+void ofi_cmap_process_connect(struct util_cmap *cmap,
+			      struct util_cmap_handle *handle,
+			      uint64_t *remote_key);
+void ofi_cmap_process_reject(struct util_cmap *cmap,
+			     struct util_cmap_handle *handle);
+int ofi_cmap_process_connreq(struct util_cmap *cmap, void *addr,
+			     struct util_cmap_handle **handle);
+void ofi_cmap_process_shutdown(struct util_cmap *cmap,
+			       struct util_cmap_handle *handle);
 void ofi_cmap_del_handle(struct util_cmap_handle *handle);
 void ofi_cmap_free(struct util_cmap *cmap);
-struct util_cmap *ofi_cmap_alloc(struct util_av *av,
-		ofi_cmap_free_handle_func free_handle);
+struct util_cmap *ofi_cmap_alloc(struct util_ep *ep,
+				 struct util_cmap_attr *attr);
 
 /*
  * Poll set
@@ -369,7 +511,7 @@ struct util_poll {
 	struct util_domain	*domain;
 	struct dlist_entry	fid_list;
 	fastlock_t		lock;
-	atomic_t		ref;
+	ofi_atomic32_t		ref;
 	const struct fi_provider *prov;
 };
 
@@ -390,7 +532,7 @@ struct util_wait {
 	struct fid_wait		wait_fid;
 	struct util_fabric	*fabric;
 	struct util_poll	*pollset;
-	atomic_t		ref;
+	ofi_atomic32_t		ref;
 	const struct fi_provider *prov;
 
 	enum fi_wait_obj	wait_obj;
@@ -420,7 +562,7 @@ struct util_eq {
 	struct util_fabric	*fabric;
 	struct util_wait	*wait;
 	fastlock_t		lock;
-	atomic_t		ref;
+	ofi_atomic32_t		ref;
 	const struct fi_provider *prov;
 
 	struct slist		list;
@@ -441,74 +583,99 @@ int ofi_eq_create(struct fid_fabric *fabric, struct fi_eq_attr *attr,
 /*
  * MR
  */
+#define OFI_MR_BASIC_MAP (FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR)
 
+#define OFI_CHECK_MR_BASIC(mode) ((mode == FI_MR_BASIC) || \
+				  ((mode & OFI_MR_BASIC_MAP) == OFI_MR_BASIC_MAP))
 
-/*hide addr related info & store prov_mr ptr */
-struct ofi_util_mr {
-    void *map_handle;
-    uint64_t b_key; /* track available key (BASIC usage) */
-    enum fi_mr_mode mr_type;
-    const struct fi_provider *prov;
+#define OFI_CHECK_MR_SCALABLE(mode) (!(mode & OFI_MR_BASIC_MAP))
+
+struct ofi_mr_map {
+	const struct fi_provider *prov;
+	void			*rbtree;
+	uint64_t		key;
+	enum fi_mr_mode		mode;
 };
 
-/*create instance of data structure and return handle to user */
-int ofi_mr_init(const struct fi_provider *in_prov, enum fi_mr_mode mode,
-                                struct ofi_util_mr ** out_new_mr);
-/*insert user mr struct in data structure*/
-int ofi_mr_insert(struct ofi_util_mr * in_mr_h,
-                                const struct fi_mr_attr *in_attr,
-                                uint64_t * out_key, void * in_prov_mr);
-/*return on user mr struct */
-void * ofi_mr_retrieve(struct ofi_util_mr * in_mr_h,  uint64_t in_key);
-/*need address offsetted, verified, and user mr struct returned*/
-/* io_addr is address of buff (&buf) */
-int ofi_mr_retrieve_and_verify(struct ofi_util_mr * in_mr_h, ssize_t in_len,
-                                uintptr_t *io_addr, uint64_t in_key,
-                                uint64_t in_access, void **out_prov_mr);
-/*erase a specific item in the data structure */
-int ofi_mr_erase(struct ofi_util_mr * in_mr_h, uint64_t in_key);
-/*close data structure instance */
-void ofi_mr_close(struct ofi_util_mr *in_mr_h);
+/* If the app sets FI_MR_LOCAL, we ignore FI_LOCAL_MR.  So, if the
+ * app doesn't set FI_MR_LOCAL, we need to check for FI_LOCAL_MR.
+ * The provider is assumed only to set FI_MR_LOCAL correctly.
+ */
+static inline uint64_t ofi_mr_get_prov_mode(uint32_t version,
+					    const struct fi_info *user_info,
+					    const struct fi_info *prov_info)
+{
+	if (FI_VERSION_LT(version, FI_VERSION(1, 5)) ||
+	    (user_info->domain_attr &&
+	     !(user_info->domain_attr->mr_mode & FI_MR_LOCAL))) {
+		return (prov_info->domain_attr->mr_mode & FI_MR_LOCAL) ?
+			prov_info->mode | FI_LOCAL_MR : prov_info->mode;
+	} else {
+		return prov_info->mode;
+	}
+}
 
+int ofi_mr_map_init(const struct fi_provider *in_prov, int mode,
+		    struct ofi_mr_map *map);
+void ofi_mr_map_close(struct ofi_mr_map *map);
+
+int ofi_mr_insert(struct ofi_mr_map *map,
+		  const struct fi_mr_attr *attr,
+		  uint64_t *key, void *context);
+int ofi_mr_remove(struct ofi_mr_map *map, uint64_t key);
+void *ofi_mr_get(struct ofi_mr_map *map,  uint64_t key);
+
+int ofi_mr_verify(struct ofi_mr_map *map, uintptr_t *io_addr,
+		  size_t len, uint64_t key, uint64_t access,
+		  void **context);
 
 
 /*
  * Attributes and capabilities
  */
-#define FI_PRIMARY_CAPS	(FI_MSG | FI_RMA | FI_TAGGED | FI_ATOMICS | \
+#define FI_PRIMARY_CAPS	(FI_MSG | FI_RMA | FI_TAGGED | FI_ATOMICS | FI_MULTICAST | \
 			 FI_NAMED_RX_CTX | FI_DIRECTED_RECV | \
 			 FI_READ | FI_WRITE | FI_RECV | FI_SEND | \
 			 FI_REMOTE_READ | FI_REMOTE_WRITE)
 
 #define FI_SECONDARY_CAPS (FI_MULTI_RECV | FI_SOURCE | FI_RMA_EVENT | \
-			   FI_TRIGGER | FI_FENCE)
+			   FI_SHARED_AV | FI_TRIGGER | FI_FENCE | \
+			   FI_LOCAL_COMM | FI_REMOTE_COMM)
 
-int fi_check_fabric_attr(const struct fi_provider *prov,
-			 const struct fi_fabric_attr *prov_attr,
-			 const struct fi_fabric_attr *user_attr,
-			 enum fi_match_type type);
-int fi_check_wait_attr(const struct fi_provider *prov,
-		       const struct fi_wait_attr *attr);
-int fi_check_domain_attr(const struct fi_provider *prov,
-			 const struct fi_domain_attr *prov_attr,
-			 const struct fi_domain_attr *user_attr,
-			 enum fi_match_type type);
-int fi_check_ep_attr(const struct util_prov *util_prov,
-		     const struct fi_ep_attr *user_attr);
-int fi_check_cq_attr(const struct fi_provider *prov,
-		     const struct fi_cq_attr *attr);
-int fi_check_rx_attr(const struct fi_provider *prov,
-		     const struct fi_rx_attr *prov_attr,
-		     const struct fi_rx_attr *user_attr);
-int fi_check_tx_attr(const struct fi_provider *prov,
-		     const struct fi_tx_attr *prov_attr,
-		     const struct fi_tx_attr *user_attr);
-int fi_check_info(const struct util_prov *util_prov,
-		  const struct fi_info *user_info,
-		  enum fi_match_type type);
-void ofi_alter_info(struct fi_info *info,
-		   const struct fi_info *hints);
+int ofi_check_mr_mode(uint32_t api_version, uint32_t prov_mode,
+			     uint32_t user_mode);
+int ofi_check_fabric_attr(const struct fi_provider *prov,
+			  const struct fi_fabric_attr *prov_attr,
+			  const struct fi_fabric_attr *user_attr);
+int ofi_check_wait_attr(const struct fi_provider *prov,
+		        const struct fi_wait_attr *attr);
+int ofi_check_domain_attr(const struct fi_provider *prov, uint32_t api_version,
+			  const struct fi_domain_attr *prov_attr,
+			  const struct fi_domain_attr *user_attr);
+int ofi_check_ep_attr(const struct util_prov *util_prov, uint32_t api_version,
+		      const struct fi_ep_attr *user_attr);
+int ofi_check_cq_attr(const struct fi_provider *prov,
+		      const struct fi_cq_attr *attr);
+int ofi_check_rx_attr(const struct fi_provider *prov,
+		      const struct fi_rx_attr *prov_attr,
+		      const struct fi_rx_attr *user_attr, uint64_t info_mode);
+int ofi_check_tx_attr(const struct fi_provider *prov,
+		      const struct fi_tx_attr *prov_attr,
+		      const struct fi_tx_attr *user_attr, uint64_t info_mode);
+int ofi_prov_check_info(const struct util_prov *util_prov,
+			uint32_t api_version,
+			const struct fi_info *user_info);
+int ofi_prov_check_dup_info(const struct util_prov *util_prov,
+			    uint32_t api_version,
+			    const struct fi_info *user_info,
+			    struct fi_info **info);
+int ofi_check_info(const struct util_prov *util_prov,
+		   const struct fi_info *prov_info, uint32_t api_version,
+		   const struct fi_info *user_info);
+void ofi_alter_info(struct fi_info *info, const struct fi_info *hints,
+		    uint32_t api_version);
 
+struct fi_info *ofi_allocinfo_internal(void);
 int util_getinfo(const struct util_prov *util_prov, uint32_t version,
 		 const char *node, const char *service, uint64_t flags,
 		 struct fi_info *hints, struct fi_info **info);
@@ -524,27 +691,83 @@ int fid_list_insert(struct dlist_entry *fid_list, fastlock_t *lock,
 void fid_list_remove(struct dlist_entry *fid_list, fastlock_t *lock,
 		     struct fid *fid);
 
-void fi_fabric_insert(struct util_fabric *fabric);
-struct util_fabric *fi_fabric_find(const char *name);
-void fi_fabric_remove(struct util_fabric *fabric);
+void ofi_fabric_insert(struct util_fabric *fabric);
+struct util_fabric *ofi_fabric_find(struct util_fabric_info *fabric_info);
+void ofi_fabric_remove(struct util_fabric *fabric);
 
 /*
- * Layered Providers
+ * Utility Providers
  */
 
-typedef int (*ofi_alter_info_t)(struct fi_info *src_info, struct fi_info *dest_info);
+typedef int (*ofi_alter_info_t)(uint32_t version, struct fi_info *src_info,
+				struct fi_info *dest_info);
 
+int ofi_get_core_info(uint32_t version, const char *node, const char *service,
+		      uint64_t flags, const struct util_prov *util_prov,
+		      struct fi_info *util_hints, ofi_alter_info_t info_to_core,
+		      struct fi_info **core_info);
 int ofix_getinfo(uint32_t version, const char *node, const char *service,
-			uint64_t flags, const struct util_prov *util_prov,
-			struct fi_info *hints,
-			ofi_alter_info_t alter_layer_info,
-			ofi_alter_info_t alter_base_info,
-			int get_base_info, struct fi_info **info);
-char *ofi_strdup_less_prefix(char *name, char *prefix);
-char *ofi_strdup_add_prefix(char *name, char *prefix);
+		 uint64_t flags, const struct util_prov *util_prov,
+		 struct fi_info *hints, ofi_alter_info_t info_to_core,
+		 ofi_alter_info_t info_to_util, struct fi_info **info);
+int ofi_get_core_info_fabric(struct fi_fabric_attr *util_attr,
+			     struct fi_info **core_info);
+
+
+#define OFI_NAME_DELIM	';'
+#define OFI_UTIL_PREFIX "ofi_"
+
+char *ofi_strdup_append(const char *head, const char *tail);
+// char *ofi_strdup_head(const char *str);
+// char *ofi_strdup_tail(const char *str);
+const char *ofi_util_name(const char *prov_name, size_t *len);
+const char *ofi_core_name(const char *prov_name, size_t *len);
+
 
 int ofi_shm_map(struct util_shm *shm, const char *name, size_t size,
 		int readonly, void **mapped);
 int ofi_shm_unmap(struct util_shm *shm);
+
+/*
+ * Name Server TODO: add support for Windows OS
+ * (osd/windows/pthread.h should be extended)
+ */
+
+typedef int(*ofi_ns_service_cmp_func_t)(void *svc1, void *svc2);
+typedef int(*ofi_ns_is_service_wildcard_func_t)(void *svc);
+
+struct util_ns {
+	RbtHandle	ns_map;
+	char		*ns_hostname;
+	int		ns_port;
+	pthread_t	ns_thread;
+
+	size_t	name_len;
+	size_t	service_len;
+
+	ofi_ns_service_cmp_func_t	service_cmp;
+
+	ofi_ns_is_service_wildcard_func_t is_service_wildcard;
+};
+
+struct util_ns_attr {
+	char	*ns_hostname;
+	int	ns_port;
+
+	size_t	name_len;
+	size_t	service_len;
+
+	ofi_ns_service_cmp_func_t	service_cmp;
+
+	ofi_ns_is_service_wildcard_func_t is_service_wildcard;
+};
+
+int ofi_ns_init(struct util_ns_attr *attr, struct util_ns *ns);
+void ofi_ns_start_server(struct util_ns *ns);
+void ofi_ns_stop_server(struct util_ns *ns);
+int ofi_ns_add_local_name(struct util_ns *ns, void *service, void *name);
+int ofi_ns_del_local_name(struct util_ns *ns, void *service, void *name);
+void *ofi_ns_resolve_name(struct util_ns *ns, const char *server,
+			  void *service);
 
 #endif

@@ -53,6 +53,7 @@
 
 #include "sock.h"
 #include "sock_util.h"
+#include <fi_iov.h>
 
 #define SOCK_LOG_DBG(...) _SOCK_LOG_DBG(FI_LOG_EP_DATA, __VA_ARGS__)
 #define SOCK_LOG_ERROR(...) _SOCK_LOG_ERROR(FI_LOG_EP_DATA, __VA_ARGS__)
@@ -63,7 +64,8 @@ ssize_t sock_ep_tx_atomic(struct fid_ep *ep,
 			  size_t compare_count, struct fi_ioc *resultv,
 			  void **result_desc, size_t result_count, uint64_t flags)
 {
-	int i, ret;
+	ssize_t ret;
+	size_t i;
 	size_t datatype_sz;
 	struct sock_op tx_op;
 	union sock_iov tx_iov;
@@ -112,14 +114,14 @@ ssize_t sock_ep_tx_atomic(struct fid_ep *ep,
 
 	if (flags & FI_TRIGGER) {
 		ret = sock_queue_atomic_op(ep, msg, comparev, compare_count,
-					resultv, result_count, flags,
-					SOCK_OP_ATOMIC);
+					   resultv, result_count, flags,
+					   FI_OP_ATOMIC);
 		if (ret != 1)
 			return ret;
 	}
 
 	src_len = cmp_len = 0;
-	datatype_sz = fi_datatype_size(msg->datatype);
+	datatype_sz = ofi_datatype_size(msg->datatype);
 	for (i = 0; i < compare_count; i++)
 		cmp_len += (comparev[i].count * datatype_sz);
 	if (flags & FI_INJECT) {
@@ -139,7 +141,7 @@ ssize_t sock_ep_tx_atomic(struct fid_ep *ep,
 		      (result_count * sizeof(union sock_iov)));
 
 	sock_tx_ctx_start(tx_ctx);
-	if (rbavail(&tx_ctx->rb) < total_len) {
+	if (ofi_rbavail(&tx_ctx->rb) < total_len) {
 		ret = -FI_EAGAIN;
 		goto err;
 	}
@@ -310,7 +312,7 @@ static ssize_t sock_ep_atomic_writev(struct fid_ep *ep,
 			uint64_t addr, uint64_t key,
 			enum fi_datatype datatype, enum fi_op op, void *context)
 {
-	int i;
+	size_t i;
 	struct fi_msg_atomic msg;
 	struct fi_rma_ioc rma_iov;
 
@@ -420,7 +422,7 @@ static ssize_t sock_ep_atomic_readwrite(struct fid_ep *ep,
 	msg.addr = dest_addr;
 
 	rma_iov.addr = addr;
-	rma_iov.count = 1;
+	rma_iov.count = count;
 	rma_iov.key = key;
 	msg.rma_iov = &rma_iov;
 	msg.rma_iov_count = 1;
@@ -429,7 +431,7 @@ static ssize_t sock_ep_atomic_readwrite(struct fid_ep *ep,
 	msg.context = context;
 
 	resultv.addr = result;
-	resultv.count = 1;
+	resultv.count = count;
 
 	return sock_ep_atomic_readwritemsg(ep, &msg, &resultv, &result_desc, 1,
 						SOCK_USE_OP_FLAGS);
@@ -451,7 +453,7 @@ static ssize_t sock_ep_atomic_readwritev(struct fid_ep *ep,
 	msg.addr = dest_addr;
 
 	rma_iov.addr = addr;
-	rma_iov.count = 1;
+	rma_iov.count = ofi_total_ioc_cnt(iov, count);
 	rma_iov.key = key;
 	msg.rma_iov = &rma_iov;
 	msg.rma_iov_count = 1;
@@ -511,7 +513,7 @@ static ssize_t sock_ep_atomic_compwrite(struct fid_ep *ep,
 	msg.addr = dest_addr;
 
 	rma_iov.addr = addr;
-	rma_iov.count = 1;
+	rma_iov.count = count;
 	rma_iov.key = key;
 	msg.rma_iov = &rma_iov;
 	msg.rma_iov_count = 1;
@@ -520,9 +522,9 @@ static ssize_t sock_ep_atomic_compwrite(struct fid_ep *ep,
 	msg.context = context;
 
 	resultv.addr = result;
-	resultv.count = 1;
+	resultv.count = count;
 	comparev.addr = (void *)compare;
-	comparev.count = 1;
+	comparev.count = count;
 
 	return sock_ep_atomic_compwritemsg(ep, &msg, &comparev, &compare_desc,
 			1, &resultv, &result_desc, 1, SOCK_USE_OP_FLAGS);
@@ -545,7 +547,7 @@ static ssize_t sock_ep_atomic_compwritev(struct fid_ep *ep,
 	msg.addr = dest_addr;
 
 	rma_iov.addr = addr;
-	rma_iov.count = 1;
+	rma_iov.count = ofi_total_ioc_cnt(iov, count);
 	rma_iov.key = key;
 	msg.rma_iov = &rma_iov;
 	msg.rma_iov_count = 1;
@@ -553,45 +555,66 @@ static ssize_t sock_ep_atomic_compwritev(struct fid_ep *ep,
 	msg.op = op;
 	msg.context = context;
 
-	return sock_ep_atomic_compwritemsg(ep, &msg, comparev, compare_desc, 1,
-					   resultv, result_desc, 1,
+	return sock_ep_atomic_compwritemsg(ep, &msg,
+					   comparev, compare_desc, compare_count,
+					   resultv, result_desc, result_count,
 					   SOCK_USE_OP_FLAGS);
 }
 
-static int sock_ep_atomic_valid(struct fid_ep *ep, enum fi_datatype datatype,
-			      enum fi_op op, size_t *count)
+/* Domain parameter is ignored, okay to pass in NULL */
+int sock_query_atomic(struct fid_domain *domain,
+		      enum fi_datatype datatype, enum fi_op op,
+		      struct fi_atomic_attr *attr, uint64_t flags)
 {
-	size_t datatype_sz;
+	int ret;
 
-	switch (datatype) {
-	case FI_FLOAT:
-	case FI_DOUBLE:
-	case FI_LONG_DOUBLE:
-		if (op == FI_BOR || op == FI_BAND ||
-		    op == FI_BXOR || op == FI_MSWAP)
-			return -FI_ENOENT;
-		break;
+	ret = ofi_atomic_valid(&sock_prov, datatype, op, flags);
+	if (ret)
+		return ret;
 
-	case FI_FLOAT_COMPLEX:
-	case FI_DOUBLE_COMPLEX:
-	case FI_LONG_DOUBLE_COMPLEX:
-		if (op == FI_BOR      || op == FI_BAND     ||
-		    op == FI_BXOR     || op == FI_MSWAP    ||
-		    op == FI_MIN      || op == FI_MAX      ||
-		    op == FI_CSWAP_LE || op == FI_CSWAP_LT ||
-		    op == FI_CSWAP_GE || op == FI_CSWAP_GT)
-			return -FI_ENOENT;
-	break;
-	default:
-		break;
-	}
+	attr->size = ofi_datatype_size(datatype);
+	if (attr->size == 0)
+		return -FI_EINVAL;
 
-	datatype_sz = fi_datatype_size(datatype);
-	if (datatype_sz == 0)
-		return -FI_ENOENT;
-
-	*count = (SOCK_EP_MAX_ATOMIC_SZ/datatype_sz);
+	attr->count = (SOCK_EP_MAX_ATOMIC_SZ / attr->size);
 	return 0;
+}
+
+static int sock_ep_atomic_valid(struct fid_ep *ep,
+		enum fi_datatype datatype, enum fi_op op, size_t *count)
+{
+	struct fi_atomic_attr attr;
+	int ret;
+
+	ret = sock_query_atomic(NULL, datatype, op, &attr, 0);
+	if (!ret)
+		*count = attr.count;
+	return ret;
+}
+
+static int sock_ep_atomic_fetch_valid(struct fid_ep *ep,
+		enum fi_datatype datatype, enum fi_op op, size_t *count)
+{
+	struct fi_atomic_attr attr;
+	int ret;
+
+	ret = sock_query_atomic(NULL, datatype, op, &attr, FI_FETCH_ATOMIC);
+	if (!ret)
+		*count = attr.count;
+	return ret;
+}
+
+static int sock_ep_atomic_cswap_valid(struct fid_ep *ep,
+		enum fi_datatype datatype, enum fi_op op, size_t *count)
+{
+	struct fi_atomic_attr attr;
+	int ret;
+
+	/* domain parameter is ignored - okay to pass in NULL */
+	ret = sock_query_atomic(NULL, datatype, op, &attr, FI_COMPARE_ATOMIC);
+	if (!ret)
+		*count = attr.count;
+	return ret;
 }
 
 struct fi_ops_atomic sock_ep_atomic = {
@@ -607,6 +630,6 @@ struct fi_ops_atomic sock_ep_atomic = {
 	.compwritev = sock_ep_atomic_compwritev,
 	.compwritemsg = sock_ep_atomic_compwritemsg,
 	.writevalid = sock_ep_atomic_valid,
-	.readwritevalid = sock_ep_atomic_valid,
-	.compwritevalid = sock_ep_atomic_valid,
+	.readwritevalid = sock_ep_atomic_fetch_valid,
+	.compwritevalid = sock_ep_atomic_cswap_valid,
 };

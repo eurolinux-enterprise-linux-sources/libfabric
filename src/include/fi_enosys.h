@@ -1,5 +1,5 @@
 /*
- * Copyright (c); 2014 Intel Corporation. All rights reserved.
+ * Copyright (c) 2014-2017 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -162,6 +162,7 @@ static struct fi_ops_cm X = {
 	.accept = fi_no_accept,
 	.reject = fi_no_reject,
 	.shutdown = fi_no_shutdown,
+	.join = fi_no_join,
 };
 */
 int fi_no_setname(fid_t fid, void *addr, size_t addrlen);
@@ -174,6 +175,8 @@ int fi_no_accept(struct fid_ep *ep, const void *param, size_t paramlen);
 int fi_no_reject(struct fid_pep *pep, fid_t handle,
 		const void *param, size_t paramlen);
 int fi_no_shutdown(struct fid_ep *ep, uint64_t flags);
+int fi_no_join(struct fid_ep *ep, const void *addr, uint64_t flags,
+		struct fid_mc **mc, void *context);
 
 /*
 static struct fi_ops_domain X = {
@@ -186,6 +189,7 @@ static struct fi_ops_domain X = {
 	.poll_open = fi_no_poll_open,
 	.stx_ctx = fi_no_stx_context,
 	.srx_ctx = fi_no_srx_context,
+	.query_atomic = fi_no_query_atomic,
 };
 */
 int fi_no_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
@@ -204,6 +208,9 @@ int fi_no_stx_context(struct fid_domain *domain, struct fi_tx_attr *attr,
 		struct fid_stx **stx, void *context);
 int fi_no_srx_context(struct fid_domain *domain, struct fi_rx_attr *attr,
 		struct fid_ep **rx_ep, void *context);
+int fi_no_query_atomic(struct fid_domain *domain, enum fi_datatype datatype,
+		enum fi_op op, struct fi_atomic_attr *attr, uint64_t flags);
+
 
 /*
 static struct fi_ops_mr X = {

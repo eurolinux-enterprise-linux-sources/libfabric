@@ -1,6 +1,7 @@
 /*
- * Copyright (c) 2015-2016 Cray Inc. All rights reserved.
- * Copyright (c) 2015-2016 Los Alamos National Security, LLC. All rights reserved.
+ * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
+ * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
+ *                         All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -53,7 +54,7 @@ static int __gnix_amo_send_err(struct gnix_fid_ep *ep,
 	if (ep->send_cq) {
 		rc = _gnix_cq_add_error(ep->send_cq, req->user_context,
 					flags, 0, 0, 0, 0, 0, error,
-					GNI_RC_TRANSACTION_ERROR, NULL);
+					GNI_RC_TRANSACTION_ERROR, NULL, 0);
 		if (rc) {
 			GNIX_WARN(FI_LOG_EP_DATA,
 				  "_gnix_cq_add_error() failed: %d\n", rc);
@@ -91,7 +92,7 @@ static int __gnix_amo_send_completion(struct gnix_fid_ep *ep,
 	uint64_t flags = req->flags & GNIX_AMO_COMPLETION_FLAGS;
 
 	if ((req->flags & FI_COMPLETION) && ep->send_cq) {
-		rc = _gnix_cq_add_event(ep->send_cq, req->user_context,
+		rc = _gnix_cq_add_event(ep->send_cq, ep, req->user_context,
 					flags, 0, 0, 0, 0, FI_ADDR_NOTAVAIL);
 		if (rc) {
 			GNIX_WARN(FI_LOG_EP_DATA,
@@ -130,7 +131,7 @@ static void __gnix_amo_fr_complete(struct gnix_fab_req *req)
 		fi_close(&req->amo.loc_md->mr_fid.fid);
 	}
 
-	atomic_dec(&req->vc->outstanding_tx_reqs);
+	ofi_atomic_dec32(&req->vc->outstanding_tx_reqs);
 
 	/* Schedule VC TX queue in case the VC is 'fenced'. */
 	_gnix_vc_tx_schedule(req->vc);
@@ -274,32 +275,11 @@ static int __gnix_amo_txd_complete(void *arg, gni_return_t tx_status)
 	struct gnix_tx_descriptor *txd = (struct gnix_tx_descriptor *)arg;
 	struct gnix_fab_req *req = txd->req;
 	int rc = FI_SUCCESS;
-	uint32_t read_data32;
-	uint64_t read_data64;
 
 	_gnix_nic_tx_free(req->vc->ep->nic, txd);
 
 	if (tx_status != GNI_RC_SUCCESS) {
 		return __gnix_amo_post_err(req, FI_ECANCELED);
-	}
-
-	/* FI_ATOMIC_READ data is delivered to operand buffer in addition to
-	 * the results buffer. */
-	if (req->amo.op == FI_ATOMIC_READ) {
-		switch(fi_datatype_size(req->amo.datatype)) {
-		case sizeof(uint32_t):
-			read_data32 = *(uint32_t *)req->amo.loc_addr;
-			*(uint32_t *)req->amo.read_buf = read_data32;
-			break;
-		case sizeof(uint64_t):
-			read_data64 = *(uint64_t *)req->amo.loc_addr;
-			*(uint64_t *)req->amo.read_buf = read_data64;
-			break;
-		default:
-			GNIX_FATAL(FI_LOG_EP_DATA, "Invalid datatype: %d\n",
-				   req->amo.datatype);
-			break;
-		}
 	}
 
 	if (req->vc->peer_caps & FI_RMA_EVENT) {
@@ -381,16 +361,16 @@ int _gnix_atomic_cmd(enum fi_datatype dt, enum fi_op op,
 	      (fr_type == GNIX_FAB_RQ_NAMO_AX_S) ||
 	      (fr_type == GNIX_FAB_RQ_NAMO_FAX_S)) &&
 	    (dt >= FI_DATATYPE_LAST || op >= FI_ATOMIC_OP_LAST)) {
-		return -FI_ENOENT;
+		return -FI_EOPNOTSUPP;
 	}
 
 	switch(fr_type) {
 	case GNIX_FAB_RQ_AMO:
-		return __gnix_amo_cmds[op][dt] ?: -FI_ENOENT;
+		return __gnix_amo_cmds[op][dt] ?: -FI_EOPNOTSUPP;
 	case GNIX_FAB_RQ_FAMO:
-		return __gnix_fetch_amo_cmds[op][dt] ?: -FI_ENOENT;
+		return __gnix_fetch_amo_cmds[op][dt] ?: -FI_EOPNOTSUPP;
 	case GNIX_FAB_RQ_CAMO:
-		return __gnix_cmp_amo_cmds[op][dt] ?: -FI_ENOENT;
+		return __gnix_cmp_amo_cmds[op][dt] ?: -FI_EOPNOTSUPP;
 	case GNIX_FAB_RQ_NAMO_AX:
 		return GNI_FMA_ATOMIC2_AX;
 	case GNIX_FAB_RQ_NAMO_AX_S:
@@ -403,7 +383,7 @@ int _gnix_atomic_cmd(enum fi_datatype dt, enum fi_op op,
 		break;
 	}
 
-	return -FI_ENOENT;
+	return -FI_EOPNOTSUPP;
 }
 
 int _gnix_amo_post_req(void *data)
@@ -516,6 +496,7 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 	uint64_t compare_operand = 0;
 	void *loc_addr = NULL;
 	int dt_len, dt_align;
+	int connected;
 
 	if (!(flags & FI_INJECT) && !ep->send_cq &&
 	    (((fr_type == GNIX_FAB_RQ_AMO ||
@@ -532,10 +513,17 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 
 
 	if (!ep || !msg || !msg->msg_iov ||
-	    !msg->msg_iov[0].addr ||
 	    msg->msg_iov[0].count != 1 ||
 	    msg->iov_count != GNIX_MAX_ATOMIC_IOV_LIMIT ||
 	    !msg->rma_iov || !msg->rma_iov[0].addr)
+		return -FI_EINVAL;
+
+	/*
+	 * see fi_atomic man page
+	 */
+
+	if ((msg->op != FI_ATOMIC_READ) &&
+		!msg->msg_iov[0].addr)
 		return -FI_EINVAL;
 
 	if (flags & FI_TRIGGER) {
@@ -554,7 +542,7 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 		compare_operand = *(uint64_t *)comparev[0].addr;
 	}
 
-	dt_len = fi_datatype_size(msg->datatype);
+	dt_len = ofi_datatype_size(msg->datatype);
 	dt_align = dt_len - 1;
 	len = dt_len * msg->msg_iov->count;
 
@@ -601,15 +589,6 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 		}
 	}
 
-	/* find VC for target */
-	rc = _gnix_vc_ep_get_vc(ep, msg->addr, &vc);
-	if (rc) {
-		GNIX_INFO(FI_LOG_EP_DATA,
-			  "_gnix_vc_ep_get_vc() failed, addr: %lx, rc:\n",
-			  msg->addr, rc);
-		goto err_get_vc;
-	}
-
 	/* setup fabric request */
 	req = _gnix_fr_alloc(ep);
 	if (!req) {
@@ -620,7 +599,6 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 
 	req->type = fr_type;
 	req->gnix_ep = ep;
-	req->vc = vc;
 	req->user_context = msg->context;
 	req->work_fn = _gnix_amo_post_req;
 
@@ -639,13 +617,7 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 		req->amo.second_operand =
 			*((uint64_t *)(msg->msg_iov[0].addr) + 1);
 	} else if (msg->op == FI_ATOMIC_READ) {
-		/* Atomic reads are the only AMO which write to the operand
-		 * buffer.  It's assumed that this is in addition to writing
-		 * fetched data to the result buffer.  Make the NIC write to
-		 * the result buffer, like all other AMOS, and copy read data
-		 * to the operand buffer after the completion is received. */
 		req->amo.first_operand = 0xFFFFFFFFFFFFFFFF; /* operand to FAND */
-		req->amo.read_buf = msg->msg_iov[0].addr;
 	} else if (msg->op == FI_CSWAP) {
 		req->amo.first_operand = compare_operand;
 		req->amo.second_operand = *(uint64_t *)msg->msg_iov[0].addr;
@@ -675,10 +647,40 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 		req->flags |= FI_COMPLETION;
 	}
 
-	return _gnix_vc_queue_tx_req(req);
+	COND_ACQUIRE(ep->requires_lock, &ep->vc_lock);
 
-err_fr_alloc:
+	/* find VC for target */
+	rc = _gnix_vc_ep_get_vc(ep, msg->addr, &vc);
+	if (rc) {
+		GNIX_INFO(FI_LOG_EP_DATA,
+			  "_gnix_vc_ep_get_vc() failed, addr: %lx, rc:\n",
+			  msg->addr, rc);
+		goto err_get_vc;
+	}
+
+	req->vc = vc;
+
+	rc = _gnix_vc_queue_tx_req(req);
+	connected = (vc->conn_state == GNIX_VC_CONNECTED);
+
+	COND_RELEASE(ep->requires_lock, &ep->vc_lock);
+
+	/*
+	 *If a new VC was allocated, progress CM before returning.
+	 * If the VC is connected and there's a backlog, poke
+	 * the nic progress engine befure returning.
+	 */
+	if (!connected) {
+		_gnix_cm_nic_progress(ep->cm_nic);
+	} else if (!dlist_empty(&vc->tx_queue)) {
+		_gnix_nic_progress(vc->ep->nic);
+	}
+
+	return rc;
+
 err_get_vc:
+	COND_RELEASE(ep->requires_lock, &ep->vc_lock);
+err_fr_alloc:
 	if (auto_mr) {
 		fi_close(&auto_mr->fid);
 	}

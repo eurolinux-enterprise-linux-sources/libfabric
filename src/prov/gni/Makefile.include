@@ -11,6 +11,7 @@ AM_CPPFLAGS += -I$(top_srcdir)/prov/gni/include -I$(top_srcdir)/prov/gni
 
 _gni_files = \
 	prov/gni/src/gnix_atomic.c \
+	prov/gni/src/gnix_auth_key.c \
 	prov/gni/src/gnix_av.c \
 	prov/gni/src/gnix_bitmap.c \
 	prov/gni/src/gnix_buddy_allocator.c \
@@ -34,8 +35,10 @@ _gni_files = \
 	prov/gni/src/gnix_nameserver.c \
 	prov/gni/src/gnix_nic.c \
 	prov/gni/src/gnix_poll.c \
+	prov/gni/src/gnix_progress.c \
 	prov/gni/src/gnix_queue.c \
 	prov/gni/src/gnix_rma.c \
+	prov/gni/src/gnix_sep.c \
 	prov/gni/src/gnix_tags.c \
 	prov/gni/src/gnix_trigger.c \
 	prov/gni/src/gnix_util.c \
@@ -47,9 +50,11 @@ _gni_files = \
 _gni_headers = \
 	prov/gni/include/fi_ext_gni.h \
 	prov/gni/include/gnix_atomic.h \
+	prov/gni/include/gnix_auth_key.h \
 	prov/gni/include/gnix_av.h \
 	prov/gni/include/gnix_bitmap.h \
 	prov/gni/include/gnix_buddy_allocator.h \
+	prov/gni/include/gnix_cm.h \
 	prov/gni/include/gnix_cm_nic.h \
 	prov/gni/include/gnix_cntr.h \
 	prov/gni/include/gnix_cq.h \
@@ -67,6 +72,7 @@ _gni_headers = \
 	prov/gni/include/gnix_nameserver.h \
 	prov/gni/include/gnix_nic.h \
 	prov/gni/include/gnix_poll.h \
+	prov/gni/include/gnix_progress.h \
 	prov/gni/include/gnix_priv.h \
 	prov/gni/include/gnix_queue.h \
 	prov/gni/include/gnix_rma.h \
@@ -78,12 +84,14 @@ _gni_headers = \
 	prov/gni/include/gnix_xpmem.h \
 	prov/gni/include/gnix_wait.h
 
+
 if HAVE_CRITERION
 bin_PROGRAMS += prov/gni/test/gnitest
 bin_SCRIPTS += prov/gni/test/run_gnitest
 nodist_prov_gni_test_gnitest_SOURCES = \
 	prov/gni/test/allocator.c \
 	prov/gni/test/av.c \
+	prov/gni/test/auth_key.c \
 	prov/gni/test/bitmap.c \
 	prov/gni/test/buddy_allocator.c \
 	prov/gni/test/cancel.c \
@@ -94,6 +102,8 @@ nodist_prov_gni_test_gnitest_SOURCES = \
 	prov/gni/test/dom.c \
 	prov/gni/test/ep.c \
 	prov/gni/test/eq.c \
+	prov/gni/test/fabric.c \
+	prov/gni/test/fi_addr_str.c \
 	prov/gni/test/freelist.c \
 	prov/gni/test/hashtable.c \
 	prov/gni/test/mr.c \
@@ -111,11 +121,14 @@ nodist_prov_gni_test_gnitest_SOURCES = \
 	prov/gni/test/api.c \
 	prov/gni/test/api_cq.c \
 	prov/gni/test/api_cntr.c \
+	prov/gni/test/sep.c \
 	prov/gni/test/utils.c \
 	prov/gni/test/vc.c \
 	prov/gni/test/vc_lookup.c \
 	prov/gni/test/vector.c \
 	prov/gni/test/wait.c \
+	prov/gni/test/rdm_dgram_stx.c \
+	prov/gni/test/cm.c \
 	prov/gni/test/common.c
 
 prov_gni_test_gnitest_LDFLAGS = $(CRAY_PMI_LIBS) $(gnitest_LDFLAGS) -static

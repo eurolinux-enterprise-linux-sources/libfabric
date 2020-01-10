@@ -35,6 +35,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <fi_util.h>
+
 #include "sock.h"
 #include "sock_util.h"
 
@@ -47,7 +49,8 @@ const struct fi_domain_attr sock_domain_attr = {
 	.control_progress = FI_PROGRESS_AUTO,
 	.data_progress = FI_PROGRESS_AUTO,
 	.resource_mgmt = FI_RM_ENABLED,
-	.mr_mode = FI_MR_SCALABLE,
+	/* Provider supports basic memory registration mode */
+	.mr_mode = FI_MR_BASIC,
 	.mr_key_size = sizeof(uint64_t),
 	.cq_data_size = sizeof(uint64_t),
 	.cq_cnt = SOCK_EP_MAX_CQ_CNT,
@@ -58,9 +61,13 @@ const struct fi_domain_attr sock_domain_attr = {
 	.max_ep_rx_ctx = SOCK_EP_MAX_RX_CNT,
 	.max_ep_stx_ctx = SOCK_EP_MAX_EP_CNT,
 	.max_ep_srx_ctx = SOCK_EP_MAX_EP_CNT,
+	.cntr_cnt = SOCK_EP_MAX_CNTR_CNT,
+	.mr_iov_limit = SOCK_EP_MAX_IOV_LIMIT,
+	.max_err_data = SOCK_MAX_ERR_CQ_EQ_DATA_SZ,
+	.mr_cnt = SOCK_DOMAIN_MR_CNT,
 };
 
-int sock_verify_domain_attr(struct fi_domain_attr *attr)
+int sock_verify_domain_attr(uint32_t version, struct fi_domain_attr *attr)
 {
 	if (!attr)
 		return 0;
@@ -122,13 +129,10 @@ int sock_verify_domain_attr(struct fi_domain_attr *attr)
 		return -FI_ENODATA;
 	}
 
-	switch (attr->mr_mode) {
-	case FI_MR_UNSPEC:
-	case FI_MR_BASIC:
-	case FI_MR_SCALABLE:
-		break;
-	default:
-		SOCK_LOG_DBG("MR mode not supported\n");
+	if (ofi_check_mr_mode(version, sock_domain_attr.mr_mode,
+			      attr->mr_mode)) {
+		FI_INFO(&sock_prov, FI_LOG_CORE,
+			"Invalid memory registration mode\n");
 		return -FI_ENODATA;
 	}
 
@@ -150,6 +154,18 @@ int sock_verify_domain_attr(struct fi_domain_attr *attr)
 	if (attr->max_ep_rx_ctx > sock_domain_attr.max_ep_rx_ctx)
 		return -FI_ENODATA;
 
+	if (attr->cntr_cnt > sock_domain_attr.cntr_cnt)
+		return -FI_ENODATA;
+
+	if (attr->mr_iov_limit > sock_domain_attr.mr_iov_limit)
+		return -FI_ENODATA;
+
+	if (attr->max_err_data > sock_domain_attr.max_err_data)
+		return -FI_ENODATA;
+
+	if (attr->mr_cnt > sock_domain_attr.mr_cnt)
+		return -FI_ENODATA;
+
 	return 0;
 }
 
@@ -157,12 +173,12 @@ static int sock_dom_close(struct fid *fid)
 {
 	struct sock_domain *dom;
 	dom = container_of(fid, struct sock_domain, dom_fid.fid);
-	if (atomic_get(&dom->ref))
+	if (ofi_atomic_get32(&dom->ref))
 		return -FI_EBUSY;
 
 	sock_pe_finalize(dom->pe);
 	fastlock_destroy(&dom->lock);
-	ofi_mr_close(dom->mr_heap);
+	ofi_mr_map_close(&dom->mr_map);
 	sock_dom_remove_from_list(dom);
 	free(dom);
 	return 0;
@@ -172,20 +188,18 @@ static int sock_mr_close(struct fid *fid)
 {
 	struct sock_domain *dom;
 	struct sock_mr *mr;
-	uint64_t mr_key;
 	int err = 0;
 
 	mr = container_of(fid, struct sock_mr, mr_fid.fid);
 	dom = mr->domain;
-	mr_key = mr->key;
 
 	fastlock_acquire(&dom->lock);
-	err = ofi_mr_erase(dom->mr_heap, mr_key);
+	err = ofi_mr_remove(&dom->mr_map, mr->key);
 	if (err != 0)
 		SOCK_LOG_ERROR("MR Erase error %d \n", err);
 
 	fastlock_release(&dom->lock);
-	atomic_dec(&dom->ref);
+	ofi_atomic_dec32(&dom->ref);
 	free(mr);
 	return 0;
 }
@@ -238,9 +252,8 @@ struct sock_mr *sock_mr_verify_key(struct sock_domain *domain, uint64_t key,
 
 	fastlock_acquire(&domain->lock);
 
-	err = ofi_mr_retrieve_and_verify(domain->mr_heap, len, buf, key, access,
-                                        (void **)&mr);
-	if(err != 0) {
+	err = ofi_mr_verify(&domain->mr_map, buf, len, key, access, (void **) &mr);
+	if (err != 0) {
 		SOCK_LOG_ERROR("MR check failed\n");
 		mr = NULL;
 	}
@@ -286,17 +299,16 @@ static int sock_regattr(struct fid *fid, const struct fi_mr_attr *attr,
 	_mr->domain = dom;
 	_mr->flags = flags;
 
-	ret = ofi_mr_insert(dom->mr_heap, attr, &key, _mr);
+	ret = ofi_mr_insert(&dom->mr_map, attr, &key, _mr);
 	if (ret != 0)
 		goto err;
-
 
 	_mr->mr_fid.key = _mr->key = key;
 	_mr->mr_fid.mem_desc = (void *) (uintptr_t) key;
 	fastlock_release(&dom->lock);
 
 	*mr = &_mr->mr_fid;
-	atomic_inc(&dom->ref);
+	ofi_atomic_inc32(&dom->ref);
 
 	if (dom->mr_eq) {
 		eq_entry.fid = &domain->fid;
@@ -359,6 +371,19 @@ static int sock_dom_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 	return 0;
 }
 
+static int sock_dom_ctrl(struct fid *fid, int command, void *arg)
+{
+	struct sock_domain *dom;
+
+	dom = container_of(fid, struct sock_domain, dom_fid.fid);
+	switch (command) {
+	case FI_QUEUE_WORK:
+		return sock_queue_work(dom, arg);
+	default:
+		return -FI_ENOSYS;
+	}
+}
+
 static int sock_endpoint(struct fid_domain *domain, struct fi_info *info,
 			 struct fid_ep **ep, void *context)
 {
@@ -393,7 +418,7 @@ static struct fi_ops sock_dom_fi_ops = {
 	.size = sizeof(struct fi_ops),
 	.close = sock_dom_close,
 	.bind = sock_dom_bind,
-	.control = fi_no_control,
+	.control = sock_dom_ctrl,
 	.ops_open = fi_no_ops_open,
 };
 
@@ -407,6 +432,7 @@ static struct fi_ops_domain sock_dom_ops = {
 	.poll_open = sock_poll_open,
 	.stx_ctx = sock_stx_ctx,
 	.srx_ctx = sock_srx_ctx,
+	.query_atomic = sock_query_atomic,
 };
 
 static struct fi_ops_mr sock_dom_mr_ops = {
@@ -425,7 +451,7 @@ int sock_domain(struct fid_fabric *fabric, struct fi_info *info,
 
 	fab = container_of(fabric, struct sock_fabric, fab_fid);
 	if (info && info->domain_attr) {
-		ret = sock_verify_domain_attr(info->domain_attr);
+		ret = sock_verify_domain_attr(fabric->api_version, info->domain_attr);
 		if (ret)
 			return -FI_EINVAL;
 	}
@@ -435,13 +461,13 @@ int sock_domain(struct fid_fabric *fabric, struct fi_info *info,
 		return -FI_ENOMEM;
 
 	fastlock_init(&sock_domain->lock);
-	atomic_initialize(&sock_domain->ref, 0);
+	ofi_atomic_initialize32(&sock_domain->ref, 0);
 
 	if (info) {
 		sock_domain->info = *info;
 	} else {
 		SOCK_LOG_ERROR("invalid fi_info\n");
-		goto err;
+		goto err1;
 	}
 
 	sock_domain->dom_fid.fid.fclass = FI_CLASS_DOMAIN;
@@ -459,7 +485,7 @@ int sock_domain(struct fid_fabric *fabric, struct fi_info *info,
 	sock_domain->pe = sock_pe_init(sock_domain);
 	if (!sock_domain->pe) {
 		SOCK_LOG_ERROR("Failed to init PE\n");
-		goto err;
+		goto err1;
 	}
 
 	sock_domain->fab = fab;
@@ -470,15 +496,18 @@ int sock_domain(struct fid_fabric *fabric, struct fi_info *info,
 	else
 		sock_domain->attr = sock_domain_attr;
 
-	ret = ofi_mr_init(&sock_prov, sock_domain->attr.mr_mode, &sock_domain->mr_heap);
-	if (!ret) {
-		return ret;
-	}
+	ret = ofi_mr_map_init(&sock_prov, sock_domain->attr.mr_mode,
+			      &sock_domain->mr_map);
+	if (ret)
+		goto err2;
 
 	sock_dom_add_to_list(sock_domain);
 	return 0;
 
-err:
+err2:
+	sock_pe_finalize(sock_domain->pe);
+err1:
+	fastlock_destroy(&sock_domain->lock);
 	free(sock_domain);
 	return -FI_EINVAL;
 }

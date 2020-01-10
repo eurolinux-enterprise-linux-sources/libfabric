@@ -44,34 +44,27 @@
 #define VERBS_ANY_FABRIC "Any RDMA fabric"
 
 #define VERBS_MSG_CAPS (FI_MSG | FI_RMA | FI_ATOMICS | FI_READ | FI_WRITE | \
-			FI_SEND | FI_RECV | FI_REMOTE_READ | FI_REMOTE_WRITE)
+			FI_SEND | FI_RECV | FI_REMOTE_READ | FI_REMOTE_WRITE | \
+			FI_LOCAL_COMM | FI_REMOTE_COMM)
 
 #define VERBS_RDM_CAPS (FI_MSG | FI_RMA | FI_TAGGED | FI_READ | FI_WRITE |	\
-			FI_RECV | FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE )
+			FI_RECV | FI_MULTI_RECV | FI_SEND | FI_REMOTE_READ |	\
+			FI_REMOTE_WRITE )
 
-#define VERBS_MODE (FI_LOCAL_MR)
 #define VERBS_RDM_MODE (FI_CONTEXT)
 
 #define VERBS_TX_OP_FLAGS (FI_INJECT | FI_COMPLETION | FI_TRANSMIT_COMPLETE)
 #define VERBS_TX_OP_FLAGS_IWARP (FI_INJECT | FI_COMPLETION)
 #define VERBS_TX_OP_FLAGS_IWARP_RDM (VERBS_TX_OP_FLAGS)
 
-#define VERBS_TX_MODE VERBS_MODE
 #define VERBS_TX_RDM_MODE VERBS_RDM_MODE
 
-#define VERBS_RX_MODE (FI_LOCAL_MR | FI_RX_CQ_DATA)
+#define VERBS_RX_MODE (FI_RX_CQ_DATA)
 
 #define VERBS_RX_RDM_OP_FLAGS (FI_COMPLETION)
 
 #define VERBS_MSG_ORDER (FI_ORDER_RAR | FI_ORDER_RAW | FI_ORDER_RAS | \
 		FI_ORDER_WAW | FI_ORDER_WAS | FI_ORDER_SAW | FI_ORDER_SAS )
-
-
-static char def_tx_ctx_size[16] = "384";
-static char def_rx_ctx_size[16] = "384";
-static char def_tx_iov_limit[16] = "4";
-static char def_rx_iov_limit[16] = "4";
-static char def_inject_size[16] = "64";
 
 const struct fi_fabric_attr verbs_fabric_attr = {
 	.prov_version		= VERBS_PROV_VERS,
@@ -81,13 +74,17 @@ const struct fi_domain_attr verbs_domain_attr = {
 	.threading		= FI_THREAD_SAFE,
 	.control_progress	= FI_PROGRESS_AUTO,
 	.data_progress		= FI_PROGRESS_AUTO,
-	.mr_mode		= FI_MR_BASIC,
+	.resource_mgmt		= FI_RM_ENABLED,
+	.mr_mode		= OFI_MR_BASIC_MAP | FI_MR_LOCAL | FI_MR_BASIC,
 	.mr_key_size		= sizeof_field(struct ibv_sge, lkey),
 	.cq_data_size		= sizeof_field(struct ibv_send_wr, imm_data),
 	.tx_ctx_cnt		= 1024,
 	.rx_ctx_cnt		= 1024,
 	.max_ep_tx_ctx		= 1,
 	.max_ep_rx_ctx		= 1,
+	.mr_iov_limit		= 1,
+	/* max_err_data is size of ibv_wc::vendor_err for CQ, 0 - for EQ */
+	.max_err_data		= sizeof_field(struct ibv_wc, vendor_err),
 };
 
 const struct fi_ep_attr verbs_ep_attr = {
@@ -102,11 +99,12 @@ const struct fi_ep_attr verbs_ep_attr = {
 const struct fi_rx_attr verbs_rx_attr = {
 	.mode			= VERBS_RX_MODE,
 	.msg_order		= VERBS_MSG_ORDER,
+	.comp_order		= FI_ORDER_STRICT | FI_ORDER_DATA,
 	.total_buffered_recv	= 0,
 };
 
 const struct fi_rx_attr verbs_rdm_rx_attr = {
-	.mode			= VERBS_RX_MODE,
+	.mode			= VERBS_RDM_MODE | VERBS_RX_MODE,
 	.op_flags		= VERBS_RX_RDM_OP_FLAGS,
 	.msg_order		= VERBS_MSG_ORDER,
 	.total_buffered_recv	= 0,
@@ -114,11 +112,11 @@ const struct fi_rx_attr verbs_rdm_rx_attr = {
 };
 
 const struct fi_tx_attr verbs_tx_attr = {
-	.mode			= VERBS_TX_MODE,
+	.mode			= 0,
 	.op_flags		= VERBS_TX_OP_FLAGS,
 	.msg_order		= VERBS_MSG_ORDER,
+	.comp_order		= FI_ORDER_STRICT,
 	.inject_size		= 0,
-	.rma_iov_limit		= 1,
 };
 
 const struct fi_tx_attr verbs_rdm_tx_attr = {
@@ -147,126 +145,16 @@ struct fi_ibv_rdm_sysaddr
 	int is_found;
 };
 
-static struct fi_info *verbs_info = NULL;
+struct fi_info *verbs_info = NULL;
 static pthread_mutex_t verbs_info_lock = PTHREAD_MUTEX_INITIALIZER;
-
-int fi_ibv_check_fabric_attr(const struct fi_fabric_attr *attr,
-			     const struct fi_info *info)
-{
-	if (attr->name && strcmp(attr->name, info->fabric_attr->name)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE, "Unknown fabric name\n");
-		return -FI_ENODATA;
-	}
-
-	if (attr->prov_version > info->fabric_attr->prov_version) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Unsupported provider version\n");
-		return -FI_ENODATA;
-	}
-
-	return 0;
-}
-
-int fi_ibv_check_domain_attr(const struct fi_domain_attr *attr,
-			     const struct fi_info *info)
-{
-	if (attr->name && strcmp(attr->name, info->domain_attr->name)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE, "Unknown domain name\n");
-		return -FI_ENODATA;
-	}
-
-	switch (attr->threading) {
-	case FI_THREAD_UNSPEC:
-	case FI_THREAD_SAFE:
-	case FI_THREAD_FID:
-	case FI_THREAD_DOMAIN:
-	case FI_THREAD_COMPLETION:
-	case FI_THREAD_ENDPOINT:
-		break;
-	default:
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Invalid threading model\n");
-		return -FI_ENODATA;
-	}
-
-	switch (attr->control_progress) {
-	case FI_PROGRESS_UNSPEC:
-	case FI_PROGRESS_AUTO:
-	case FI_PROGRESS_MANUAL:
-		break;
-	default:
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given control progress mode not supported\n");
-		return -FI_ENODATA;
-	}
-
-	switch (attr->data_progress) {
-	case FI_PROGRESS_UNSPEC:
-	case FI_PROGRESS_AUTO:
-	case FI_PROGRESS_MANUAL:
-		break;
-	default:
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given data progress mode not supported!\n");
-		return -FI_ENODATA;
-	}
-
-	switch (attr->mr_mode) {
-	case FI_MR_UNSPEC:
-	case FI_MR_BASIC:
-		break;
-	default:
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"MR mode not supported\n");
-		return -FI_ENODATA;
-	}
-
-	if (attr->mr_key_size > info->domain_attr->mr_key_size) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"MR key size too large\n");
-		return -FI_ENODATA;
-	}
-
-	if (attr->cq_data_size > info->domain_attr->cq_data_size) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"CQ data size too large\n");
-		return -FI_ENODATA;
-	}
-
-	if (attr->cq_cnt > info->domain_attr->cq_cnt) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"cq_cnt exceeds supported size\n");
-		return -FI_ENODATA;
-	}
-
-	if (attr->ep_cnt > info->domain_attr->ep_cnt) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"ep_cnt exceeds supported size\n");
-		return -FI_ENODATA;
-	}
-
-	if (attr->max_ep_tx_ctx > info->domain_attr->max_ep_tx_ctx) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"domain_attr: max_ep_tx_ctx exceeds supported size\n");
-		return -FI_ENODATA;
-	}
-
-	if (attr->max_ep_rx_ctx > info->domain_attr->max_ep_rx_ctx) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"domain_attr: max_ep_rx_ctx exceeds supported size\n");
-		return -FI_ENODATA;
-	}
-
-	return 0;
-}
 
 int fi_ibv_check_ep_attr(const struct fi_ep_attr *attr,
 			 const struct fi_info *info)
 {
 	if ((attr->type != FI_EP_UNSPEC) &&
 	    (attr->type != info->ep_attr->type)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Unsupported endpoint type\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Unsupported endpoint type\n");
 		return -FI_ENODATA;
 	}
 
@@ -279,51 +167,83 @@ int fi_ibv_check_ep_attr(const struct fi_ep_attr *attr,
 	case FI_PROTO_IWARP_RDM:
 		break;
 	default:
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Unsupported protocol\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Unsupported protocol\n");
 		return -FI_ENODATA;
 	}
 
 	if (attr->protocol_version > 1) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Unsupported protocol version\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Unsupported protocol version\n");
 		return -FI_ENODATA;
 	}
 
 	if (attr->max_msg_size > info->ep_attr->max_msg_size) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Max message size too large\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Max message size too large\n");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, info->ep_attr, attr,
+				  max_msg_size);
 		return -FI_ENODATA;
 	}
 
 	if (attr->max_order_raw_size > info->ep_attr->max_order_raw_size) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"max_order_raw_size exceeds supported size\n");
+		VERBS_INFO( FI_LOG_CORE,
+			   "max_order_raw_size exceeds supported size\n");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, info->ep_attr, attr,
+				  max_order_raw_size);
 		return -FI_ENODATA;
 	}
 
 	if (attr->max_order_war_size) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"max_order_war_size exceeds supported size\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "max_order_war_size exceeds supported size\n");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, info->ep_attr, attr,
+				  max_order_war_size);
 		return -FI_ENODATA;
 	}
 
 	if (attr->max_order_waw_size > info->ep_attr->max_order_waw_size) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"max_order_waw_size exceeds supported size\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "max_order_waw_size exceeds supported size\n");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, info->ep_attr, attr,
+				  max_order_waw_size);
 		return -FI_ENODATA;
 	}
 
 	if (attr->tx_ctx_cnt > info->domain_attr->max_ep_tx_ctx) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"tx_ctx_cnt exceeds supported size\n");
-		return -FI_ENODATA;
+		if (attr->tx_ctx_cnt != FI_SHARED_CONTEXT) {
+			VERBS_INFO(FI_LOG_CORE,
+				   "tx_ctx_cnt exceeds supported size\n");
+			VERBS_INFO(FI_LOG_CORE, "Supported: %zd\nRequested: %zd\n",
+				   info->domain_attr->max_ep_tx_ctx, attr->tx_ctx_cnt);
+			return -FI_ENODATA;
+		} else if (!info->domain_attr->max_ep_stx_ctx) {
+			VERBS_INFO(FI_LOG_CORE,
+				   "Shared tx context not supported\n");
+			return -FI_ENODATA;
+		}
 	}
 
-	if ((attr->rx_ctx_cnt > info->domain_attr->max_ep_rx_ctx) &&
-			(attr->rx_ctx_cnt != FI_SHARED_CONTEXT)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"rx_ctx_cnt exceeds supported size\n");
+	if ((attr->rx_ctx_cnt > info->domain_attr->max_ep_rx_ctx)) {
+		if (attr->rx_ctx_cnt != FI_SHARED_CONTEXT) {
+			VERBS_INFO(FI_LOG_CORE,
+				   "rx_ctx_cnt exceeds supported size\n");
+			VERBS_INFO(FI_LOG_CORE, "Supported: %zd\nRequested: %zd\n",
+				   info->domain_attr->max_ep_rx_ctx,
+				   attr->rx_ctx_cnt);
+			return -FI_ENODATA;
+		} else if (!info->domain_attr->max_ep_srx_ctx) {
+			VERBS_INFO(FI_LOG_CORE,
+				   "Shared rx context not supported\n");
+			return -FI_ENODATA;
+		}
+	}
+
+	if (attr->auth_key_size &&
+	    (attr->auth_key_size != info->ep_attr->auth_key_size)) {
+		VERBS_INFO(FI_LOG_CORE, "Unsupported authentication size.");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, info->ep_attr, attr,
+				  auth_key_size);
 		return -FI_ENODATA;
 	}
 
@@ -337,37 +257,39 @@ int fi_ibv_check_rx_attr(const struct fi_rx_attr *attr,
 	int rm_enabled;
 
 	if (attr->caps & ~(info->rx_attr->caps)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given rx_attr->caps not supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given rx_attr->caps not supported\n");
 		return -FI_ENODATA;
 	}
 
 	compare_mode = attr->mode ? attr->mode : hints->mode;
-	
-	check_mode = FI_IBV_EP_TYPE_IS_RDM(info) ? VERBS_RDM_MODE :
-		(hints->caps & FI_RMA) ? info->rx_attr->mode : VERBS_MODE;
+
+	check_mode = (hints->domain_attr && hints->domain_attr->cq_data_size) ?
+		info->rx_attr->mode : (info->rx_attr->mode & ~FI_RX_CQ_DATA);
 
 	if ((compare_mode & check_mode) != check_mode) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given rx_attr->mode not supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given rx_attr->mode not supported\n");
+		FI_INFO_MODE(&fi_ibv_prov, check_mode, compare_mode);
 		return -FI_ENODATA;
 	}
 
 	if (attr->op_flags & ~(info->rx_attr->op_flags)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given rx_attr->op_flags not supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given rx_attr->op_flags not supported\n");
 		return -FI_ENODATA;
 	}
 
 	if (attr->msg_order & ~(info->rx_attr->msg_order)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given rx_attr->msg_order not supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given rx_attr->msg_order not supported\n");
 		return -FI_ENODATA;
 	}
 
 	if (attr->size > info->rx_attr->size) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given rx_attr->size is greater than supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given rx_attr->size is greater than supported\n");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, info->rx_attr, attr, size);
 		return -FI_ENODATA;
 	}
 
@@ -377,14 +299,19 @@ int fi_ibv_check_rx_attr(const struct fi_rx_attr *attr,
 	if (!rm_enabled &&
 	    (attr->total_buffered_recv > info->rx_attr->total_buffered_recv))
 	{
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given rx_attr->total_buffered_recv exceeds supported size\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given rx_attr->total_buffered_recv "
+			   "exceeds supported size\n");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, info->rx_attr, attr,
+				  total_buffered_recv);
 		return -FI_ENODATA;
 	}
 
 	if (attr->iov_limit > info->rx_attr->iov_limit) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given rx_attr->iov_limit greater than supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given rx_attr->iov_limit greater than supported\n");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, info->rx_attr, attr,
+				  iov_limit);
 		return -FI_ENODATA;
 	}
 
@@ -395,77 +322,89 @@ int fi_ibv_check_tx_attr(const struct fi_tx_attr *attr,
 			 const struct fi_info *hints, const struct fi_info *info)
 {
 	if (attr->caps & ~(info->tx_attr->caps)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given tx_attr->caps not supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given tx_attr->caps not supported\n");
+		FI_INFO_CHECK(&fi_ibv_prov, (info->tx_attr), attr, caps, FI_TYPE_CAPS);
 		return -FI_ENODATA;
 	}
 
 	if (((attr->mode ? attr->mode : hints->mode) &
-				info->tx_attr->mode) != info->tx_attr->mode) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given tx_attr->mode not supported\n");
+	     info->tx_attr->mode) != info->tx_attr->mode) {
+		size_t user_mode = (attr->mode ? attr->mode : hints->mode);
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given tx_attr->mode not supported\n");
+		FI_INFO_MODE(&fi_ibv_prov, info->tx_attr->mode, user_mode);
 		return -FI_ENODATA;
 	}
 
 	if (attr->op_flags & ~(info->tx_attr->op_flags)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given tx_attr->op_flags not supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given tx_attr->op_flags not supported\n");
 		return -FI_ENODATA;
 	}
 
 	if (attr->msg_order & ~(info->tx_attr->msg_order)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given tx_attr->msg_order not supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given tx_attr->msg_order not supported\n");
 		return -FI_ENODATA;
 	}
 
 	if (attr->size > info->tx_attr->size) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given tx_attr->size is greater than supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given tx_attr->size is greater than supported\n");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, (info->tx_attr), attr, size);
 		return -FI_ENODATA;
 	}
 
 	if (attr->iov_limit > info->tx_attr->iov_limit) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given tx_attr->iov_limit greater than supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given tx_attr->iov_limit greater than supported\n");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, (info->tx_attr), attr,
+				  iov_limit);
 		return -FI_ENODATA;
 	}
 
 	if (attr->rma_iov_limit > info->tx_attr->rma_iov_limit) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Given tx_attr->rma_iov_limit greater than supported\n");
+		VERBS_INFO(FI_LOG_CORE,
+			   "Given tx_attr->rma_iov_limit greater than supported\n");
+		FI_INFO_CHECK_VAL(&fi_ibv_prov, (info->tx_attr), attr,
+				  rma_iov_limit);
 		return -FI_ENODATA;
 	}
 
 	return 0;
 }
 
-static int fi_ibv_check_hints(const struct fi_info *hints,
+static int fi_ibv_check_hints(uint32_t version, const struct fi_info *hints,
 		const struct fi_info *info)
 {
 	int ret;
+	uint64_t prov_mode;
 
 	if (hints->caps & ~(info->caps)) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Unsupported capabilities\n");
+		VERBS_INFO(FI_LOG_CORE, "Unsupported capabilities\n");
+		FI_INFO_CHECK(&fi_ibv_prov, info, hints, caps, FI_TYPE_CAPS);
 		return -FI_ENODATA;
 	}
 
-	if ((hints->mode & info->mode) != info->mode) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-			"Required hints mode bits not set. Expected:0x%llx"
-			" Given:0x%llx\n", info->mode, hints->mode);
+	prov_mode = ofi_mr_get_prov_mode(version, hints, info);
+
+	if ((hints->mode & prov_mode) != prov_mode) {
+		VERBS_INFO(FI_LOG_CORE, "needed mode not set\n");
+		FI_INFO_MODE(&fi_ibv_prov, prov_mode, hints->mode);
 		return -FI_ENODATA;
 	}
 
 	if (hints->fabric_attr) {
-		ret = fi_ibv_check_fabric_attr(hints->fabric_attr, info);
+		ret = ofi_check_fabric_attr(&fi_ibv_prov, info->fabric_attr,
+					    hints->fabric_attr);
 		if (ret)
 			return ret;
 	}
 
 	if (hints->domain_attr) {
-		ret = fi_ibv_check_domain_attr(hints->domain_attr, info);
+		ret = ofi_check_domain_attr(&fi_ibv_prov, version, info->domain_attr,
+					    hints->domain_attr);
 		if (ret)
 			return ret;
 	}
@@ -553,7 +492,7 @@ static int fi_ibv_rai_to_fi(struct rdma_addrinfo *rai, struct fi_info *fi)
 {
 	fi->addr_format = ofi_translate_addr_format(rai->ai_family);
 	if (fi->addr_format == FI_FORMAT_UNSPEC) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_FABRIC, "Unknown address format\n");
+		VERBS_WARN(FI_LOG_FABRIC, "Unknown address format\n");
 		return -FI_EINVAL;
 	}
 
@@ -576,7 +515,6 @@ static int fi_ibv_rai_to_fi(struct rdma_addrinfo *rai, struct fi_info *fi)
 }
 
 static inline int fi_ibv_get_qp_cap(struct ibv_context *ctx,
-				    struct ibv_device_attr *device_attr,
 				    struct fi_info *info)
 {
 	struct ibv_pd *pd;
@@ -598,26 +536,15 @@ static inline int fi_ibv_get_qp_cap(struct ibv_context *ctx,
 		goto err1;
 	}
 
-	/* TODO: serialize access to string buffers */
-	fi_read_file(FI_CONF_DIR, "def_tx_ctx_size",
-			def_tx_ctx_size, sizeof def_tx_ctx_size);
-	fi_read_file(FI_CONF_DIR, "def_rx_ctx_size",
-			def_rx_ctx_size, sizeof def_rx_ctx_size);
-	fi_read_file(FI_CONF_DIR, "def_tx_iov_limit",
-			def_tx_iov_limit, sizeof def_tx_iov_limit);
-	fi_read_file(FI_CONF_DIR, "def_rx_iov_limit",
-			def_rx_iov_limit, sizeof def_rx_iov_limit);
-	fi_read_file(FI_CONF_DIR, "def_inject_size",
-			def_inject_size, sizeof def_inject_size);
-
 	memset(&init_attr, 0, sizeof init_attr);
 	init_attr.send_cq = cq;
 	init_attr.recv_cq = cq;
-	init_attr.cap.max_send_wr = MIN(atoi(def_tx_ctx_size), device_attr->max_qp_wr);
-	init_attr.cap.max_recv_wr = MIN(atoi(def_rx_ctx_size), device_attr->max_qp_wr);
-	init_attr.cap.max_send_sge = MIN(atoi(def_tx_iov_limit), device_attr->max_sge);
-	init_attr.cap.max_recv_sge = MIN(atoi(def_rx_iov_limit), device_attr->max_sge);
-	init_attr.cap.max_inline_data = atoi(def_inject_size);
+	init_attr.cap.max_send_wr = verbs_default_tx_size;
+	init_attr.cap.max_recv_wr = verbs_default_rx_size;
+	init_attr.cap.max_send_sge = verbs_default_tx_iov_limit;
+	init_attr.cap.max_recv_sge = verbs_default_rx_iov_limit;
+	init_attr.cap.max_inline_data = verbs_default_inline_size;
+
 	init_attr.qp_type = IBV_QPT_RC;
 
 	qp = ibv_create_qp(pd, &init_attr);
@@ -627,17 +554,7 @@ static inline int fi_ibv_get_qp_cap(struct ibv_context *ctx,
 		goto err2;
 	}
 
-	info->tx_attr->inject_size	= init_attr.cap.max_inline_data;
-	info->tx_attr->iov_limit 	= init_attr.cap.max_send_sge;
-	info->tx_attr->size	 	= init_attr.cap.max_send_wr;
-
-	info->rx_attr->iov_limit 	= init_attr.cap.max_recv_sge;
-	/*
-	 * On some HW ibv_create_qp can increase max_recv_wr value more than
-	 * it really supports. So, alignment with device capability is needed.
-	 */
-	info->rx_attr->size	 	= MIN(init_attr.cap.max_recv_wr,
-						device_attr->max_qp_wr);
+	info->tx_attr->inject_size = init_attr.cap.max_inline_data;
 
 	ibv_destroy_qp(qp);
 err2:
@@ -664,10 +581,28 @@ static int fi_ibv_get_device_attrs(struct ibv_context *ctx, struct fi_info *info
 	info->domain_attr->ep_cnt 		= device_attr.max_qp;
 	info->domain_attr->tx_ctx_cnt 		= MIN(info->domain_attr->tx_ctx_cnt, device_attr.max_qp);
 	info->domain_attr->rx_ctx_cnt 		= MIN(info->domain_attr->rx_ctx_cnt, device_attr.max_qp);
-	info->domain_attr->max_ep_tx_ctx 	= device_attr.max_qp;
-	info->domain_attr->max_ep_rx_ctx 	= device_attr.max_qp;
+	info->domain_attr->max_ep_tx_ctx 	= MIN(info->domain_attr->tx_ctx_cnt, device_attr.max_qp);
+	info->domain_attr->max_ep_rx_ctx 	= MIN(info->domain_attr->rx_ctx_cnt, device_attr.max_qp);
+	info->domain_attr->max_ep_srx_ctx	= device_attr.max_srq;
+	info->domain_attr->mr_cnt		= device_attr.max_mr;
 
-	ret = fi_ibv_get_qp_cap(ctx, &device_attr, info);
+	if (info->ep_attr->type == FI_EP_RDM)
+		info->domain_attr->cntr_cnt	= device_attr.max_qp * 4;
+
+	info->tx_attr->size 			= device_attr.max_qp_wr;
+	info->tx_attr->iov_limit 		= device_attr.max_sge;
+	info->tx_attr->rma_iov_limit		= device_attr.max_sge;
+
+	info->rx_attr->size 			= device_attr.max_srq_wr ?
+						  MIN(device_attr.max_qp_wr,
+						      device_attr.max_srq_wr) :
+						      device_attr.max_qp_wr;
+	info->rx_attr->iov_limit 		= device_attr.max_srq_sge ?
+						  MIN(device_attr.max_sge,
+						      device_attr.max_srq_sge) :
+						  device_attr.max_sge;
+
+	ret = fi_ibv_get_qp_cap(ctx, info);
 	if (ret)
 		return ret;
 
@@ -731,7 +666,6 @@ static int fi_ibv_alloc_info(struct ibv_context *ctx, struct fi_info **info,
 		fi->mode	= VERBS_RDM_MODE;
 		*(fi->tx_attr)	= verbs_rdm_tx_attr;
 	} else {
-		fi->mode	= VERBS_MODE;
 		*(fi->tx_attr)	= verbs_tx_attr;
 	}
 
@@ -739,6 +673,10 @@ static int fi_ibv_alloc_info(struct ibv_context *ctx, struct fi_info **info,
 				? verbs_rdm_rx_attr : verbs_rx_attr;
 	*(fi->ep_attr)		= verbs_ep_attr;
 	*(fi->domain_attr)	= verbs_domain_attr;
+
+	if (ep_dom->type == FI_EP_RDM)
+		fi->domain_attr->mr_mode &= ~FI_MR_LOCAL;
+
 	*(fi->fabric_attr)	= verbs_fabric_attr;
 
 	fi->ep_attr->type	= ep_dom->type;
@@ -757,14 +695,14 @@ static int fi_ibv_alloc_info(struct ibv_context *ctx, struct fi_info **info,
 			if (param > sizeof (struct fi_ibv_rdm_rndv_header)) {
 				fi->tx_attr->inject_size = param;
 			} else {
-				FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-					"rdm_buffer_size too small, should be greater then %d\n",
-					sizeof (struct fi_ibv_rdm_rndv_header));
+				VERBS_INFO(FI_LOG_CORE,
+					   "rdm_buffer_size too small, "
+					   "should be greater then %d\n",
+					   sizeof (struct fi_ibv_rdm_rndv_header));
 				ret = -FI_EINVAL;
 				goto err;
 			}
 		}
-		fi->domain_attr->resource_mgmt = FI_RM_ENABLED;
 	}
 
 	switch (ctx->device->transport_type) {
@@ -802,9 +740,14 @@ static int fi_ibv_alloc_info(struct ibv_context *ctx, struct fi_info **info,
 			fi->ep_attr->protocol = FI_PROTO_IWARP_RDM;
 			fi->tx_attr->op_flags = VERBS_TX_OP_FLAGS_IWARP_RDM;
 		}
+
+		/* TODO Some iWarp HW may support immediate data as per RFC 7306
+		 * (RDMA Protocol Extensions). Update this to figure out if the
+		 * hw supports immediate data dynamically */
+		fi->domain_attr->cq_data_size = 0;
 		break;
 	default:
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE, "Unknown transport type\n");
+		VERBS_INFO(FI_LOG_CORE, "Unknown transport type\n");
 		ret = -FI_ENODATA;
 		goto err;
 	}
@@ -833,9 +776,9 @@ static void fi_ibv_verbs_devs_free(struct dlist_entry *verbs_devs)
 	struct verbs_addr *addr;
 
 	while (!dlist_empty(verbs_devs)) {
-		dlist_pop_front_container(verbs_devs, dev, entry);
+		dlist_pop_front(verbs_devs, struct verbs_dev_info, dev, entry);
 		while (!dlist_empty(&dev->addrs)) {
-			dlist_pop_front_container(&dev->addrs, addr, entry);
+			dlist_pop_front(&dev->addrs, struct verbs_addr, addr, entry);
 			rdma_freeaddrinfo(addr->rai);
 			free(addr);
 		}
@@ -857,7 +800,7 @@ static int fi_ibv_add_rai(struct dlist_entry *verbs_devs, struct rdma_cm_id *id,
 	addr->rai = rai;
 
 	dev_name = ibv_get_device_name(id->verbs->device);
-	dlist_foreach_container(verbs_devs, dev, entry)
+	dlist_foreach_container(verbs_devs, struct verbs_dev_info, dev, entry)
 		if (!strcmp(dev_name, dev->name))
 			goto add_rai;
 
@@ -893,10 +836,10 @@ static int fi_ibv_getifaddrs(struct dlist_entry *verbs_devs)
 	size_t iface_len = 0;
 	int exact_match = 0;
 
-	ret = getifaddrs(&ifaddr);
+	ret = ofi_getifaddrs(&ifaddr);
 	if (ret) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_FABRIC,
-				"Unable to get interface addresses\n");
+		VERBS_WARN(FI_LOG_FABRIC,
+			   "Unable to get interface addresses\n");
 		return ret;
 	}
 
@@ -941,9 +884,10 @@ static int fi_ibv_getifaddrs(struct dlist_entry *verbs_devs)
 			continue;
 		}
 		if (!ret_ptr) {
-			FI_WARN(&fi_ibv_prov, FI_LOG_FABRIC,
-					"inet_ntop failed: %s(%d)\n",
-					strerror(errno), errno);
+			VERBS_WARN(FI_LOG_FABRIC,
+				   "inet_ntop failed: %s(%d)\n",
+				   strerror(errno), errno);
+			ret = -errno;
 			goto err1;
 		}
 
@@ -956,9 +900,9 @@ static int fi_ibv_getifaddrs(struct dlist_entry *verbs_devs)
 		if (ret)
 			goto err2;
 
-		FI_DBG(&fi_ibv_prov, FI_LOG_FABRIC,
-			"Found active interface for verbs device: %s with address: %s\n",
-			ibv_get_device_name(id->verbs->device), name);
+		VERBS_DBG(FI_LOG_FABRIC, "Found active interface for verbs device: "
+			  "%s with address: %s\n",
+			  ibv_get_device_name(id->verbs->device), name);
 
 		rdma_destroy_ep(id);
 
@@ -989,14 +933,14 @@ static int fi_ibv_get_srcaddr_devs(struct fi_info **info)
 		return ret;
 
 	if (dlist_empty(&verbs_devs)) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_CORE, "No interface address found\n");
+		VERBS_WARN(FI_LOG_CORE, "No interface address found\n");
 		return 0;
 	}
 
 	for (fi = *info; fi; fi = fi->next) {
-		dlist_foreach_container(&verbs_devs, dev, entry)
+		dlist_foreach_container(&verbs_devs, struct verbs_dev_info, dev, entry)
 			if (!strncmp(fi->domain_attr->name, dev->name, strlen(dev->name))) {
-				dlist_foreach_container(&dev->addrs, addr, entry) {
+				dlist_foreach_container(&dev->addrs, struct verbs_addr, addr, entry) {
 					/* When a device has multiple interfaces/addresses configured
 					 * duplicate fi_info and add the address info. fi->src_addr
 					 * would have been set in the previous iteration */
@@ -1071,13 +1015,6 @@ static void fi_ibv_sockaddr_set_port(struct sockaddr *sa, uint16_t port)
 	}
 }
 
-static inline int fi_ibv_is_loopback(struct sockaddr *addr)
-{
-	assert(addr);
-	return addr->sa_family == AF_INET &&
-	       ((struct sockaddr_in *)addr)->sin_addr.s_addr == ntohl(INADDR_LOOPBACK);
-}
-
 static int fi_ibv_fill_addr(struct rdma_addrinfo *rai, struct fi_info **info,
 		struct rdma_cm_id *id)
 {
@@ -1085,7 +1022,12 @@ static int fi_ibv_fill_addr(struct rdma_addrinfo *rai, struct fi_info **info,
 	struct sockaddr *local_addr;
 	int ret;
 
-	if (rai->ai_src_addr && !fi_ibv_is_loopback(rai->ai_src_addr))
+	/*
+	 * TODO MPICH CH3 doesn't work with verbs provider without skipping the
+	 * loopback address. An alternative approach if there is one is needed
+	 * to allow both.
+	 */
+	if (rai->ai_src_addr && !ofi_is_loopback_addr(rai->ai_src_addr))
 		goto rai_to_fi;
 
 	if (!id->verbs)
@@ -1096,8 +1038,8 @@ static int fi_ibv_fill_addr(struct rdma_addrinfo *rai, struct fi_info **info,
 	 * corresponds to a valid dest addr) */
 	local_addr = rdma_get_local_addr(id);
 	if (!local_addr) {
-		FI_WARN(&fi_ibv_prov, FI_LOG_CORE,
-				"Unable to get local address\n");
+		VERBS_WARN(FI_LOG_CORE,
+			   "Unable to get local address\n");
 		return -FI_ENODATA;
 	}
 
@@ -1136,16 +1078,16 @@ int fi_ibv_init_info(void)
 	fi_param_get_bool(NULL, "fork_unsafe", &fork_unsafe);
 
 	if (!fork_unsafe) {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE, "Enabling IB fork support\n");
+		VERBS_INFO(FI_LOG_CORE, "Enabling IB fork support\n");
 		ret = ibv_fork_init();
 		if (ret) {
-			FI_WARN(&fi_ibv_prov, FI_LOG_CORE,
-					"Enabling IB fork support failed: %s (%d)\n",
-					strerror(ret), ret);
+			VERBS_WARN(FI_LOG_CORE,
+				   "Enabling IB fork support failed: %s (%d)\n",
+				   strerror(ret), ret);
 			goto unlock;
 		}
 	} else {
-		FI_INFO(&fi_ibv_prov, FI_LOG_CORE, "Not enabling IB fork support\n");
+		VERBS_INFO(FI_LOG_CORE, "Not enabling IB fork support\n");
 	}
 
 	if (!fi_ibv_have_device()) {
@@ -1187,42 +1129,6 @@ unlock:
 	return ret;
 }
 
-void fi_ibv_update_info(const struct fi_info *hints, struct fi_info *info)
-{
-	if (hints) {
-		if (hints->ep_attr) {
-			if (hints->ep_attr->tx_ctx_cnt)
-				info->ep_attr->tx_ctx_cnt = hints->ep_attr->tx_ctx_cnt;
-			if (hints->ep_attr->rx_ctx_cnt)
-				info->ep_attr->rx_ctx_cnt = hints->ep_attr->rx_ctx_cnt;
-		}
-
-		if (hints->tx_attr)
-			info->tx_attr->op_flags = hints->tx_attr->op_flags;
-
-		if (hints->rx_attr)
-			info->rx_attr->op_flags = hints->rx_attr->op_flags;
-
-		if (hints->handle)
-			info->handle = hints->handle;
-	} else {
-		info->tx_attr->op_flags = 0;
-		info->rx_attr->op_flags = 0;
-	}
-}
-
-int fi_ibv_find_fabric(const struct fi_fabric_attr *attr)
-{
-	struct fi_info *fi;
-
-	for (fi = verbs_info; fi; fi = fi->next) {
-		if (!fi_ibv_check_fabric_attr(attr, fi))
-			return 0;
-	}
-
-	return -FI_ENODATA;
-}
-
 struct fi_info *fi_ibv_get_verbs_info(const char *domain_name)
 {
 	struct fi_info *fi;
@@ -1235,8 +1141,61 @@ struct fi_info *fi_ibv_get_verbs_info(const char *domain_name)
 	return NULL;
 }
 
-static int fi_ibv_get_matching_info(const char *dev_name, struct fi_info *hints,
-		struct fi_info **info)
+static int fi_ibv_set_default_attr(struct fi_info *info, size_t *attr,
+				   size_t default_attr, char *attr_str)
+{
+	if (default_attr > *attr) {
+		VERBS_WARN(FI_LOG_FABRIC, "Ignoring provider default value "
+			   "for %s as it is greater than the value supported "
+			   "by domain: %s\n", attr_str, info->domain_attr->name);
+	} else {
+		*attr = default_attr;
+	}
+	return 0;
+}
+
+/* Set default values for attributes. ofi_alter_info would change them if the
+ * user has asked for a different value in hints */
+static int fi_ibv_set_default_info(struct fi_info *info)
+{
+	int ret;
+
+	ret = fi_ibv_set_default_attr(info, &info->tx_attr->size,
+				      verbs_default_tx_size, "tx context size");
+	if (ret)
+		return ret;
+
+	ret = fi_ibv_set_default_attr(info, &info->rx_attr->size,
+				    verbs_default_rx_size, "rx context size");
+	if (ret)
+		return ret;
+
+	/* Don't set defaults for verb/RDM as it supports an iov limit of just 1 */
+	if (info->ep_attr->type != FI_EP_RDM) {
+		ret = fi_ibv_set_default_attr(info, &info->tx_attr->iov_limit,
+					      verbs_default_tx_iov_limit,
+					      "tx iov_limit");
+		if (ret)
+			return ret;
+
+		/* For verbs iov limit is same for both regular messages and RMA */
+		ret = fi_ibv_set_default_attr(info, &info->tx_attr->rma_iov_limit,
+					      verbs_default_tx_iov_limit,
+					      "tx rma_iov_limit");
+		if (ret)
+			return ret;
+
+		ret = fi_ibv_set_default_attr(info, &info->rx_attr->iov_limit,
+					      verbs_default_rx_iov_limit,
+					      "rx iov_limit");
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int fi_ibv_get_matching_info(uint32_t version, const char *dev_name,
+		struct fi_info *hints, struct fi_info **info)
 {
 	struct fi_info *check_info;
 	struct fi_info *fi, *tail;
@@ -1251,7 +1210,7 @@ static int fi_ibv_get_matching_info(const char *dev_name, struct fi_info *hints,
 			continue;
 
 		if (hints) {
-			ret = fi_ibv_check_hints(hints, check_info);
+			ret = fi_ibv_check_hints(version, hints, check_info);
 			if (ret)
 				continue;
 		}
@@ -1261,7 +1220,11 @@ static int fi_ibv_get_matching_info(const char *dev_name, struct fi_info *hints,
 			goto err1;
 		}
 
-		fi_ibv_update_info(hints, fi);
+		ret = fi_ibv_set_default_info(fi);
+		if (ret) {
+			fi_freeinfo(fi);
+			continue;
+		}
 
 		if (!*info)
 			*info = fi;
@@ -1285,6 +1248,7 @@ int fi_ibv_getinfo(uint32_t version, const char *node, const char *service,
 	struct rdma_cm_id *id = NULL;
 	struct rdma_addrinfo *rai;
 	const char *dev_name = NULL;
+	struct fi_info *cur;
 	int ret;
 
 	ret = fi_ibv_init_info();
@@ -1298,7 +1262,7 @@ int fi_ibv_getinfo(uint32_t version, const char *node, const char *service,
 	if (id->verbs)
 		dev_name = ibv_get_device_name(id->verbs->device);
 
-	ret = fi_ibv_get_matching_info(dev_name, hints, info);
+	ret = fi_ibv_get_matching_info(version, dev_name, hints, info);
 	if (ret)
 		goto err;
 
@@ -1308,7 +1272,12 @@ int fi_ibv_getinfo(uint32_t version, const char *node, const char *service,
 		goto err;
 	}
 
-	ofi_alter_info(*info, hints);
+	ofi_alter_info(*info, hints, version);
+
+	if (!hints || !(hints->mode & FI_RX_CQ_DATA)) {
+		for (cur = *info; cur; cur = cur->next)
+			cur->domain_attr->cq_data_size = 0;
+	}
 err:
 	fi_ibv_destroy_ep(rai, &id);
 out:

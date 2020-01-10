@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -38,14 +38,14 @@ struct psmx2_fid_mr *psmx2_mr_get(struct psmx2_fid_domain *domain,
 	RbtIterator it;
 	struct psmx2_fid_mr *mr = NULL;
 
-	fastlock_acquire(&domain->mr_lock);
+	psmx2_lock(&domain->mr_lock, 1);
 	it = rbtFind(domain->mr_map, (void *)key);
 	if (!it)
 		goto exit;
 
 	rbtKeyValue(domain->mr_map, it, (void **)&key, (void **)&mr);
 exit:
-	fastlock_release(&domain->mr_lock);
+	psmx2_unlock(&domain->mr_lock, 1);
 	return mr;
 }
 
@@ -54,11 +54,11 @@ static inline void psmx2_mr_release_key(struct psmx2_fid_domain *domain,
 {
 	RbtIterator it;
 
-	fastlock_acquire(&domain->mr_lock);
+	psmx2_lock(&domain->mr_lock, 1);
 	it = rbtFind(domain->mr_map, (void *)key);
 	if (it)
 		rbtErase(domain->mr_map, it);
-	fastlock_release(&domain->mr_lock);
+	psmx2_unlock(&domain->mr_lock, 1);
 }
 
 static int psmx2_mr_reserve_key(struct psmx2_fid_domain *domain,
@@ -71,20 +71,20 @@ static int psmx2_mr_reserve_key(struct psmx2_fid_domain *domain,
 	int try_count;
 	int err = -FI_ENOKEY;
 
-	fastlock_acquire(&domain->mr_lock);
+	psmx2_lock(&domain->mr_lock, 1);
 
-	if (domain->mr_mode == FI_MR_SCALABLE) {
-		key = requested_key;
-		try_count = 1;
-	} else {
+	if (domain->mr_mode == FI_MR_BASIC) {
 		key = domain->mr_reserved_key;
 		try_count = 10000; /* large enough */
+	} else {
+		key = requested_key;
+		try_count = 1;
 	}
 
 	for (i=0; i<try_count; i++, key++) {
 		if (!rbtFind(domain->mr_map, (void *)key)) {
 			if (!rbtInsert(domain->mr_map, (void *)key, mr)) {
-				if (domain->mr_mode != FI_MR_SCALABLE)
+				if (domain->mr_mode == FI_MR_BASIC)
 					domain->mr_reserved_key = key + 1;
 				*assigned_key = key;
 				err = 0;
@@ -93,7 +93,7 @@ static int psmx2_mr_reserve_key(struct psmx2_fid_domain *domain,
 		}
 	}
 
-	fastlock_release(&domain->mr_lock);
+	psmx2_unlock(&domain->mr_lock, 1);
 
 	return err;
 }
@@ -156,6 +156,7 @@ static int psmx2_mr_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 		if (mr->domain != cntr->domain)
 			return -FI_EINVAL;
 		mr->cntr = cntr;
+		cntr->trx_ctxt = PSMX2_ALL_TRX_CTXT;
 		break;
 
 	default:
@@ -275,9 +276,8 @@ static int psmx2_mr_reg(struct fid *fid, const void *buf, size_t len,
 	mr_priv->iov_count = 1;
 	mr_priv->iov[0].iov_base = (void *)buf;
 	mr_priv->iov[0].iov_len = len;
-	mr_priv->offset = (domain_priv->mr_mode == FI_MR_SCALABLE) ?
-				((uint64_t)mr_priv->iov[0].iov_base - offset) :
-				0;
+	mr_priv->offset = (domain_priv->mr_mode == FI_MR_BASIC) ? 0 :
+				((uint64_t)mr_priv->iov[0].iov_base - offset);
 
 	*mr = &mr_priv->mr;
 	return 0;
@@ -331,9 +331,8 @@ static int psmx2_mr_regv(struct fid *fid,
 	for (i=0; i<count; i++)
 		mr_priv->iov[i] = iov[i];
 	psmx2_mr_normalize_iov(mr_priv->iov, &mr_priv->iov_count);
-	mr_priv->offset = (domain_priv->mr_mode == FI_MR_SCALABLE) ?
-				((uint64_t)mr_priv->iov[0].iov_base - offset) :
-				0;
+	mr_priv->offset = (domain_priv->mr_mode == FI_MR_BASIC) ? 0 :
+				((uint64_t)mr_priv->iov[0].iov_base - offset);
 
 	*mr = &mr_priv->mr;
 	return 0;
@@ -387,9 +386,8 @@ static int psmx2_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
 	for (i=0; i<attr->iov_count; i++)
 		mr_priv->iov[i] = attr->mr_iov[i];
 	psmx2_mr_normalize_iov(mr_priv->iov, &mr_priv->iov_count);
-	mr_priv->offset = (domain_priv->mr_mode == FI_MR_SCALABLE) ?
-				((uint64_t)mr_priv->iov[0].iov_base - attr->offset) :
-				0;
+	mr_priv->offset = (domain_priv->mr_mode == FI_MR_BASIC) ? 0 :
+				((uint64_t)mr_priv->iov[0].iov_base - attr->offset);
 
 	*mr = &mr_priv->mr;
 	return 0;

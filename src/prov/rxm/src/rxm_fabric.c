@@ -49,23 +49,9 @@ static struct fi_ops_fabric rxm_fabric_ops = {
 static int rxm_fabric_close(fid_t fid)
 {
 	struct rxm_fabric *rxm_fabric;
-	struct fi_eq_entry entry = {0};
-	ssize_t rd;
 	int ret;
 
 	rxm_fabric = container_of(fid, struct rxm_fabric, util_fabric.fabric_fid.fid);
-
-	rd = fi_eq_write(rxm_fabric->msg_eq, FI_NOTIFY, &entry, sizeof(entry), 0);
-	if (rd != sizeof(entry)) {
-		FI_WARN(&rxm_prov, FI_LOG_FABRIC, "Unable to notify listener thread\n");
-		return rd;
-	}
-
-	pthread_join(rxm_fabric->msg_listener_thread, NULL);
-
-	ret = fi_close(&rxm_fabric->msg_eq->fid);
-	if (ret)
-		return ret;
 
 	ret = fi_close(&rxm_fabric->msg_fabric->fid);
 	if (ret)
@@ -88,11 +74,10 @@ static struct fi_ops rxm_fabric_fi_ops = {
 };
 
 int rxm_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
-		void *context)
+	       void *context)
 {
 	struct rxm_fabric *rxm_fabric;
-	struct fi_info hints, *msg_info;
-	struct fi_eq_attr eq_attr;
+	struct fi_info *msg_info;
 	int ret;
 
 	rxm_fabric = calloc(1, sizeof(*rxm_fabric));
@@ -100,62 +85,29 @@ int rxm_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
 		return -FI_ENOMEM;
 
 	ret = ofi_fabric_init(&rxm_prov, &rxm_fabric_attr, attr,
-			     &rxm_fabric->util_fabric, context, FI_MATCH_PREFIX);
+			      &rxm_fabric->util_fabric, context);
 	if (ret)
 		goto err1;
 
-	memset(&hints, 0, sizeof hints);
-	if (!(hints.fabric_attr = calloc(1, sizeof(*hints.fabric_attr)))) {
-		ret = -FI_ENOMEM;
-		goto err2;
-	}
-	hints.fabric_attr->name = attr->name;
-	hints.mode = rxm_info.mode;
-
-	ret = ofix_getinfo(rxm_prov.version, NULL, NULL, 0, &rxm_util_prov,
-			&hints, rxm_alter_layer_info,
-			rxm_alter_base_info, 1, &msg_info);
+	ret = ofi_get_core_info_fabric(attr, &msg_info);
 	if (ret) {
+		FI_WARN(&rxm_prov, FI_LOG_FABRIC, "Unable to get core info!\n");
 		ret = -FI_EINVAL;
-		goto err3;
+		goto err2;
 	}
 
 	ret = fi_fabric(msg_info->fabric_attr, &rxm_fabric->msg_fabric, context);
 	if (ret) {
-		goto err4;
+		goto err3;
 	}
-
-	eq_attr.wait_obj = FI_WAIT_UNSPEC;
-	eq_attr.flags = FI_WRITE;
-
-	ret = fi_eq_open(rxm_fabric->msg_fabric, &eq_attr, &rxm_fabric->msg_eq, NULL);
-	if (ret) {
-		FI_WARN(&rxm_prov, FI_LOG_FABRIC, "Unable to open msg EQ\n");
-		goto err5;
-	}
-
-	if (pthread_create(&rxm_fabric->msg_listener_thread, 0,
-				rxm_msg_listener, rxm_fabric)) {
-		ret = -errno;
-		FI_WARN(&rxm_prov, FI_LOG_FABRIC, "Unable to create msg_cm_listener_thread\n");
-		goto err6;
-	}
-
 	*fabric = &rxm_fabric->util_fabric.fabric_fid;
 	(*fabric)->fid.ops = &rxm_fabric_fi_ops;
 	(*fabric)->ops = &rxm_fabric_ops;
 
-	free(hints.fabric_attr);
 	fi_freeinfo(msg_info);
 	return 0;
-err6:
-	fi_close(&rxm_fabric->msg_eq->fid);
-err5:
-	fi_close(&rxm_fabric->msg_fabric->fid);
-err4:
-	fi_freeinfo(msg_info);
 err3:
-	free(hints.fabric_attr);
+	fi_freeinfo(msg_info);
 err2:
 	ofi_fabric_close(&rxm_fabric->util_fabric);
 err1:

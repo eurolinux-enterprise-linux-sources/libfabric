@@ -114,15 +114,15 @@ USNIC_INI ;
 #  define USNIC_INIT NULL
 #endif
 
-#if (HAVE_MXM) && (HAVE_MXM_DL)
-#  define MXM_INI FI_EXT_INI
-#  define MXM_INIT NULL
-#elif (HAVE_MXM)
-#  define MXM_INI INI_SIG(fi_mxm_ini)
-#  define MXM_INIT fi_mxm_ini()
-MXM_INI ;
+#if (HAVE_MLX) && (HAVE_MLX_DL)
+#  define MLX_INI FI_EXT_INI
+#  define MLX_INIT NULL
+#elif (HAVE_MLX)
+#  define MLX_INI INI_SIG(fi_mlx_ini)
+#  define MLX_INIT fi_mlx_ini()
+MLX_INI ;
 #else
-#  define MXM_INIT NULL
+#  define MLX_INIT NULL
 #endif
 
 #if (HAVE_UDP) && (HAVE_UDP_DL)
@@ -157,5 +157,31 @@ RXD_INI ;
 #else
 #  define RXD_INIT NULL
 #endif
+
+#if (HAVE_BGQ) && (HAVE_BGQ_DL)
+#  define BGQ_INI FI_EXT_INI
+#  define BGQ_INIT NULL
+#elif (HAVE_BGQ)
+#  define BGQ_INI INI_SIG(fi_bgq_ini)
+#  define BGQ_INIT fi_bgq_ini()
+BGQ_INI ;
+#else
+#  define BGQ_INIT NULL
+#endif
+
+#ifdef _WIN32
+#if (HAVE_NETDIR) && (HAVE_NETDIR_DL)
+#  define NETDIR_INI FI_EXT_INI
+#  define NETDIR_INIT NULL
+#elif (HAVE_NETDIR)
+#  define NETDIR_INI INI_SIG(fi_netdir_ini)
+#  define NETDIR_INIT fi_netdir_ini()
+NETDIR_INI ;
+#else
+#  define NETDIR_INIT NULL
+#endif
+#else /* _WIN32 */
+#  define NETDIR_INIT NULL
+#endif /* _WIN32 */
 
 #endif /* _PROV_H_ */

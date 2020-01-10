@@ -37,7 +37,6 @@
 #include "../fi_verbs.h"
 #include "verbs_queuing.h"
 
-
 struct util_buf_pool *fi_ibv_rdm_request_pool;
 struct util_buf_pool *fi_ibv_rdm_postponed_pool;
 
@@ -60,16 +59,18 @@ static ssize_t fi_ibv_rdm_tagged_cq_readfrom(struct fid_cq *cq, void *buf,
 	     cq_entry;
 	     cq_entry = (ret < count) ? fi_ibv_rdm_take_first_from_cq(_cq) : NULL)
 	{
-		FI_DBG(&fi_ibv_prov, FI_LOG_CQ,
-			"\t\t-> found in ready: %p op_ctx %p, len %lu, tag 0x%llx\n",
-			cq_entry, cq_entry->context, cq_entry->len,
-			cq_entry->minfo.tag);
+		VERBS_DBG(FI_LOG_CQ,
+			  "\t\t-> found in ready: %p op_ctx %p, len %lu, tag 0x%llx\n",
+			  cq_entry, cq_entry->context, cq_entry->len,
+			  cq_entry->minfo.tag);
 
 		src_addr[ret] =
 			_cq->ep->av->conn_to_addr(_cq->ep, cq_entry->minfo.conn);
 		entry[ret].op_context = cq_entry->context;
 		entry[ret].flags = (cq_entry->comp_flags & ~FI_COMPLETION);
 		entry[ret].len = cq_entry->len;
+		entry[ret].buf = (cq_entry->comp_flags & FI_TRANSMIT) ?
+			cq_entry->src_addr : cq_entry->dest_buf;
 		entry[ret].data = cq_entry->imm;
 		entry[ret].tag = cq_entry->minfo.tag;
 
@@ -87,7 +88,6 @@ static ssize_t fi_ibv_rdm_tagged_cq_readfrom(struct fid_cq *cq, void *buf,
 		if (fi_ibv_rdm_tagged_poll(_cq->ep) < 0) {
 			VERBS_INFO(FI_LOG_CQ, "fi_ibv_rdm_tagged_poll failed\n");
 		}
-
 		if (!dlist_empty(&_cq->request_errcq)) {
 			ret = -FI_EAVAIL;
 		}
@@ -112,12 +112,13 @@ ssize_t fi_ibv_rdm_cq_sreadfrom(struct fid_cq *cq, void *buf, size_t count,
 				int timeout)
 {
 	size_t threshold = count;
-	uint64_t time_limit = fi_gettime_ms() + timeout;
+	uint64_t time_limit =
+		((timeout < 0) ? SIZE_MAX : (fi_gettime_ms() + timeout));
 	size_t counter = 0;
 	ssize_t ret = 0;
 	struct fi_cq_tagged_entry *cqe_buf = buf;
-
-	struct fi_ibv_rdm_cq *_cq = container_of(cq, struct fi_ibv_rdm_cq, cq_fid);
+	struct fi_ibv_rdm_cq *_cq = container_of(cq, struct fi_ibv_rdm_cq,
+						 cq_fid);
 	switch (_cq->wait_cond) {
 	case FI_CQ_COND_THRESHOLD:
 		threshold = MIN((uintptr_t) cond, threshold);
@@ -133,8 +134,9 @@ ssize_t fi_ibv_rdm_cq_sreadfrom(struct fid_cq *cq, void *buf, size_t count,
 						    threshold - counter,
 						    src_addr);
 		counter += (ret > 0) ? ret : 0;
-	} while ((ret >= 0) && (counter < threshold ||
-		(timeout >= 0 && fi_gettime_ms() < time_limit)));
+	} while ((ret >= 0 || ret == -FI_EAGAIN) &&
+		 (counter < threshold) &&
+		 (fi_gettime_ms() < time_limit));
 
 	if (counter != 0 && ret >= 0) {
 		ret = counter;
@@ -184,6 +186,7 @@ fi_ibv_rdm_cq_readerr(struct fid_cq *cq_fid, struct fi_cq_err_entry *entry,
                              uint64_t flags)
 {
 	ssize_t ret = 0;
+	uint32_t api_version;
 	struct fi_ibv_rdm_cq *cq =
 		container_of(cq_fid, struct fi_ibv_rdm_cq, cq_fid.fid);
 
@@ -200,7 +203,13 @@ fi_ibv_rdm_cq_readerr(struct fid_cq *cq_fid, struct fi_cq_err_entry *entry,
 		entry->olen = -1; /* TODO: */
 		entry->err = err_request->state.err;
 		entry->prov_errno = -err_request->state.err;
-		entry->err_data = NULL;
+
+		api_version = cq->domain->fab->util_fabric.fabric_fid.api_version;
+
+		if (!entry->err_data_size)
+			entry->err_data = NULL;
+		else if (FI_VERSION_GE(api_version, FI_VERSION(1, 5)))
+			entry->err_data_size = 0;
 
 		if (err_request->state.eager == FI_IBV_STATE_EAGER_READY_TO_FREE) {
 			FI_IBV_RDM_DBG_REQUEST("to_pool: ", err_request,
@@ -307,8 +316,8 @@ int fi_ibv_rdm_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 		if (param > 0) {
 			_cq->read_bunch_size = param;
 		} else {
-			FI_INFO(&fi_ibv_prov, FI_LOG_CORE,
-				"invalid value of rdm_cqread_bunch_size\n");
+			VERBS_INFO(FI_LOG_CORE,
+				   "invalid value of rdm_cqread_bunch_size\n");
 			ret = -FI_EINVAL;
 			goto err;
 		}

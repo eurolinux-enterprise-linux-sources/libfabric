@@ -212,6 +212,11 @@ int fi_no_shutdown(struct fid_ep *ep, uint64_t flags)
 {
 	return -FI_ENOSYS;
 }
+int fi_no_join(struct fid_ep *ep, const void *addr, uint64_t flags,
+			  struct fid_mc **mc, void *context)
+{
+	return -FI_ENOSYS;
+}
 
 /*
  * struct fi_ops_av
@@ -257,6 +262,11 @@ int fi_no_stx_context(struct fid_domain *domain, struct fi_tx_attr *attr,
 }
 int fi_no_srx_context(struct fid_domain *domain, struct fi_rx_attr *attr,
 		struct fid_ep **rx_ep, void *context)
+{
+	return -FI_ENOSYS;
+}
+int fi_no_query_atomic(struct fid_domain *domain, enum fi_datatype datatype,
+		enum fi_op op, struct fi_atomic_attr *attr, uint64_t flags)
 {
 	return -FI_ENOSYS;
 }
@@ -395,6 +405,15 @@ ssize_t fi_no_eq_sread(struct fid_eq *eq, uint32_t *event,
 /*
  * struct fi_ops_cq
  */
+ssize_t fi_no_cq_read(struct fid_cq *cq, void *buf, size_t count)
+{
+	return -FI_ENOSYS;
+}
+ssize_t fi_no_cq_readerr(struct fid_cq *cq, struct fi_cq_err_entry *buf,
+		                uint64_t flags)
+{
+	return -FI_ENOSYS;
+}
 ssize_t fi_no_cq_readfrom(struct fid_cq *cq, void *buf, size_t count,
 		fi_addr_t *src_addr)
 {

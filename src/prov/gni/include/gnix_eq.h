@@ -35,6 +35,7 @@
 #define _GNIX_EQ_H_
 
 #include <rdma/fi_eq.h>
+#include <stdbool.h>
 
 #include "gnix_queue.h"
 #include "gnix_wait.h"
@@ -42,10 +43,8 @@
 
 #define GNIX_EQ_DEFAULT_SIZE 256
 
-ssize_t _gnix_eq_write_error(struct fid_eq *eq, fid_t fid,
-			     void *context, uint64_t index, int err,
-			     int prov_errno, void *err_data,
-			     size_t err_size);
+extern struct dlist_entry gnix_eq_list;
+extern pthread_mutex_t gnix_eq_list_lock;
 
 /*
  * Stores events inside of the event queue.
@@ -65,12 +64,25 @@ struct gnix_eq_entry {
 	struct slist_entry item;
 };
 
+struct gnix_eq_poll_obj {
+	struct dlist_entry list;
+	struct fid *obj_fid;
+};
+
+struct gnix_eq_err_buf {
+	struct dlist_entry dlist;
+	int do_free;
+	char buf[];
+};
+
 /*
  * EQ structure. Contains error and event queue.
  */
 struct gnix_fid_eq {
 	struct fid_eq eq_fid;
 	struct gnix_fid_fabric *fabric;
+
+	bool requires_lock;
 
 	struct gnix_queue *events;
 	struct gnix_queue *errors;
@@ -81,6 +93,22 @@ struct gnix_fid_eq {
 
 	fastlock_t lock;
 	struct gnix_reference ref_cnt;
+
+	rwlock_t poll_obj_lock;
+	struct dlist_entry poll_objs;
+	struct dlist_entry gnix_fid_eq_list;
+
+	struct dlist_entry err_bufs;
 };
+
+ssize_t _gnix_eq_write_error(struct gnix_fid_eq *eq, fid_t fid,
+			     void *context, uint64_t index, int err,
+			     int prov_errno, void *err_data,
+			     size_t err_size);
+
+int _gnix_eq_progress(struct gnix_fid_eq *eq);
+
+int _gnix_eq_poll_obj_add(struct gnix_fid_eq *eq, struct fid *obj_fid);
+int _gnix_eq_poll_obj_rem(struct gnix_fid_eq *eq, struct fid *obj_fid);
 
 #endif /* _GNIX_EQ_H_ */

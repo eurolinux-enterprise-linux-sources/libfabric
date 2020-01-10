@@ -61,8 +61,9 @@ static ssize_t fi_ibv_rdm_recvmsg(struct fid_ep *ep, const struct fi_msg *msg,
 				.is_tagged = 0
 			},
 			.context = msg->context,
-			.flags = (ep_rdm->rx_selective_completion ?
-				flags : (flags | FI_COMPLETION))
+			.flags = ep_rdm->rx_op_flags |
+				(ep_rdm->rx_selective_completion ? flags :
+				(flags | FI_COMPLETION))
 		},
 		.dest_addr =
 			(msg->iov_count) ? msg->msg_iov[0].iov_base : NULL,
@@ -71,7 +72,8 @@ static ssize_t fi_ibv_rdm_recvmsg(struct fid_ep *ep, const struct fi_msg *msg,
 	};
 	struct fi_ibv_rdm_request *request =
 		util_buf_alloc(fi_ibv_rdm_request_pool);
-
+	if (OFI_UNLIKELY(!request))
+		return -FI_EAGAIN;
 	fi_ibv_rdm_zero_request(request);
 	FI_IBV_RDM_DBG_REQUEST("get_from_pool: ", request, FI_LOG_DEBUG);
 
@@ -95,9 +97,6 @@ fi_ibv_rdm_recvv(struct fid_ep *ep, const struct iovec *iov,
 		 void **desc, size_t count, fi_addr_t src_addr,
 		 void *context)
 {
-	struct fi_ibv_rdm_ep *ep_rdm =
-		container_of(ep, struct fi_ibv_rdm_ep, ep_fid);
-
 	const struct fi_msg msg = {
 		.msg_iov = iov,
 		.desc = desc,
@@ -107,8 +106,7 @@ fi_ibv_rdm_recvv(struct fid_ep *ep, const struct iovec *iov,
 		.data = 0
 	};
 
-	return fi_ibv_rdm_recvmsg(ep, &msg,
-		(ep_rdm->rx_selective_completion ? 0ULL : FI_COMPLETION));
+	return fi_ibv_rdm_recvmsg(ep, &msg, 0ULL);
 }
 
 static ssize_t
@@ -133,8 +131,7 @@ static ssize_t fi_ibv_rdm_sendmsg(struct fid_ep *ep, const struct fi_msg *msg,
 		.conn = ep_rdm->av->addr_to_conn(ep_rdm, msg->addr),
 		.data_len = 0,
 		.context = msg->context,
-		.flags = FI_TAGGED | FI_SEND | (ep_rdm->tx_selective_completion ?
-			(flags & FI_COMPLETION) : FI_COMPLETION),
+		.flags = FI_MSG | FI_SEND | GET_TX_COMP_FLAG(ep_rdm, flags),
 		.tag = 0,
 		.is_tagged = 0,
 		.buf.src_addr = NULL,
@@ -196,8 +193,7 @@ static ssize_t fi_ibv_rdm_sendv(struct fid_ep *ep, const struct iovec *iov,
 		.data = 0
 	};
 
-	return fi_ibv_rdm_sendmsg(ep, &msg,
-		(ep_rdm->tx_selective_completion ? 0ULL : FI_COMPLETION));
+	return fi_ibv_rdm_sendmsg(ep, &msg, GET_TX_COMP(ep_rdm));
 }
 
 static ssize_t fi_ibv_rdm_send(struct fid_ep *ep, const void *buf, size_t len,

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2016, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -55,6 +55,7 @@
 #include <rdma/fi_errno.h>
 #include "fi.h"
 #include "fi_enosys.h"
+#include "fi_util.h"
 
 #include "usnic_direct.h"
 #include "usd.h"
@@ -156,12 +157,25 @@ fail:
 static int
 usdf_ep_dgram_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 {
+	int ret;
 	struct usdf_ep *ep;
 	struct usdf_cq *cq;
 	struct usdf_av *av;
-	int ret;
 
 	USDF_TRACE_SYS(EP_CTRL, "\n");
+
+	/* Backward compatibility case for Open MPI. We haven't been validating the flags until now.
+	 * Older version of Open MPI gives FI_RECV as AV bind flag (bug). */
+	if (bfid->fclass == FI_CLASS_AV) {
+		av = av_fidtou(bfid);
+		if (av->av_domain->dom_info->fabric_attr->api_version <= FI_VERSION(1, 4) && (flags & FI_RECV))
+			flags = flags & ~FI_RECV;
+	}
+
+	/* Check if the binding flags are valid. */
+	ret = ofi_ep_bind_valid(&usdf_ops, bfid, flags);
+	if (ret)
+		return ret;
 
 	ep = ep_fidtou(fid);
 
@@ -174,7 +188,7 @@ usdf_ep_dgram_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 
 		av = av_fidtou(bfid);
 		ep->e.dg.ep_av = av;
-		atomic_inc(&av->av_refcnt);
+		ofi_atomic_inc32(&av->av_refcnt);
 		break;
 
 	case FI_CLASS_CQ:
@@ -205,7 +219,7 @@ usdf_ep_dgram_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 					(ep->e.dg.tx_op_flags & FI_COMPLETION));
 
 			ep->e.dg.ep_wcq = cq;
-			atomic_inc(&cq->cq_refcnt);
+			ofi_atomic_inc32(&cq->cq_refcnt);
 		}
 
 		if (flags & FI_RECV) {
@@ -223,7 +237,7 @@ usdf_ep_dgram_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 					(ep->e.dg.rx_op_flags & FI_COMPLETION));
 
 			ep->e.dg.ep_rcq = cq;
-			atomic_inc(&cq->cq_refcnt);
+			ofi_atomic_inc32(&cq->cq_refcnt);
 		}
 		break;
 
@@ -232,7 +246,7 @@ usdf_ep_dgram_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 			return -FI_EINVAL;
 		}
 		ep->ep_eq = eq_fidtou(bfid);
-		atomic_inc(&ep->ep_eq->eq_refcnt);
+		ofi_atomic_inc32(&ep->ep_eq->eq_refcnt);
 		break;
 	default:
 		return -FI_EINVAL;
@@ -250,14 +264,14 @@ usdf_ep_dgram_deref_cq(struct usdf_cq *cq)
 	if (cq == NULL) {
 		return;
 	}
-	atomic_dec(&cq->cq_refcnt);
+	ofi_atomic_dec32(&cq->cq_refcnt);
 
 	rtn = usdf_progress_hard_cq;
 
 	if (cq->cq_is_soft) {
 		TAILQ_FOREACH(hcq, &cq->c.soft.cq_list, cqh_link) {
 			if (hcq->cqh_progress == rtn) {
-				atomic_dec(&hcq->cqh_refcnt);
+				ofi_atomic_dec32(&hcq->cqh_refcnt);
 				return;
 			}
 		}
@@ -273,7 +287,7 @@ usdf_ep_dgram_close(fid_t fid)
 
 	ep = ep_fidtou(fid);
 
-	if (atomic_get(&ep->ep_refcnt) > 0) {
+	if (ofi_atomic_get32(&ep->ep_refcnt) > 0) {
 		return -FI_EBUSY;
 	}
 
@@ -282,13 +296,13 @@ usdf_ep_dgram_close(fid_t fid)
 	if (ep->e.dg.ep_qp != NULL) {
 		usd_destroy_qp(ep->e.dg.ep_qp);
 	}
-	atomic_dec(&ep->ep_domain->dom_refcnt);
+	ofi_atomic_dec32(&ep->ep_domain->dom_refcnt);
 	if (ep->ep_eq != NULL) {
-		atomic_dec(&ep->ep_eq->eq_refcnt);
+		ofi_atomic_dec32(&ep->ep_eq->eq_refcnt);
 	}
 
 	if (ep->e.dg.ep_av)
-		atomic_dec(&ep->e.dg.ep_av->av_refcnt);
+		ofi_atomic_dec32(&ep->e.dg.ep_av->av_refcnt);
 
 	usdf_ep_dgram_deref_cq(ep->e.dg.ep_wcq);
 	usdf_ep_dgram_deref_cq(ep->e.dg.ep_rcq);
@@ -359,6 +373,24 @@ static struct fi_ops_cm usdf_cm_dgram_ops = {
 	.accept = fi_no_accept,
 	.reject = fi_no_reject,
 	.shutdown = fi_no_shutdown,
+	.join = fi_no_join,
+};
+
+static struct fi_ops_atomic usdf_dgram_atomic_ops = {
+	.size = sizeof(struct fi_ops_atomic),
+	.write = fi_no_atomic_write,
+	.writev = fi_no_atomic_writev,
+	.writemsg = fi_no_atomic_writemsg,
+	.inject = fi_no_atomic_inject,
+	.readwrite = fi_no_atomic_readwrite,
+	.readwritev = fi_no_atomic_readwritev,
+	.readwritemsg = fi_no_atomic_readwritemsg,
+	.compwrite = fi_no_atomic_compwrite,
+	.compwritev = fi_no_atomic_compwritev,
+	.compwritemsg = fi_no_atomic_compwritemsg,
+	.writevalid = fi_no_atomic_writevalid,
+	.readwritevalid = fi_no_atomic_readwritevalid,
+	.compwritevalid = fi_no_atomic_compwritevalid,
 };
 
 /*******************************************************************************
@@ -398,11 +430,15 @@ static const struct fi_ep_attr dgram_dflt_ep_attr = {
 };
 
 static const struct fi_domain_attr dgram_dflt_domain_attr = {
+	.caps = USDF_DOM_CAPS,
 	.threading = FI_THREAD_ENDPOINT,
 	.control_progress = FI_PROGRESS_AUTO,
 	.data_progress = FI_PROGRESS_MANUAL,
 	.resource_mgmt = FI_RM_DISABLED,
-	.mr_mode = FI_MR_BASIC
+	.mr_mode = OFI_MR_BASIC_MAP | FI_MR_LOCAL,
+	.cntr_cnt = USDF_DGRAM_CNTR_CNT,
+	.mr_iov_limit = USDF_DGRAM_MR_IOV_LIMIT,
+	.mr_cnt = USDF_DGRAM_MR_CNT,
 };
 
 /*******************************************************************************
@@ -476,7 +512,7 @@ int usdf_dgram_fill_dom_attr(uint32_t version, struct fi_info *hints,
 		return -FI_ENODATA;
 
 	if (!hints || !hints->domain_attr)
-		goto out;
+		goto catch;
 
 	switch (hints->domain_attr->threading) {
 	case FI_THREAD_UNSPEC:
@@ -519,23 +555,44 @@ int usdf_dgram_fill_dom_attr(uint32_t version, struct fi_info *hints,
 		return -FI_ENODATA;
 	}
 
-	switch (hints->domain_attr->mr_mode) {
-	case FI_MR_UNSPEC:
-	case FI_MR_BASIC:
+	switch (hints->domain_attr->caps) {
+	case 0:
+	case FI_REMOTE_COMM:
 		break;
 	default:
+		USDF_WARN_SYS(DOMAIN,
+			"invalid domain capabilities\n");
 		return -FI_ENODATA;
 	}
 
-out:
-	*fi->domain_attr = defaults;
+	if (usdf_check_mr_mode(version, hints, defaults.mr_mode))
+		return -FI_ENODATA;
 
+	if (hints->domain_attr->mr_cnt) {
+		if (hints->domain_attr->mr_cnt <= USDF_DGRAM_MR_CNT) {
+			defaults.mr_cnt = hints->domain_attr->mr_cnt;
+		} else {
+			USDF_DBG_SYS(DOMAIN,
+				     "mr_count exceeded provider limit\n");
+			return -FI_ENODATA;
+		}
+	}
+
+catch:
+	/* catch the version change here. */
+	ret = usdf_catch_dom_attr(version, hints, &defaults);
+	if (ret)
+		return ret;
+
+	*fi->domain_attr = defaults;
 	return FI_SUCCESS;
 }
 
-int usdf_dgram_fill_tx_attr(struct fi_info *hints, struct fi_info *fi,
-		struct usd_device_attrs *dap)
+int usdf_dgram_fill_tx_attr(uint32_t version, struct fi_info *hints,
+			    struct fi_info *fi,
+			    struct usd_device_attrs *dap)
 {
+	int ret;
 	struct fi_tx_attr defaults;
 	size_t entries;
 
@@ -551,11 +608,8 @@ int usdf_dgram_fill_tx_attr(struct fi_info *hints, struct fi_info *fi,
 		return -FI_ENODATA;
 
 	/* clear the mode bits the app doesn't support */
-	defaults.mode &= (hints->mode | hints->tx_attr->mode);
-
-	/* make sure the app supports our required mode bits */
-	if ((defaults.mode & USDF_DGRAM_REQ_MODE) != USDF_DGRAM_REQ_MODE)
-		return -FI_ENODATA;
+	if (hints->mode || hints->tx_attr->mode)
+		defaults.mode &= (hints->mode | hints->tx_attr->mode);
 
 	defaults.op_flags |= hints->tx_attr->op_flags;
 
@@ -603,14 +657,20 @@ out:
 	if (!hints || (hints && !(hints->mode & FI_MSG_PREFIX)))
 		defaults.iov_limit -= 1;
 
+	/* catch version changes here. */
+	ret = usdf_catch_tx_attr(version, &defaults);
+	if (ret)
+		return ret;
+
 	*fi->tx_attr = defaults;
 
 	return FI_SUCCESS;
 }
 
-int usdf_dgram_fill_rx_attr(struct fi_info *hints, struct fi_info *fi,
-		struct usd_device_attrs *dap)
+int usdf_dgram_fill_rx_attr(uint32_t version, struct fi_info *hints,
+			    struct fi_info *fi, struct usd_device_attrs *dap)
 {
+	int ret;
 	struct fi_rx_attr defaults;
 	size_t entries;
 
@@ -626,11 +686,8 @@ int usdf_dgram_fill_rx_attr(struct fi_info *hints, struct fi_info *fi,
 		return -FI_ENODATA;
 
 	/* clear the mode bits the app doesn't support */
-	defaults.mode &= (hints->mode | hints->rx_attr->mode);
-
-	/* make sure the app supports our required mode bits */
-	if ((defaults.mode & USDF_DGRAM_REQ_MODE) != USDF_DGRAM_REQ_MODE)
-		return -FI_ENODATA;
+	if (hints->mode || hints->tx_attr->mode)
+		defaults.mode &= (hints->mode | hints->rx_attr->mode);
 
 	defaults.op_flags |= hints->rx_attr->op_flags;
 
@@ -676,6 +733,11 @@ out:
 	if (!hints || (hints && !(hints->mode & FI_MSG_PREFIX)))
 		defaults.iov_limit -= 1;
 
+	/* catch version changes here. */
+	ret = usdf_catch_rx_attr(version, &defaults);
+	if (ret)
+		return ret;
+
 	*fi->rx_attr = defaults;
 
 	return FI_SUCCESS;
@@ -719,7 +781,7 @@ usdf_ep_dgram_open(struct fid_domain *domain, struct fi_info *info,
 	struct usdf_ep *ep;
 	int ret;
 	struct usdf_pep *parent_pep;
-	struct sockaddr *src_addr;
+	void *src_addr;
 	int is_bound;
 	size_t tx_size;
 	size_t rx_size;
@@ -764,14 +826,8 @@ usdf_ep_dgram_open(struct fid_domain *domain, struct fi_info *info,
 	}
 
 	if (!is_bound) {
-		if (info->src_addr != NULL) {
-			if (!usdf_cm_addr_is_valid_sin(info->src_addr,
-					info->src_addrlen, info->addr_format)) {
-				ret = -FI_EINVAL;
-				goto fail;
-			}
-			src_addr = info->src_addr;
-		}
+		if (info->src_addr != NULL)
+			src_addr = usdf_format_to_sin(info, info->src_addr);
 
 		if (src_addr != NULL) {
 			ret = bind(ep->e.dg.ep_sock, src_addr,
@@ -781,12 +837,15 @@ usdf_ep_dgram_open(struct fid_domain *domain, struct fi_info *info,
 				goto fail;
 			}
 		}
+
+		usdf_free_sin_if_needed(info, src_addr);
 	}
 
 	ep->ep_fid.fid.fclass = FI_CLASS_EP;
 	ep->ep_fid.fid.context = context;
 	ep->ep_fid.fid.ops = &usdf_ep_dgram_ops;
 	ep->ep_fid.cm = &usdf_cm_dgram_ops;
+	ep->ep_fid.atomic = &usdf_dgram_atomic_ops;
 	ep->ep_domain = udp;
 	ep->ep_caps = info->caps;
 	ep->ep_mode = info->mode;
@@ -856,8 +915,8 @@ usdf_ep_dgram_open(struct fid_domain *domain, struct fi_info *info,
 		ep->ep_fid.ops = &usdf_base_dgram_ops;
 		ep->ep_fid.msg = &usdf_dgram_ops;
 	}
-	atomic_initialize(&ep->ep_refcnt, 0);
-	atomic_inc(&udp->dom_refcnt);
+	ofi_atomic_initialize32(&ep->ep_refcnt, 0);
+	ofi_atomic_inc32(&udp->dom_refcnt);
 
 	*ep_o = ep_utof(ep);
 	return 0;

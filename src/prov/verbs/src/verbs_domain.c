@@ -32,8 +32,11 @@
 
 #include "config.h"
 
+#include <fi_util.h>
 #include "fi_verbs.h"
 #include "ep_rdm/verbs_rdm.h"
+
+#include "fi_verbs.h"
 
 static int fi_ibv_mr_close(fid_t fid)
 {
@@ -81,6 +84,13 @@ fi_ibv_mr_reg(struct fid *fid, const void *buf, size_t len,
 	md->mr_fid.fid.context = context;
 	md->mr_fid.fid.ops = &fi_ibv_mr_ops;
 
+	/* Enable local write access by default for FI_EP_RDM which hides local
+	 * registration requirements. This allows to avoid buffering or double
+	 * registration */
+	if (!(md->domain->info->caps & FI_LOCAL_MR) ||
+	    (md->domain->info->domain_attr->mr_mode & FI_MR_LOCAL))
+		fi_ibv_access |= IBV_ACCESS_LOCAL_WRITE;
+
 	/* Local read access to an MR is enabled by default in verbs */
 
 	if (access & FI_RECV)
@@ -112,6 +122,14 @@ fi_ibv_mr_reg(struct fid *fid, const void *buf, size_t len,
 	md->mr_fid.mem_desc = (void *) (uintptr_t) md->mr->lkey;
 	md->mr_fid.key = md->mr->rkey;
 	*mr = &md->mr_fid;
+	if(md->domain->eq && (md->domain->eq_flags & FI_REG_MR)) {
+		struct fi_eq_entry entry = {
+			.fid = &md->mr_fid.fid,
+			.context = context
+		};
+		fi_ibv_eq_write_event(md->domain->eq, FI_MR_COMPLETE,
+			 	      &entry, sizeof(entry));
+	}
 	return 0;
 
 err:
@@ -119,14 +137,95 @@ err:
 	return -errno;
 }
 
+static int fi_ibv_mr_regv(struct fid *fid, const struct iovec * iov,
+		size_t count, uint64_t access, uint64_t offset, uint64_t requested_key,
+		uint64_t flags, struct fid_mr **mr, void *context)
+{
+	if (count > VERBS_MR_IOV_LIMIT) {
+		VERBS_WARN(FI_LOG_FABRIC,
+			   "iov count > %d not supported\n",
+			   VERBS_MR_IOV_LIMIT);
+		return -FI_EINVAL;
+	}
+	return fi_ibv_mr_reg(fid, iov->iov_base, iov->iov_len, access, offset,
+			requested_key, flags, mr, context);
+}
+
+static int fi_ibv_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
+		uint64_t flags, struct fid_mr **mr)
+{
+	return fi_ibv_mr_regv(fid, attr->mr_iov, attr->iov_count, attr->access,
+			0, attr->requested_key, flags, mr, attr->context);
+}
+
+static int fi_ibv_domain_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
+{
+	struct fi_ibv_domain *domain;
+	struct fi_ibv_eq *eq;
+
+	domain = container_of(fid, struct fi_ibv_domain, domain_fid.fid);
+
+	switch (bfid->fclass) {
+	case FI_CLASS_EQ:
+		eq = container_of(bfid, struct fi_ibv_eq, eq_fid);
+		domain->eq = eq;
+		domain->eq_flags = flags;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void *fi_ibv_rdm_cm_progress_thread(void *dom)
+{
+	struct fi_ibv_domain *domain =
+		(struct fi_ibv_domain *)dom;
+	struct slist_entry *item, *prev;
+	while (domain->rdm_cm->fi_ibv_rdm_tagged_cm_progress_running) {
+		struct fi_ibv_rdm_ep *ep = NULL;
+		slist_foreach(&domain->ep_list, item, prev) {
+			(void) prev;
+			ep = container_of(item, struct fi_ibv_rdm_ep,
+					  list_entry);
+			if (fi_ibv_rdm_cm_progress(ep)) {
+				VERBS_INFO (FI_LOG_EP_DATA,
+				            "fi_ibv_rdm_cm_progress error\n");
+				abort();
+			}
+		}
+		usleep(domain->rdm_cm->cm_progress_timeout);
+	}
+	return NULL;
+}
+
 static int fi_ibv_domain_close(fid_t fid)
 {
 	struct fi_ibv_domain *domain;
+	struct fi_ibv_rdm_av_entry *av_entry = NULL;
+	struct slist_entry *item;
+	void *status = NULL;
 	int ret;
 
 	domain = container_of(fid, struct fi_ibv_domain, domain_fid.fid);
 
 	if (domain->rdm) {
+		domain->rdm_cm->fi_ibv_rdm_tagged_cm_progress_running = 0;
+		pthread_join(domain->rdm_cm->cm_progress_thread, &status);
+		pthread_mutex_destroy(&domain->rdm_cm->cm_lock);
+
+		for (item = slist_remove_head(
+				&domain->rdm_cm->av_removed_entry_head);
+	     	     item;
+	     	     item = slist_remove_head(
+				&domain->rdm_cm->av_removed_entry_head)) {
+			av_entry = container_of(item,
+						struct fi_ibv_rdm_av_entry,
+						removed_next);
+			fi_ibv_rdm_overall_conn_cleanup(av_entry);
+			ofi_freealign(av_entry);
+		}
 		rdma_destroy_ep(domain->rdm_cm->listener);
 		free(domain->rdm_cm);
 	}
@@ -174,7 +273,7 @@ static int fi_ibv_open_device_by_name(struct fi_ibv_domain *domain, const char *
 static struct fi_ops fi_ibv_fid_ops = {
 	.size = sizeof(struct fi_ops),
 	.close = fi_ibv_domain_close,
-	.bind = fi_no_bind,
+	.bind = fi_ibv_domain_bind,
 	.control = fi_no_control,
 	.ops_open = fi_no_ops_open,
 };
@@ -182,8 +281,8 @@ static struct fi_ops fi_ibv_fid_ops = {
 static struct fi_ops_mr fi_ibv_domain_mr_ops = {
 	.size = sizeof(struct fi_ops_mr),
 	.reg = fi_ibv_mr_reg,
-	.regv = fi_no_mr_regv,
-	.regattr = fi_no_mr_regattr,
+	.regv = fi_ibv_mr_regv,
+	.regattr = fi_ibv_mr_regattr,
 };
 
 static struct fi_ops_domain fi_ibv_domain_ops = {
@@ -196,11 +295,12 @@ static struct fi_ops_domain fi_ibv_domain_ops = {
 	.poll_open = fi_no_poll_open,
 	.stx_ctx = fi_no_stx_context,
 	.srx_ctx = fi_ibv_srq_context,
+	.query_atomic = fi_ibv_query_atomic,
 };
 
 static struct fi_ops_domain fi_ibv_rdm_domain_ops = {
 	.size = sizeof(struct fi_ops_domain),
-	.av_open = fi_ibv_av_open,
+	.av_open = fi_ibv_rdm_av_open,
 	.cq_open = fi_ibv_rdm_cq_open,
 	.endpoint = fi_ibv_rdm_open_ep,
 	.scalable_ep = fi_no_scalable_ep,
@@ -208,6 +308,7 @@ static struct fi_ops_domain fi_ibv_rdm_domain_ops = {
 	.poll_open = fi_no_poll_open,
 	.stx_ctx = fi_no_stx_context,
 	.srx_ctx = fi_no_srx_context,
+	.query_atomic = fi_ibv_query_atomic,
 };
 
 static int
@@ -215,14 +316,18 @@ fi_ibv_domain(struct fid_fabric *fabric, struct fi_info *info,
 	   struct fid_domain **domain, void *context)
 {
 	struct fi_ibv_domain *_domain;
+	struct fi_ibv_fabric *fab;
 	struct fi_info *fi;
-	int ret;
+	int param = 0, ret;
 
 	fi = fi_ibv_get_verbs_info(info->domain_attr->name);
 	if (!fi)
 		return -FI_EINVAL;
 
-	ret = fi_ibv_check_domain_attr(info->domain_attr, fi);
+	fab = container_of(fabric, struct fi_ibv_fabric,
+			   util_fabric.fabric_fid);
+	ret = ofi_check_domain_attr(&fi_ibv_prov, fabric->api_version,
+				    fi->domain_attr, info->domain_attr);
 	if (ret)
 		return ret;
 
@@ -239,6 +344,35 @@ fi_ibv_domain(struct fid_fabric *fabric, struct fi_info *info,
 		_domain->rdm_cm = calloc(1, sizeof(*_domain->rdm_cm));
 		if (!_domain->rdm_cm) {
 			ret = -FI_ENOMEM;
+			goto err2;
+		}
+		_domain->rdm_cm->cm_progress_timeout =
+			FI_IBV_RDM_CM_THREAD_TIMEOUT;
+		if (!fi_param_get_int(&fi_ibv_prov,
+				      "rdm_thread_timeout",
+				      &param)) {
+			if (param < 0) {
+				VERBS_INFO(FI_LOG_CORE,
+				   	   "invalid value of "
+					   "rdm_thread_timeout\n");
+				ret = -FI_EINVAL;
+				goto err2;
+			} else {
+				_domain->rdm_cm->cm_progress_timeout = param;
+			}
+		}
+		slist_init(&_domain->rdm_cm->av_removed_entry_head);
+
+		pthread_mutex_init(&_domain->rdm_cm->cm_lock, NULL);
+		_domain->rdm_cm->fi_ibv_rdm_tagged_cm_progress_running = 1;
+		ret = pthread_create(&_domain->rdm_cm->cm_progress_thread,
+				     NULL, &fi_ibv_rdm_cm_progress_thread,
+				     (void *)_domain);
+		if (ret) {
+			VERBS_INFO(FI_LOG_EP_CTRL,
+				   "Failed to launch CM progress thread, "
+				   "err :%d\n", ret);
+			ret = -FI_EOTHER;
 			goto err2;
 		}
 	}
@@ -287,7 +421,7 @@ fi_ibv_domain(struct fid_fabric *fabric, struct fi_info *info,
 	} else {
 		_domain->domain_fid.ops = &fi_ibv_domain_ops;
 	}
-	_domain->fab = container_of(fabric, struct fi_ibv_fabric, fabric_fid);
+	_domain->fab = fab;
 
 	*domain = &_domain->domain_fid;
 	return 0;
@@ -333,7 +467,15 @@ static int fi_ibv_trywait(struct fid_fabric *fabric, struct fid **fids, int coun
 
 static int fi_ibv_fabric_close(fid_t fid)
 {
-	free(fid);
+	struct fi_ibv_fabric *fab;
+	int ret;
+
+	fab = container_of(fid, struct fi_ibv_fabric, util_fabric.fabric_fid.fid);
+	ret = ofi_fabric_close(&fab->util_fabric);
+	if (ret)
+		return ret;
+	free(fab);
+
 	return 0;
 }
 
@@ -358,13 +500,10 @@ int fi_ibv_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
 		  void *context)
 {
 	struct fi_ibv_fabric *fab;
+	struct fi_info *info;
 	int ret;
 
 	ret = fi_ibv_init_info();
-	if (ret)
-		return ret;
-
-	ret = fi_ibv_find_fabric(attr);
 	if (ret)
 		return ret;
 
@@ -372,11 +511,20 @@ int fi_ibv_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
 	if (!fab)
 		return -FI_ENOMEM;
 
-	fab->fabric_fid.fid.fclass = FI_CLASS_FABRIC;
-	fab->fabric_fid.fid.context = context;
-	fab->fabric_fid.fid.ops = &fi_ibv_fi_ops;
-	fab->fabric_fid.ops = &fi_ibv_ops_fabric;
+	for (info = verbs_info; info; info = info->next) {
+		ret = ofi_fabric_init(&fi_ibv_prov, info->fabric_attr, attr,
+				      &fab->util_fabric, context);
+		if (ret != -FI_ENODATA)
+			break;
+	}
+	if (ret) {
+		free(fab);
+		return ret;
+	}
 
-	*fabric = &fab->fabric_fid;
+	*fabric = &fab->util_fabric.fabric_fid;
+	(*fabric)->fid.ops = &fi_ibv_fi_ops;
+	(*fabric)->ops = &fi_ibv_ops_fabric;
+
 	return 0;
 }

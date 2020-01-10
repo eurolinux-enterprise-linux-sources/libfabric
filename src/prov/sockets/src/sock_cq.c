@@ -62,15 +62,17 @@ void sock_cq_add_tx_ctx(struct sock_cq *cq, struct sock_tx_ctx *tx_ctx)
 			goto out;
 	}
 	dlist_insert_tail(&tx_ctx->cq_entry, &cq->tx_list);
+	ofi_atomic_inc32(&cq->ref);
 out:
 	fastlock_release(&cq->list_lock);
 }
 
 void sock_cq_remove_tx_ctx(struct sock_cq *cq, struct sock_tx_ctx *tx_ctx)
 {
-		fastlock_acquire(&cq->list_lock);
-		dlist_remove(&tx_ctx->cq_entry);
-		fastlock_release(&cq->list_lock);
+	fastlock_acquire(&cq->list_lock);
+	dlist_remove(&tx_ctx->cq_entry);
+	ofi_atomic_dec32(&cq->ref);
+	fastlock_release(&cq->list_lock);
 }
 
 void sock_cq_add_rx_ctx(struct sock_cq *cq, struct sock_rx_ctx *rx_ctx)
@@ -86,15 +88,17 @@ void sock_cq_add_rx_ctx(struct sock_cq *cq, struct sock_rx_ctx *rx_ctx)
 			goto out;
 	}
 	dlist_insert_tail(&rx_ctx->cq_entry, &cq->rx_list);
+	ofi_atomic_inc32(&cq->ref);
 out:
 	fastlock_release(&cq->list_lock);
 }
 
 void sock_cq_remove_rx_ctx(struct sock_cq *cq, struct sock_rx_ctx *rx_ctx)
 {
-		fastlock_acquire(&cq->list_lock);
-		dlist_remove(&rx_ctx->cq_entry);
-		fastlock_release(&cq->list_lock);
+	fastlock_acquire(&cq->list_lock);
+	dlist_remove(&rx_ctx->cq_entry);
+	ofi_atomic_dec32(&cq->ref);
+	fastlock_release(&cq->list_lock);
 }
 
 int sock_cq_progress(struct sock_cq *cq)
@@ -110,15 +114,21 @@ int sock_cq_progress(struct sock_cq *cq)
 	for (entry = cq->tx_list.next; entry != &cq->tx_list;
 	     entry = entry->next) {
 		tx_ctx = container_of(entry, struct sock_tx_ctx, cq_entry);
+		if (!tx_ctx->enabled)
+			continue;
+
 		if (tx_ctx->use_shared)
 			sock_pe_progress_tx_ctx(cq->domain->pe, tx_ctx->stx_ctx);
 		else
-			sock_pe_progress_tx_ctx(cq->domain->pe, tx_ctx);		      
+			sock_pe_progress_tx_ctx(cq->domain->pe, tx_ctx);
 	}
 
 	for (entry = cq->rx_list.next; entry != &cq->rx_list;
 	     entry = entry->next) {
 		rx_ctx = container_of(entry, struct sock_rx_ctx, cq_entry);
+		if (!rx_ctx->enabled)
+			continue;
+
 		if (rx_ctx->use_shared)
 			sock_pe_progress_rx_ctx(cq->domain->pe, rx_ctx->srx_ctx);
 		else
@@ -166,7 +176,7 @@ static ssize_t _sock_cq_write(struct sock_cq *cq, fi_addr_t addr,
 	struct sock_cq_overflow_entry_t *overflow_entry;
 
 	fastlock_acquire(&cq->lock);
-	if (rbfdavail(&cq->cq_rbfd) < len) {
+	if (ofi_rbfdavail(&cq->cq_rbfd) < len) {
 		SOCK_LOG_ERROR("Not enough space in CQ\n");
 		overflow_entry = calloc(1, sizeof(*overflow_entry) + len);
 		if (!overflow_entry) {
@@ -183,14 +193,14 @@ static ssize_t _sock_cq_write(struct sock_cq *cq, fi_addr_t addr,
 	}
 
 
-	rbwrite(&cq->addr_rb, &addr, sizeof(addr));
-	rbcommit(&cq->addr_rb);
+	ofi_rbwrite(&cq->addr_rb, &addr, sizeof(addr));
+	ofi_rbcommit(&cq->addr_rb);
 
-	rbfdwrite(&cq->cq_rbfd, buf, len);
+	ofi_rbfdwrite(&cq->cq_rbfd, buf, len);
 	if (cq->domain->progress_mode == FI_PROGRESS_MANUAL)
-		rbcommit(&cq->cq_rbfd.rb);
+		ofi_rbcommit(&cq->cq_rbfd.rb);
 	else
-		rbfdcommit(&cq->cq_rbfd);
+		ofi_rbfdcommit(&cq->cq_rbfd);
 
 	ret = len;
 
@@ -281,21 +291,21 @@ static void sock_cq_set_report_fn(struct sock_cq *sock_cq)
 
 static inline void sock_cq_copy_overflow_list(struct sock_cq *cq, size_t count)
 {
-	ssize_t i;
+	size_t i;
 	struct sock_cq_overflow_entry_t *overflow_entry;
 
 	for (i = 0; i < count && !dlist_empty(&cq->overflow_list); i++) {
 		overflow_entry = container_of(cq->overflow_list.next,
 					      struct sock_cq_overflow_entry_t,
 					      entry);
-		rbwrite(&cq->addr_rb, &overflow_entry->addr, sizeof(fi_addr_t));
-		rbcommit(&cq->addr_rb);
+		ofi_rbwrite(&cq->addr_rb, &overflow_entry->addr, sizeof(fi_addr_t));
+		ofi_rbcommit(&cq->addr_rb);
 
-		rbfdwrite(&cq->cq_rbfd, &overflow_entry->cq_entry[0], overflow_entry->len);
+		ofi_rbfdwrite(&cq->cq_rbfd, &overflow_entry->cq_entry[0], overflow_entry->len);
 		if (cq->domain->progress_mode == FI_PROGRESS_MANUAL)
-			rbcommit(&cq->cq_rbfd.rb);
+			ofi_rbcommit(&cq->cq_rbfd.rb);
 		else
-			rbfdcommit(&cq->cq_rbfd);
+			ofi_rbfdcommit(&cq->cq_rbfd);
 
 		dlist_remove(&overflow_entry->entry);
 		free(overflow_entry);
@@ -306,12 +316,12 @@ static inline ssize_t sock_cq_rbuf_read(struct sock_cq *cq, void *buf,
 					size_t count, fi_addr_t *src_addr,
 					size_t cq_entry_len)
 {
-	ssize_t i;
+	size_t i;
 	fi_addr_t addr;
 
-	rbfdread(&cq->cq_rbfd, buf, cq_entry_len * count);
+	ofi_rbfdread(&cq->cq_rbfd, buf, cq_entry_len * count);
 	for (i = 0; i < count; i++) {
-		rbread(&cq->addr_rb, &addr, sizeof(addr));
+		ofi_rbread(&cq->addr_rb, &addr, sizeof(addr));
 		if (src_addr)
 			src_addr[i] = addr;
 	}
@@ -329,7 +339,7 @@ static ssize_t sock_cq_sreadfrom(struct fid_cq *cq, void *buf, size_t count,
 	ssize_t cq_entry_len, avail;
 
 	sock_cq = container_of(cq, struct sock_cq, cq_fid);
-	if (rbused(&sock_cq->cqerr_rb))
+	if (ofi_rbused(&sock_cq->cqerr_rb))
 		return -FI_EAVAIL;
 
 	cq_entry_len = sock_cq->cq_entry_size;
@@ -347,10 +357,10 @@ static ssize_t sock_cq_sreadfrom(struct fid_cq *cq, void *buf, size_t count,
 		do {
 			sock_cq_progress(sock_cq);
 			fastlock_acquire(&sock_cq->lock);
-			avail = rbfdused(&sock_cq->cq_rbfd);
+			avail = ofi_rbfdused(&sock_cq->cq_rbfd);
 			if (avail)
 				ret = sock_cq_rbuf_read(sock_cq, buf,
-					MIN(threshold, avail / cq_entry_len),
+					MIN(threshold, (size_t)(avail / cq_entry_len)),
 					src_addr, cq_entry_len);
 			fastlock_release(&sock_cq->lock);
 			if (ret == 0 && timeout >= 0) {
@@ -360,17 +370,19 @@ static ssize_t sock_cq_sreadfrom(struct fid_cq *cq, void *buf, size_t count,
 		} while (ret == 0);
 	} else {
 		do {
-			ret = rbfdwait(&sock_cq->cq_rbfd, timeout);
+			ret = ofi_rbfdwait(&sock_cq->cq_rbfd, timeout);
 			if (ret <= 0)
 				break;
 
 			fastlock_acquire(&sock_cq->lock);
 			ret = 0;
-			avail = rbfdused(&sock_cq->cq_rbfd);
+			avail = ofi_rbfdused(&sock_cq->cq_rbfd);
 			if (avail)
 				ret = sock_cq_rbuf_read(sock_cq, buf,
-					MIN(threshold, avail / cq_entry_len),
+					MIN(threshold, (size_t)(avail / cq_entry_len)),
 					src_addr, cq_entry_len);
+			else /* No CQ entry available, read the fd */
+				ofi_rbfdreset(&sock_cq->cq_rbfd);
 			fastlock_release(&sock_cq->lock);
 
 			if ((ret == -FI_EAGAIN || ret == 0) && timeout >= 0) {
@@ -405,14 +417,34 @@ static ssize_t sock_cq_readerr(struct fid_cq *cq, struct fi_cq_err_entry *buf,
 {
 	struct sock_cq *sock_cq;
 	ssize_t ret;
+	struct fi_cq_err_entry entry;
+	uint32_t api_version;
+	size_t err_data_size = 0;
+	void *err_data = NULL;
 
 	sock_cq = container_of(cq, struct sock_cq, cq_fid);
 	if (sock_cq->domain->progress_mode == FI_PROGRESS_MANUAL)
 		sock_cq_progress(sock_cq);
 
 	fastlock_acquire(&sock_cq->lock);
-	if (rbused(&sock_cq->cqerr_rb) >= sizeof(struct fi_cq_err_entry)) {
-		rbread(&sock_cq->cqerr_rb, buf, sizeof(*buf));
+	if (ofi_rbused(&sock_cq->cqerr_rb) >= sizeof(struct fi_cq_err_entry)) {
+		api_version = sock_cq->domain->fab->fab_fid.api_version;
+		ofi_rbread(&sock_cq->cqerr_rb, &entry, sizeof(entry));
+
+		if ((FI_VERSION_GE(api_version, FI_VERSION(1, 5)))
+			&& buf->err_data && buf->err_data_size) {
+			err_data = buf->err_data;
+			err_data_size = buf->err_data_size;
+			*buf = entry;
+			buf->err_data = err_data;
+
+			/* Fill provided user's buffer */
+			buf->err_data_size = MIN(entry.err_data_size, err_data_size);
+			memcpy(buf->err_data, entry.err_data, buf->err_data_size);
+		} else {
+			memcpy(buf, &entry, sizeof(struct fi_cq_err_entry_1_0));
+		}
+
 		ret = 1;
 	} else {
 		ret = -FI_EAGAIN;
@@ -434,19 +466,19 @@ static int sock_cq_close(struct fid *fid)
 	struct sock_cq *cq;
 
 	cq = container_of(fid, struct sock_cq, cq_fid.fid);
-	if (atomic_get(&cq->ref))
+	if (ofi_atomic_get32(&cq->ref))
 		return -FI_EBUSY;
 
 	if (cq->signal && cq->attr.wait_obj == FI_WAIT_MUTEX_COND)
 		sock_wait_close(&cq->waitset->fid);
 
-	rbfree(&cq->addr_rb);
-	rbfree(&cq->cqerr_rb);
-	rbfdfree(&cq->cq_rbfd);
+	ofi_rbfree(&cq->addr_rb);
+	ofi_rbfree(&cq->cqerr_rb);
+	ofi_rbfdfree(&cq->cq_rbfd);
 
 	fastlock_destroy(&cq->lock);
 	fastlock_destroy(&cq->list_lock);
-	atomic_dec(&cq->domain->ref);
+	ofi_atomic_dec32(&cq->domain->ref);
 
 	free(cq);
 	return 0;
@@ -456,7 +488,10 @@ static int sock_cq_signal(struct fid_cq *cq)
 {
 	struct sock_cq *sock_cq;
 	sock_cq = container_of(cq, struct sock_cq, cq_fid);
-	rbfdsignal(&sock_cq->cq_rbfd);
+
+	fastlock_acquire(&sock_cq->lock);
+	ofi_rbfdsignal(&sock_cq->cq_rbfd);
+	fastlock_release(&sock_cq->lock);
 	return 0;
 }
 
@@ -486,7 +521,7 @@ static int sock_cq_control(struct fid *fid, int command, void *arg)
 		case FI_WAIT_NONE:
 		case FI_WAIT_FD:
 		case FI_WAIT_UNSPEC:
-			memcpy(arg, &cq->cq_rbfd.fd[RB_READ_FD], sizeof(int));
+			memcpy(arg, &cq->cq_rbfd.fd[OFI_RB_READ_FD], sizeof(int));
 			break;
 
 		case FI_WAIT_SET:
@@ -579,15 +614,15 @@ int sock_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 	if (!sock_cq)
 		return -FI_ENOMEM;
 
-	atomic_initialize(&sock_cq->ref, 0);
+	ofi_atomic_initialize32(&sock_cq->ref, 0);
 	sock_cq->cq_fid.fid.fclass = FI_CLASS_CQ;
 	sock_cq->cq_fid.fid.context = context;
 	sock_cq->cq_fid.fid.ops = &sock_cq_fi_ops;
 	sock_cq->cq_fid.ops = &sock_cq_ops;
 
-	if (attr == NULL)
+	if (attr == NULL) {
 		sock_cq->attr = _sock_cq_def_attr;
-	else {
+	} else {
 		sock_cq->attr = *attr;
 		if (attr->size == 0)
 			sock_cq->attr.size = _sock_cq_def_attr.size;
@@ -602,17 +637,17 @@ int sock_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 	dlist_init(&sock_cq->ep_list);
 	dlist_init(&sock_cq->overflow_list);
 
-	ret = rbfdinit(&sock_cq->cq_rbfd, sock_cq->attr.size *
+	ret = ofi_rbfdinit(&sock_cq->cq_rbfd, sock_cq->attr.size *
 			sock_cq->cq_entry_size);
 	if (ret)
 		goto err1;
 
-	ret = rbinit(&sock_cq->addr_rb,
+	ret = ofi_rbinit(&sock_cq->addr_rb,
 			sock_cq->attr.size * sizeof(fi_addr_t));
 	if (ret)
 		goto err2;
 
-	ret = rbinit(&sock_cq->cqerr_rb, sock_cq->attr.size *
+	ret = ofi_rbinit(&sock_cq->cqerr_rb, sock_cq->attr.size *
 			sizeof(struct fi_cq_err_entry));
 	if (ret)
 		goto err3;
@@ -661,30 +696,31 @@ int sock_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 	}
 
 	*cq = &sock_cq->cq_fid;
-	atomic_inc(&sock_dom->ref);
+	ofi_atomic_inc32(&sock_dom->ref);
 	fastlock_init(&sock_cq->list_lock);
 
 	return 0;
 
 err4:
-	rbfree(&sock_cq->cqerr_rb);
+	ofi_rbfree(&sock_cq->cqerr_rb);
 err3:
-	rbfree(&sock_cq->addr_rb);
+	ofi_rbfree(&sock_cq->addr_rb);
 err2:
-	rbfdfree(&sock_cq->cq_rbfd);
+	ofi_rbfdfree(&sock_cq->cq_rbfd);
 err1:
 	free(sock_cq);
 	return ret;
 }
 
 int sock_cq_report_error(struct sock_cq *cq, struct sock_pe_entry *entry,
-			 size_t olen, int err, int prov_errno, void *err_data)
+			 size_t olen, int err, int prov_errno, void *err_data,
+			 size_t err_data_size)
 {
 	int ret;
 	struct fi_cq_err_entry err_entry;
 
 	fastlock_acquire(&cq->lock);
-	if (rbavail(&cq->cqerr_rb) < sizeof(err_entry)) {
+	if (ofi_rbavail(&cq->cqerr_rb) < sizeof(err_entry)) {
 		ret = -FI_ENOSPC;
 		goto out;
 	}
@@ -692,6 +728,7 @@ int sock_cq_report_error(struct sock_cq *cq, struct sock_pe_entry *entry,
 	err_entry.err = err;
 	err_entry.olen = olen;
 	err_entry.err_data = err_data;
+	err_entry.err_data_size = err_data_size;
 	err_entry.len = entry->data_len;
 	err_entry.prov_errno = prov_errno;
 	err_entry.flags = entry->flags;
@@ -704,9 +741,11 @@ int sock_cq_report_error(struct sock_cq *cq, struct sock_pe_entry *entry,
 	else
 		err_entry.buf = (void *) (uintptr_t) entry->pe.tx.tx_iov[0].src.iov.addr;
 
-	rbwrite(&cq->cqerr_rb, &err_entry, sizeof(err_entry));
-	rbcommit(&cq->cqerr_rb);
+	ofi_rbwrite(&cq->cqerr_rb, &err_entry, sizeof(err_entry));
+	ofi_rbcommit(&cq->cqerr_rb);
 	ret = 0;
+
+	ofi_rbfdsignal(&cq->cq_rbfd);
 
 out:
 	fastlock_release(&cq->lock);

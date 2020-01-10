@@ -60,7 +60,8 @@
 ssize_t sock_ep_recvmsg(struct fid_ep *ep, const struct fi_msg *msg,
 			uint64_t flags)
 {
-	int i, ret;
+	int ret;
+	size_t i;
 	struct sock_rx_ctx *rx_ctx;
 	struct sock_rx_entry *rx_entry;
 	struct sock_ep *sock_ep;
@@ -94,7 +95,7 @@ ssize_t sock_ep_recvmsg(struct fid_ep *ep, const struct fi_msg *msg,
 		flags |= op_flags;
 
 	if (flags & FI_TRIGGER) {
-		ret = sock_queue_msg_op(ep, msg, flags, SOCK_OP_RECV);
+		ret = sock_queue_msg_op(ep, msg, flags, FI_OP_RECV);
 		if (ret != 1)
 			return ret;
 	}
@@ -174,7 +175,8 @@ static ssize_t sock_ep_recvv(struct fid_ep *ep, const struct iovec *iov,
 ssize_t sock_ep_sendmsg(struct fid_ep *ep, const struct fi_msg *msg,
 			uint64_t flags)
 {
-	int ret, i;
+	int ret;
+	size_t i;
 	uint64_t total_len, op_flags;
 	struct sock_op tx_op;
 	union sock_iov tx_iov;
@@ -224,7 +226,7 @@ ssize_t sock_ep_sendmsg(struct fid_ep *ep, const struct fi_msg *msg,
 		flags |= op_flags;
 
 	if (flags & FI_TRIGGER) {
-		ret = sock_queue_msg_op(ep, msg, flags, SOCK_OP_SEND);
+		ret = sock_queue_msg_op(ep, msg, flags, FI_OP_SEND);
 		if (ret != 1)
 			return ret;
 	}
@@ -237,10 +239,9 @@ ssize_t sock_ep_sendmsg(struct fid_ep *ep, const struct fi_msg *msg,
 		for (i = 0; i < msg->iov_count; i++)
 			total_len += msg->msg_iov[i].iov_len;
 
-		if (total_len > SOCK_EP_MAX_INJECT_SZ) {
-			ret = -FI_EINVAL;
-			goto err;
-		}
+		if (total_len > SOCK_EP_MAX_INJECT_SZ)
+			return -FI_EINVAL;
+
 		tx_op.src_iov_len = total_len;
 	} else {
 		tx_op.src_iov_len = msg->iov_count;
@@ -253,7 +254,7 @@ ssize_t sock_ep_sendmsg(struct fid_ep *ep, const struct fi_msg *msg,
 		total_len += sizeof(uint64_t);
 
 	sock_tx_ctx_start(tx_ctx);
-	if (rbavail(&tx_ctx->rb) < total_len) {
+	if (ofi_rbavail(&tx_ctx->rb) < total_len) {
 		ret = -FI_EAGAIN;
 		goto err;
 	}
@@ -389,7 +390,8 @@ struct fi_ops_msg sock_ep_msg_ops = {
 ssize_t sock_ep_trecvmsg(struct fid_ep *ep,
 			 const struct fi_msg_tagged *msg, uint64_t flags)
 {
-	int i, ret;
+	int ret;
+	size_t i;
 	struct sock_rx_ctx *rx_ctx;
 	struct sock_rx_entry *rx_entry;
 	struct sock_ep *sock_ep;
@@ -424,7 +426,7 @@ ssize_t sock_ep_trecvmsg(struct fid_ep *ep,
 	flags &= ~FI_MULTI_RECV;
 
 	if (flags & FI_TRIGGER) {
-		ret = sock_queue_tmsg_op(ep, msg, flags, SOCK_OP_TRECV);
+		ret = sock_queue_tmsg_op(ep, msg, flags, FI_OP_TRECV);
 		if (ret != 1)
 			return ret;
 	}
@@ -513,7 +515,8 @@ static ssize_t sock_ep_trecvv(struct fid_ep *ep, const struct iovec *iov,
 ssize_t sock_ep_tsendmsg(struct fid_ep *ep,
 			 const struct fi_msg_tagged *msg, uint64_t flags)
 {
-	int ret, i;
+	int ret;
+	size_t i;
 	uint64_t total_len, op_flags;
 	struct sock_op tx_op;
 	union sock_iov tx_iov;
@@ -560,7 +563,7 @@ ssize_t sock_ep_tsendmsg(struct fid_ep *ep,
 		flags |= op_flags;
 
 	if (flags & FI_TRIGGER) {
-		ret = sock_queue_tmsg_op(ep, msg, flags, SOCK_OP_TSEND);
+		ret = sock_queue_tmsg_op(ep, msg, flags, FI_OP_TSEND);
 		if (ret != 1)
 			return ret;
 	}
@@ -574,10 +577,8 @@ ssize_t sock_ep_tsendmsg(struct fid_ep *ep,
 			total_len += msg->msg_iov[i].iov_len;
 
 		tx_op.src_iov_len = total_len;
-		if (total_len > SOCK_EP_MAX_INJECT_SZ) {
-			ret = -FI_EINVAL;
-			goto err;
-		}
+		if (total_len > SOCK_EP_MAX_INJECT_SZ)
+			return -FI_EINVAL;
 	} else {
 		total_len = msg->iov_count * sizeof(union sock_iov);
 		tx_op.src_iov_len = msg->iov_count;
@@ -588,7 +589,7 @@ ssize_t sock_ep_tsendmsg(struct fid_ep *ep,
 		total_len += sizeof(uint64_t);
 
 	sock_tx_ctx_start(tx_ctx);
-	if (rbavail(&tx_ctx->rb) < total_len) {
+	if (ofi_rbavail(&tx_ctx->rb) < total_len) {
 		ret = -FI_EAGAIN;
 		goto err;
 	}

@@ -47,6 +47,7 @@ static struct fi_ops_domain rxm_domain_ops = {
 	.poll_open = fi_poll_create,
 	.stx_ctx = fi_no_stx_context,
 	.srx_ctx = fi_no_srx_context,
+	.query_atomic = fi_no_query_atomic,
 };
 
 static int rxm_domain_close(fid_t fid)
@@ -111,6 +112,12 @@ static int rxm_mr_reg(struct fid *domain_fid, const void *buf, size_t len,
 	if (!(rxm_mr = calloc(1, sizeof(*rxm_mr))))
 		return -FI_ENOMEM;
 
+	/* Additional flags to use RMA read for large message transfers */
+	access |= FI_READ | FI_REMOTE_READ;
+
+	if (rxm_domain->mr_local)
+		access |= FI_WRITE;
+
 	ret = fi_mr_reg(rxm_domain->msg_domain, buf, len, access, offset, requested_key,
 			flags, &rxm_mr->msg_mr, context);
 	if (ret) {
@@ -121,7 +128,10 @@ static int rxm_mr_reg(struct fid *domain_fid, const void *buf, size_t len,
 	rxm_mr->mr_fid.fid.fclass = FI_CLASS_MR;
 	rxm_mr->mr_fid.fid.context = context;
 	rxm_mr->mr_fid.fid.ops = &rxm_mr_ops;
-	rxm_mr->mr_fid.mem_desc = fi_mr_desc(rxm_mr->msg_mr);
+	/* Store msg_mr as rxm_mr descriptor so that we can get its key when
+	 * the app passes msg_mr as the descriptor in fi_send and friends.
+	 * The key would be used in large message transfer protocol. */
+	rxm_mr->mr_fid.mem_desc = rxm_mr->msg_mr;
 	rxm_mr->mr_fid.key = fi_mr_key(rxm_mr->msg_mr);
 	*mr = &rxm_mr->mr_fid;
 
@@ -152,11 +162,16 @@ int rxm_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 
 	rxm_fabric = container_of(fabric, struct rxm_fabric, util_fabric.fabric_fid);
 
-	ret = ofix_getinfo(rxm_prov.version, NULL, NULL, 0, &rxm_util_prov,
-			info, rxm_alter_layer_info, rxm_alter_base_info,
-			1, &msg_info);
+	ret = ofi_get_core_info(fabric->api_version, NULL, NULL, 0, &rxm_util_prov,
+				info, rxm_info_to_core, &msg_info);
 	if (ret)
 		goto err1;
+
+	/* Force core provider to supply MR key */
+	if (FI_VERSION_LT(fabric->api_version, FI_VERSION(1, 5)))
+		msg_info->domain_attr->mr_mode = FI_MR_BASIC;
+	else
+		msg_info->domain_attr->mr_mode |= FI_MR_PROV_KEY;
 
 	ret = fi_domain(rxm_fabric->msg_fabric, msg_info,
 			&rxm_domain->msg_domain, context);
@@ -174,6 +189,9 @@ int rxm_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 	(*domain)->mr = &rxm_domain_mr_ops;
 	(*domain)->ops = &rxm_domain_ops;
 
+	rxm_domain->mr_local = RXM_MR_LOCAL(msg_info) && !RXM_MR_LOCAL(info);
+
+	fi_freeinfo(msg_info);
 	return 0;
 err3:
 	fi_close(&rxm_domain->msg_domain->fid);

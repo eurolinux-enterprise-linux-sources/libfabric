@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -47,10 +47,11 @@ static struct psmx_cq_event *psmx_cq_dequeue_event(struct psmx_fid_cq *cq)
 {
 	struct slist_entry *entry;
 
-	if (slist_empty(&cq->event_queue))
-		return NULL;
-
 	fastlock_acquire(&cq->lock);
+	if (slist_empty(&cq->event_queue)) {
+		fastlock_release(&cq->lock);
+		return NULL;
+	}
 	entry = slist_remove_head(&cq->event_queue);
 	cq->event_count--;
 	fastlock_release(&cq->lock);
@@ -106,6 +107,7 @@ struct psmx_cq_event *psmx_cq_create_event(struct psmx_fid_cq *cq,
 		event->cqe.err.data = data;
 		event->cqe.err.tag = tag;
 		event->cqe.err.olen = olen;
+		event->cqe.err.flags = flags;
 		event->cqe.err.prov_errno = PSM_INTERNAL_ERR;
 		goto out;
 	}
@@ -165,10 +167,21 @@ static struct psmx_cq_event *psmx_cq_create_event_from_status(
 	uint64_t flags;
 
 	switch((int)PSMX_CTXT_TYPE(fi_context)) {
+	case PSMX_NOCOMP_SEND_CONTEXT: /* error only */
+		op_context = NULL;
+		buf = NULL;
+		flags = FI_SEND | FI_MSG;
+		break;
 	case PSMX_SEND_CONTEXT:
 		op_context = fi_context;
 		buf = PSMX_CTXT_USER(fi_context);
 		flags = FI_SEND | FI_MSG;
+		break;
+	case PSMX_NOCOMP_RECV_CONTEXT: /* error only */
+		op_context = NULL;
+		buf = NULL;
+		flags = FI_RECV | FI_MSG;
+		is_recv = 1;
 		break;
 	case PSMX_RECV_CONTEXT:
 		op_context = fi_context;
@@ -196,11 +209,13 @@ static struct psmx_cq_event *psmx_cq_create_event_from_status(
 		flags = FI_RECV | FI_TAGGED;
 		is_recv = 1;
 		break;
+	case PSMX_NOCOMP_READ_CONTEXT: /* error only */
 	case PSMX_READ_CONTEXT:
 		op_context = PSMX_CTXT_USER(fi_context);
 		buf = NULL;
 		flags = FI_READ | FI_RMA;
 		break;
+	case PSMX_NOCOMP_WRITE_CONTEXT: /* error only */
 	case PSMX_WRITE_CONTEXT:
 		op_context = PSMX_CTXT_USER(fi_context);
 		buf = NULL;
@@ -377,8 +392,12 @@ int psmx_cq_poll_mq(struct psmx_fid_cq *cq, struct psmx_fid_domain *domain,
 			case PSMX_SEND_CONTEXT:
 			case PSMX_TSEND_CONTEXT:
 				tmp_cq = tmp_ep->send_cq;
-				/* Fall through */
+				tmp_cntr = tmp_ep->send_cntr;
+				break;
+
 			case PSMX_NOCOMP_SEND_CONTEXT:
+				if (psm_status.error_code)
+					tmp_cq = tmp_ep->send_cq;
 				tmp_cntr = tmp_ep->send_cntr;
 				break;
 
@@ -388,22 +407,34 @@ int psmx_cq_poll_mq(struct psmx_fid_cq *cq, struct psmx_fid_domain *domain,
 			case PSMX_RECV_CONTEXT:
 			case PSMX_TRECV_CONTEXT:
 				tmp_cq = tmp_ep->recv_cq;
-				/* Fall through */
+				tmp_cntr = tmp_ep->recv_cntr;
+				break;
+
 			case PSMX_NOCOMP_RECV_CONTEXT:
+				if (psm_status.error_code)
+					tmp_cq = tmp_ep->recv_cq;
 				tmp_cntr = tmp_ep->recv_cntr;
 				break;
 
 			case PSMX_WRITE_CONTEXT:
 				tmp_cq = tmp_ep->send_cq;
-				/* Fall through */
+				tmp_cntr = tmp_ep->write_cntr;
+				break;
+
 			case PSMX_NOCOMP_WRITE_CONTEXT:
+				if (psm_status.error_code)
+					tmp_cq = tmp_ep->send_cq;
 				tmp_cntr = tmp_ep->write_cntr;
 				break;
 
 			case PSMX_READ_CONTEXT:
 				tmp_cq = tmp_ep->send_cq;
-				/* Fall through */
+				tmp_cntr = tmp_ep->read_cntr;
+				break;
+
 			case PSMX_NOCOMP_READ_CONTEXT:
+				if (psm_status.error_code)
+					tmp_cq = tmp_ep->send_cq;
 				tmp_cntr = tmp_ep->read_cntr;
 				break;
 
@@ -606,11 +637,18 @@ static ssize_t psmx_cq_readerr(struct fid_cq *cq, struct fi_cq_err_entry *buf,
 			       uint64_t flags)
 {
 	struct psmx_fid_cq *cq_priv;
+	uint32_t api_version;
+	size_t size;
 
 	cq_priv = container_of(cq, struct psmx_fid_cq, cq);
 
 	if (cq_priv->pending_error) {
-		memcpy(buf, &cq_priv->pending_error->cqe, sizeof *buf);
+		api_version = cq_priv->domain->fabric->util_fabric.
+			      fabric_fid.api_version;
+		size = FI_VERSION_GE(api_version, FI_VERSION(1, 5)) ?
+			sizeof(*buf) : sizeof(struct fi_cq_err_entry_1_0);
+
+		memcpy(buf, &cq_priv->pending_error->cqe, size);
 		free(cq_priv->pending_error);
 		cq_priv->pending_error = NULL;
 		return 1;

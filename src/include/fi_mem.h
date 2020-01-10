@@ -99,7 +99,7 @@ struct name {							\
 								\
 static inline void name ## _init(struct name *fs, size_t size)	\
 {								\
-	int i;							\
+	ssize_t i;						\
 	assert(size == roundup_power_of_two(size));		\
 	assert(sizeof(fs->buf[0]) >= sizeof(void *));		\
 	fs->size = size;					\
@@ -121,7 +121,7 @@ static inline struct name * name ## _create(size_t size)	\
 static inline int name ## _index(struct name *fs,		\
 		entrytype *entry)				\
 {								\
-	return entry - fs->buf;					\
+	return (int)(entry - fs->buf);				\
 }								\
 								\
 static inline void name ## _free(struct name *fs)		\
@@ -242,10 +242,34 @@ static inline void *util_buf_alloc_ex(struct util_buf_pool *pool, void **context
 	struct util_buf_footer *buf_ftr;
 
 	buf = util_buf_alloc(pool);
+	if (OFI_UNLIKELY(!buf))
+		return NULL;
+
 	buf_ftr = (struct util_buf_footer *) ((char *) buf + pool->data_sz);
 	assert(context);
 	*context = buf_ftr->region->context;
 	return buf;
+}
+
+#if ENABLE_DEBUG
+static inline int util_buf_use_ftr(struct util_buf_pool *pool)
+{
+	OFI_UNUSED(pool);
+	return 1;
+}
+#else
+static inline int util_buf_use_ftr(struct util_buf_pool *pool)
+{
+	return (pool->alloc_hndlr || pool->free_hndlr) ? 1 : 0;
+}
+#endif
+
+static inline void *util_buf_get_ctx(struct util_buf_pool *pool, void *buf)
+{
+	struct util_buf_footer *buf_ftr;
+	assert(util_buf_use_ftr(pool));
+	buf_ftr = (struct util_buf_footer *) ((char *) buf + pool->data_sz);
+	return buf_ftr->region->context;
 }
 
 void util_buf_pool_destroy(struct util_buf_pool *pool);

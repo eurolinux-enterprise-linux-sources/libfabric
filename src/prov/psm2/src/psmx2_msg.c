@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -76,7 +76,10 @@ ssize_t psmx2_recv_generic(struct fid_ep *ep, void *buf, size_t len,
 
 	if ((ep_priv->caps & FI_DIRECTED_RECV) && src_addr != FI_ADDR_UNSPEC) {
 		av = ep_priv->av;
-		if (av && av->type == FI_AV_TABLE) {
+		if (av && PSMX2_SEP_ADDR_TEST(src_addr)) {
+			psm2_epaddr = psmx2_av_translate_sep(av, ep_priv->trx_ctxt, src_addr);
+			vlane = 0;
+		} else if (av && av->type == FI_AV_TABLE) {
 			idx = (size_t)src_addr;
 			if (idx >= av->last)
 				return -FI_EINVAL;
@@ -137,7 +140,7 @@ ssize_t psmx2_recv_generic(struct fid_ep *ep, void *buf, size_t len,
 		PSMX2_CTXT_SIZE(fi_context) = len;
 	}
 
-	err = psm2_mq_irecv2(ep_priv->domain->psm2_mq, psm2_epaddr,
+	err = psm2_mq_irecv2(ep_priv->trx_ctxt->psm2_mq, psm2_epaddr,
 			     &psm2_tag, &psm2_tagsel, recv_flag, buf, len,
 			     (void *)fi_context, &psm2_req);
 	if (err != PSM2_OK)
@@ -254,7 +257,10 @@ ssize_t psmx2_send_generic(struct fid_ep *ep, const void *buf, size_t len,
 	}
 
 	av = ep_priv->av;
-	if (av && av->type == FI_AV_TABLE) {
+	if (av && PSMX2_SEP_ADDR_TEST(dest_addr)) {
+		psm2_epaddr = psmx2_av_translate_sep(av, ep_priv->trx_ctxt, dest_addr);
+		vlane = 0;
+	} else if (av && av->type == FI_AV_TABLE) {
 		idx = (size_t)dest_addr;
 		if (idx >= av->last)
 			return -FI_EINVAL;
@@ -276,10 +282,10 @@ ssize_t psmx2_send_generic(struct fid_ep *ep, const void *buf, size_t len,
 		no_completion = 1;
 
 	if (flags & FI_INJECT) {
-		if (len > PSMX2_INJECT_SIZE)
+		if (len > psmx2_env.inject_size)
 			return -FI_EMSGSIZE;
 
-		err = psm2_mq_send2(ep_priv->domain->psm2_mq, psm2_epaddr,
+		err = psm2_mq_send2(ep_priv->trx_ctxt->psm2_mq, psm2_epaddr,
 				    send_flag, &psm2_tag, buf, len);
 
 		if (err != PSM2_OK)
@@ -306,7 +312,7 @@ ssize_t psmx2_send_generic(struct fid_ep *ep, const void *buf, size_t len,
 		return 0;
 	}
 
-	if (no_completion && !context) {
+	if (no_completion) {
 		fi_context = &ep_priv->nocomp_send_context;
 	} else {
 		if (!context)
@@ -318,7 +324,7 @@ ssize_t psmx2_send_generic(struct fid_ep *ep, const void *buf, size_t len,
 		PSMX2_CTXT_EP(fi_context) = ep_priv;
 	}
 
-	err = psm2_mq_isend2(ep_priv->domain->psm2_mq, psm2_epaddr,
+	err = psm2_mq_isend2(ep_priv->trx_ctxt->psm2_mq, psm2_epaddr,
 			     send_flag, &psm2_tag, buf, len,
 			     (void *)fi_context, &psm2_req);
 
@@ -426,7 +432,10 @@ ssize_t psmx2_sendv_generic(struct fid_ep *ep, const struct iovec *iov,
 	}
 
 	av = ep_priv->av;
-	if (av && av->type == FI_AV_TABLE) {
+	if (av && PSMX2_SEP_ADDR_TEST(dest_addr)) {
+		psm2_epaddr = psmx2_av_translate_sep(av, ep_priv->trx_ctxt, dest_addr);
+		vlane = 0;
+	} else if (av && av->type == FI_AV_TABLE) {
 		idx = (size_t)dest_addr;
 		if (idx >= av->last) {
 			free(req);
@@ -450,12 +459,12 @@ ssize_t psmx2_sendv_generic(struct fid_ep *ep, const struct iovec *iov,
 		no_completion = 1;
 
 	if (flags & FI_INJECT) {
-		if (len > PSMX2_INJECT_SIZE) {
+		if (len > psmx2_env.inject_size) {
 			free(req);
 			return -FI_EMSGSIZE;
 		}
 
-		err = psm2_mq_send2(ep_priv->domain->psm2_mq, psm2_epaddr,
+		err = psm2_mq_send2(ep_priv->trx_ctxt->psm2_mq, psm2_epaddr,
 				    send_flag, &psm2_tag, req->buf, len);
 
 		free(req);
@@ -493,7 +502,7 @@ ssize_t psmx2_sendv_generic(struct fid_ep *ep, const struct iovec *iov,
 	PSMX2_CTXT_USER(fi_context) = req;
 	PSMX2_CTXT_EP(fi_context) = ep_priv;
 
-	err = psm2_mq_isend2(ep_priv->domain->psm2_mq, psm2_epaddr,
+	err = psm2_mq_isend2(ep_priv->trx_ctxt->psm2_mq, psm2_epaddr,
 			     send_flag, &psm2_tag, req->buf, len,
 			     (void *)fi_context, &psm2_req);
 
@@ -514,7 +523,7 @@ ssize_t psmx2_sendv_generic(struct fid_ep *ep, const struct iovec *iov,
 		PSMX2_SET_TAG(psm2_tag, data, tag32);
 		for (i=0; i<count; i++) {
 			if (iov[i].iov_len) {
-				err = psm2_mq_isend2(ep_priv->domain->psm2_mq,
+				err = psm2_mq_isend2(ep_priv->trx_ctxt->psm2_mq,
 						     psm2_epaddr, send_flag, &psm2_tag,
 						     iov[i].iov_base, iov[i].iov_len,
 						     (void *)fi_context, &psm2_req);
@@ -594,7 +603,7 @@ int psmx2_handle_sendv_req(struct psmx2_fid_ep *ep,
 	for (i=0; i<rep->iov_info.count; i++) {
 		if (recv_len) {
 			len = MIN(recv_len, rep->iov_info.len[i]);
-			err = psm2_mq_irecv2(ep->domain->psm2_mq,
+			err = psm2_mq_irecv2(ep->trx_ctxt->psm2_mq,
 					     psm2_status->msg_peer,
 					     &psm2_tag, &psm2_tagsel,
 					     0/*flag*/, recv_buf, len,
@@ -607,7 +616,7 @@ int psmx2_handle_sendv_req(struct psmx2_fid_ep *ep,
 			recv_len -= len;
 		} else {
 			/* recv buffer full, pust empty recvs */
-			err = psm2_mq_irecv2(ep->domain->psm2_mq,
+			err = psm2_mq_irecv2(ep->trx_ctxt->psm2_mq,
 					     psm2_status->msg_peer,
 					     &psm2_tag, &psm2_tagsel,
 					     0/*flag*/, NULL, 0,
@@ -618,6 +627,9 @@ int psmx2_handle_sendv_req(struct psmx2_fid_ep *ep,
 			}
 		}
 	}
+
+	if (multi_recv && recv_len < recv_req->min_buf_size)
+		rep->comp_flag |= FI_MULTI_RECV;
 
 	return 0;
 }

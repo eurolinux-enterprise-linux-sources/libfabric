@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2016, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -55,6 +55,7 @@
 #include <rdma/fi_errno.h>
 #include "fi.h"
 #include "fi_enosys.h"
+#include "fi_util.h"
 
 #include "usnic_direct.h"
 #include "usd.h"
@@ -111,11 +112,32 @@ static const struct fi_ep_attr msg_dflt_ep_attr = {
 };
 
 static const struct fi_domain_attr msg_dflt_domain_attr = {
+	.caps = USDF_DOM_CAPS,
 	.threading = FI_THREAD_UNSPEC,
 	.control_progress = FI_PROGRESS_AUTO,
 	.data_progress = FI_PROGRESS_MANUAL,
 	.resource_mgmt = FI_RM_DISABLED,
-	.mr_mode = FI_MR_BASIC
+	.mr_mode = OFI_MR_BASIC_MAP | FI_MR_LOCAL,
+	.cntr_cnt = USDF_MSG_CNTR_CNT,
+	.mr_iov_limit = USDF_MSG_MR_IOV_LIMIT,
+	.mr_cnt = USDF_MSG_MR_CNT,
+};
+
+static struct fi_ops_atomic usdf_msg_atomic_ops = {
+	.size = sizeof(struct fi_ops_atomic),
+	.write = fi_no_atomic_write,
+	.writev = fi_no_atomic_writev,
+	.writemsg = fi_no_atomic_writemsg,
+	.inject = fi_no_atomic_inject,
+	.readwrite = fi_no_atomic_readwrite,
+	.readwritev = fi_no_atomic_readwritev,
+	.readwritemsg = fi_no_atomic_readwritemsg,
+	.compwrite = fi_no_atomic_compwrite,
+	.compwritev = fi_no_atomic_compwritev,
+	.compwritemsg = fi_no_atomic_compwritemsg,
+	.writevalid = fi_no_atomic_writevalid,
+	.readwritevalid = fi_no_atomic_readwritevalid,
+	.compwritevalid = fi_no_atomic_compwritevalid,
 };
 
 /*******************************************************************************
@@ -175,7 +197,7 @@ int usdf_msg_fill_dom_attr(uint32_t version, struct fi_info *hints,
 		return -FI_ENODATA;
 
 	if (!hints || !hints->domain_attr)
-		goto out;
+		goto catch;
 
 	/* how to handle fi_thread_fid, fi_thread_completion, etc?
 	 */
@@ -213,39 +235,55 @@ int usdf_msg_fill_dom_attr(uint32_t version, struct fi_info *hints,
 		return -FI_ENODATA;
 	}
 
-	switch (hints->domain_attr->mr_mode) {
-	case FI_MR_UNSPEC:
-	case FI_MR_BASIC:
+	switch (hints->domain_attr->caps) {
+	case 0:
+	case FI_REMOTE_COMM:
 		break;
 	default:
+		USDF_WARN_SYS(DOMAIN,
+			"invalid domain capabilities\n");
 		return -FI_ENODATA;
 	}
 
-out:
+	if (usdf_check_mr_mode(version, hints, defaults.mr_mode))
+		return -FI_ENODATA;
+
+	if (hints->domain_attr->mr_cnt <= USDF_MSG_MR_CNT) {
+		defaults.mr_cnt = hints->domain_attr->mr_cnt;
+	} else {
+		USDF_DBG_SYS(DOMAIN, "mr_count exceeded provider limit\n");
+		return -FI_ENODATA;
+	}
+
+catch:
+	/* catch the version changes here. */
+	ret = usdf_catch_dom_attr(version, hints, &defaults);
+	if (ret)
+		return ret;
+
 	*fi->domain_attr = defaults;
 
 	return FI_SUCCESS;
 }
 
-int usdf_msg_fill_tx_attr(struct fi_info *hints, struct fi_info *fi)
+int usdf_msg_fill_tx_attr(uint32_t version, struct fi_info *hints,
+			  struct fi_info *fi)
 {
+	int ret;
 	struct fi_tx_attr defaults;
 
 	defaults = msg_dflt_tx_attr;
 
 	if (!hints || !hints->tx_attr)
-		goto out;
+		goto catch;
 
 	/* make sure we can support the caps that are requested*/
 	if (hints->tx_attr->caps & ~USDF_MSG_CAPS)
 		return -FI_ENODATA;
 
 	/* clear the mode bits the app doesn't support */
-	defaults.mode &= (hints->mode | hints->tx_attr->mode);
-
-	/* make sure the app supports our required mode bits */
-	if ((defaults.mode & USDF_MSG_REQ_MODE) != USDF_MSG_REQ_MODE)
-		return -FI_ENODATA;
+	if (hints->mode || hints->tx_attr->mode)
+		defaults.mode &= (hints->mode | hints->tx_attr->mode);
 
 	defaults.op_flags |= hints->tx_attr->op_flags;
 
@@ -269,31 +307,34 @@ int usdf_msg_fill_tx_attr(struct fi_info *hints, struct fi_info *fi)
 	if (hints->tx_attr->size > defaults.size)
 		return -FI_ENODATA;
 
-out:
+catch:
+	/* catch version changes here. */
+	ret = usdf_catch_tx_attr(version, &defaults);
+	if (ret)
+		return ret;
+
 	*fi->tx_attr = defaults;
 
 	return FI_SUCCESS;
 }
 
-int usdf_msg_fill_rx_attr(struct fi_info *hints, struct fi_info *fi)
+int usdf_msg_fill_rx_attr(uint32_t version, struct fi_info *hints, struct fi_info *fi)
 {
+	int ret;
 	struct fi_rx_attr defaults;
 
 	defaults = msg_dflt_rx_attr;
 
 	if (!hints || !hints->rx_attr)
-		goto out;
+		goto catch;
 
 	/* make sure we can support the capabilities that are requested */
 	if (hints->rx_attr->caps & ~USDF_MSG_CAPS)
 		return -FI_ENODATA;
 
 	/* clear the mode bits the app doesn't support */
-	defaults.mode &= (hints->mode | hints->rx_attr->mode);
-
-	/* make sure the app supports our required mode bits */
-	if ((defaults.mode & USDF_MSG_REQ_MODE) != USDF_MSG_REQ_MODE)
-		return -FI_ENODATA;
+	if (hints->mode || hints->rx_attr->mode)
+		defaults.mode &= (hints->mode | hints->rx_attr->mode);
 
 	defaults.op_flags |= hints->rx_attr->op_flags;
 
@@ -314,7 +355,12 @@ int usdf_msg_fill_rx_attr(struct fi_info *hints, struct fi_info *fi)
 	if (hints->rx_attr->size > defaults.size)
 		return -FI_ENODATA;
 
-out:
+catch:
+	/* catch version changes here. */
+	ret = usdf_catch_rx_attr(version, &defaults);
+	if (ret)
+		return ret;
+
 	*fi->rx_attr = defaults;
 
 	return FI_SUCCESS;
@@ -647,7 +693,7 @@ usdf_ep_msg_bind_cq(struct usdf_ep *ep, struct usdf_cq *cq, uint64_t flags)
 			goto fail;
 
 		hcq->cqh_cq = cq;
-		atomic_initialize(&hcq->cqh_refcnt, 0);
+		ofi_atomic_initialize32(&hcq->cqh_refcnt, 0);
 		hcq->cqh_progress = usdf_msg_hcq_progress;
 		hcq->cqh_post = usdf_cq_post_soft;
 		TAILQ_INSERT_TAIL(&cq->c.soft.cq_list, hcq, cqh_link);
@@ -656,8 +702,8 @@ usdf_ep_msg_bind_cq(struct usdf_ep *ep, struct usdf_cq *cq, uint64_t flags)
 		TAILQ_INSERT_TAIL(&ep->ep_domain->dom_hcq_list,
 				hcq, cqh_dom_link);
 	}
-	atomic_inc(&hcq->cqh_refcnt);
-	atomic_inc(&cq->cq_refcnt);
+	ofi_atomic_inc32(&hcq->cqh_refcnt);
+	ofi_atomic_inc32(&cq->cq_refcnt);
 	*hcqp = hcq;
 	return 0;
 
@@ -669,10 +715,16 @@ fail:
 static int
 usdf_ep_msg_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 {
+	int ret;
 	struct usdf_ep *ep;
 	struct usdf_cq *cq;
 
 	USDF_TRACE_SYS(EP_CTRL, "\n");
+
+	/* Validate the flags. */
+	ret = ofi_ep_bind_valid(&usdf_ops, bfid, flags);
+	if (ret)
+		return ret;
 
 	ep = ep_fidtou(fid);
 
@@ -703,7 +755,7 @@ usdf_ep_msg_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 			return -FI_EINVAL;
 		}
 		ep->ep_eq = eq_fidtou(bfid);
-		atomic_inc(&ep->ep_eq->eq_refcnt);
+		ofi_atomic_inc32(&ep->ep_eq->eq_refcnt);
 		break;
 	default:
 		return -FI_EINVAL;
@@ -720,14 +772,14 @@ usdf_msg_rx_ctx_close(fid_t fid)
 
 	rx = rx_fidtou(fid);
 
-	if (atomic_get(&rx->rx_refcnt) > 0) {
+	if (ofi_atomic_get32(&rx->rx_refcnt) > 0) {
 		return -FI_EBUSY;
 	}
 
 	hcq = rx->r.msg.rx_hcq;
 	if (hcq != NULL) {
-		atomic_dec(&hcq->cqh_refcnt);
-		atomic_dec(&hcq->cqh_cq->cq_refcnt);
+		ofi_atomic_dec32(&hcq->cqh_refcnt);
+		ofi_atomic_dec32(&hcq->cqh_cq->cq_refcnt);
 	}
 
 	if (rx->rx_qp != NULL) {
@@ -735,7 +787,7 @@ usdf_msg_rx_ctx_close(fid_t fid)
 		free(rx->r.msg.rx_rqe_buf);
 		usd_destroy_qp(rx->rx_qp);
 	}
-	atomic_dec(&rx->rx_domain->dom_refcnt);
+	ofi_atomic_dec32(&rx->rx_domain->dom_refcnt);
 
 	free(rx);
 
@@ -750,14 +802,14 @@ usdf_msg_tx_ctx_close(fid_t fid)
 
 	tx = tx_fidtou(fid);
 
-	if (atomic_get(&tx->tx_refcnt) > 0) {
+	if (ofi_atomic_get32(&tx->tx_refcnt) > 0) {
 		return -FI_EBUSY;
 	}
 
 	hcq = tx->t.msg.tx_hcq;
 	if (hcq != NULL) {
-		atomic_dec(&hcq->cqh_refcnt);
-		atomic_dec(&hcq->cqh_cq->cq_refcnt);
+		ofi_atomic_dec32(&hcq->cqh_refcnt);
+		ofi_atomic_dec32(&hcq->cqh_cq->cq_refcnt);
 	}
 
 	if (tx->tx_qp != NULL) {
@@ -765,7 +817,7 @@ usdf_msg_tx_ctx_close(fid_t fid)
 		free(tx->t.msg.tx_wqe_buf);
 		usd_destroy_qp(tx->tx_qp);
 	}
-	atomic_dec(&tx->tx_domain->dom_refcnt);
+	ofi_atomic_dec32(&tx->tx_domain->dom_refcnt);
 
 	free(tx);
 
@@ -781,27 +833,27 @@ usdf_ep_msg_close(fid_t fid)
 
 	ep = ep_fidtou(fid);
 
-	if (atomic_get(&ep->ep_refcnt) > 0) {
+	if (ofi_atomic_get32(&ep->ep_refcnt) > 0) {
 		return -FI_EBUSY;
 	}
 
 	if (ep->ep_rx != NULL) {
-		atomic_dec(&ep->ep_rx->rx_refcnt);
+		ofi_atomic_dec32(&ep->ep_rx->rx_refcnt);
 		if (rx_utofid(ep->ep_rx)->fclass  == FI_CLASS_RX_CTX) {
 			(void) usdf_msg_rx_ctx_close(rx_utofid(ep->ep_rx));
 		}
 	}
 
 	if (ep->ep_tx != NULL) {
-		atomic_dec(&ep->ep_tx->tx_refcnt);
+		ofi_atomic_dec32(&ep->ep_tx->tx_refcnt);
 		if (tx_utofid(ep->ep_tx)->fclass  == FI_CLASS_TX_CTX) {
 			(void) usdf_msg_tx_ctx_close(tx_utofid(ep->ep_tx));
 		}
 	}
 
-	atomic_dec(&ep->ep_domain->dom_refcnt);
+	ofi_atomic_dec32(&ep->ep_domain->dom_refcnt);
 	if (ep->ep_eq != NULL) {
-		atomic_dec(&ep->ep_eq->eq_refcnt);
+		ofi_atomic_dec32(&ep->ep_eq->eq_refcnt);
 	}
 	usdf_timer_free(ep->ep_domain->dom_fabric, ep->e.msg.ep_ack_timer);
 
@@ -830,6 +882,7 @@ static struct fi_ops_cm usdf_cm_msg_ops = {
 	.accept = usdf_cm_msg_accept,
 	.reject = fi_no_reject,
 	.shutdown = fi_no_shutdown,
+	.join = fi_no_join,
 };
 
 static struct fi_ops_msg usdf_msg_ops = {
@@ -921,6 +974,7 @@ usdf_ep_msg_open(struct fid_domain *domain, struct fi_info *info,
 	struct usdf_connreq *connreq;
 	struct usdf_pep *parent_pep;
 	int is_bound;
+	uint32_t api_version;
 
 	USDF_TRACE_SYS(EP_CTRL, "\n");
 
@@ -951,6 +1005,7 @@ usdf_ep_msg_open(struct fid_domain *domain, struct fi_info *info,
 
 	udp = dom_ftou(domain);
 	fp = udp->dom_fabric;
+	api_version = fp->fab_attr.fabric->api_version;
 
 	/* allocate peer table if not done */
 	if (udp->dom_peer_tab == NULL) {
@@ -973,6 +1028,7 @@ usdf_ep_msg_open(struct fid_domain *domain, struct fi_info *info,
 	ep->ep_fid.ops = &usdf_base_msg_ops;
 	ep->ep_fid.cm = &usdf_cm_msg_ops;
 	ep->ep_fid.msg = &usdf_msg_ops;
+	ep->ep_fid.atomic = &usdf_msg_atomic_ops;
 	ep->ep_domain = udp;
 	ep->ep_caps = info->caps;
 	ep->ep_mode = info->mode;
@@ -1018,13 +1074,13 @@ usdf_ep_msg_open(struct fid_domain *domain, struct fi_info *info,
 			goto fail;
 		}
 		tx->tx_fid.fid.fclass = FI_CLASS_TX_CTX;
-		atomic_initialize(&tx->tx_refcnt, 0);
+		ofi_atomic_initialize32(&tx->tx_refcnt, 0);
 		tx->tx_domain = udp;
 		tx->tx_progress = usdf_msg_tx_progress;
-		atomic_inc(&udp->dom_refcnt);
+		ofi_atomic_inc32(&udp->dom_refcnt);
 
 		/* use info as the hints structure, and the output structure */
-		ret = usdf_msg_fill_tx_attr(info, info);
+		ret = usdf_msg_fill_tx_attr(api_version, info, info);
 		if (ret != 0)
 			goto fail;
 		tx->tx_attr = *info->tx_attr;
@@ -1034,7 +1090,7 @@ usdf_ep_msg_open(struct fid_domain *domain, struct fi_info *info,
 		TAILQ_INIT(&tx->t.msg.tx_ep_have_acks);
 
 		ep->ep_tx = tx;
-		atomic_inc(&tx->tx_refcnt);
+		ofi_atomic_inc32(&tx->tx_refcnt);
 	}
 	TAILQ_INIT(&ep->e.msg.ep_posted_wqe);
 
@@ -1047,12 +1103,12 @@ usdf_ep_msg_open(struct fid_domain *domain, struct fi_info *info,
 			goto fail;
 		}
 		rx->rx_fid.fid.fclass = FI_CLASS_RX_CTX;
-		atomic_initialize(&rx->rx_refcnt, 0);
+		ofi_atomic_initialize32(&rx->rx_refcnt, 0);
 		rx->rx_domain = udp;
-		atomic_inc(&udp->dom_refcnt);
+		ofi_atomic_inc32(&udp->dom_refcnt);
 
 		/* info serves as both the hints and the output */
-		ret = usdf_msg_fill_rx_attr(info, info);
+		ret = usdf_msg_fill_rx_attr(api_version, info, info);
 		if (ret != 0)
 			goto fail;
 		rx->rx_attr = *info->rx_attr;
@@ -1061,22 +1117,22 @@ usdf_ep_msg_open(struct fid_domain *domain, struct fi_info *info,
 		TAILQ_INIT(&rx->r.msg.rx_posted_rqe);
 
 		ep->ep_rx = rx;
-		atomic_inc(&rx->rx_refcnt);
+		ofi_atomic_inc32(&rx->rx_refcnt);
 	}
 
-	atomic_initialize(&ep->ep_refcnt, 0);
-	atomic_inc(&udp->dom_refcnt);
+	ofi_atomic_initialize32(&ep->ep_refcnt, 0);
+	ofi_atomic_inc32(&udp->dom_refcnt);
 
 	*ep_o = ep_utof(ep);
 	return 0;
 fail:
 	if (rx != NULL) {
 		free(rx);
-		atomic_dec(&udp->dom_refcnt);
+		ofi_atomic_dec32(&udp->dom_refcnt);
 	}
 	if (tx != NULL) {
 		free(tx);
-		atomic_dec(&udp->dom_refcnt);
+		ofi_atomic_dec32(&udp->dom_refcnt);
 	}
 	if (ep != NULL) {
 		if (ep->e.msg.ep_ack_timer != NULL) {

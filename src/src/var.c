@@ -123,19 +123,20 @@ out:
 	*params = vhead;
 	return FI_SUCCESS;
 }
-DEFAULT_SYMVER(fi_getparams_, fi_getparams);
+DEFAULT_SYMVER(fi_getparams_, fi_getparams, FABRIC_1.0);
 
 __attribute__((visibility ("default")))
 void DEFAULT_SYMVER_PRE(fi_freeparams)(struct fi_param *params)
 {
-	for (int i = 0; params[i].name; ++i) {
+	int i;
+	for (i = 0; params[i].name; ++i) {
 		free((void*) params[i].name);
 		free((void*) params[i].help_string);
 		free((void*) params[i].value);
 	}
 	free(params);
 }
-DEFAULT_SYMVER(fi_freeparams_, fi_freeparams);
+DEFAULT_SYMVER(fi_freeparams_, fi_freeparams, FABRIC_1.0);
 
 static void fi_free_param(struct fi_param_entry *param)
 {
@@ -221,7 +222,7 @@ int DEFAULT_SYMVER_PRE(fi_param_define)(const struct fi_provider *provider,
 	FI_INFO(provider, FI_LOG_CORE, "registered var %s\n", param_name);
 	return FI_SUCCESS;
 }
-DEFAULT_SYMVER(fi_param_define_, fi_param_define);
+DEFAULT_SYMVER(fi_param_define_, fi_param_define, FABRIC_1.0);
 
 static int fi_parse_bool(const char *str_value)
 {
@@ -296,7 +297,7 @@ int DEFAULT_SYMVER_PRE(fi_param_get)(struct fi_provider *provider,
 out:
 	return ret;
 }
-DEFAULT_SYMVER(fi_param_get_, fi_param_get);
+DEFAULT_SYMVER(fi_param_get_, fi_param_get, FABRIC_1.0);
 
 
 void fi_param_init(void)

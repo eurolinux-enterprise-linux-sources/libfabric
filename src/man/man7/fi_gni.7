@@ -1,4 +1,4 @@
-.TH "fi_gni" "7" "2016\-10\-07" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.4.2"
+.TH "fi_gni" "7" "2017\-07\-21" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.5.3"
 .SH NAME
 .PP
 The GNI Fabric Provider
@@ -14,45 +14,59 @@ and optimized collectives.
 .PP
 The GNI provider runs on Cray XC systems running CLE 5.2 UP04 or higher
 using gcc version 4.9 or higher.
+.PP
+When using the fi_mr_regattr() and fi_mr_regv() functions to register
+multiple region, users must register the memory region with 4K page
+alignment.
+Any other page address alignment will result in a return value of
+\-FI_EINVAL.
 .SH SUPPORTED FEATURES
 .PP
 The GNI provider supports the following features defined for the
 libfabric API:
 .PP
-\f[I]Endpoint types\f[] : The provider supports the \f[I]FI_EP_RDM\f[]
-and \f[I]FI_EP_DGRAM\f[] endpoint types.
+\f[I]Endpoint types\f[] : The provider supports the \f[I]FI_EP_RDM\f[],
+\f[I]FI_EP_DGRAM\f[], \f[I]FI_EP_MSG\f[] endpoint types, including
+scalable endpoints.
 .PP
 \f[I]Address vectors\f[] : The provider implements both the
 \f[I]FI_AV_MAP\f[] and \f[I]FI_AV_TABLE\f[] address vector types.
+FI_EVENT is unsupported.
 .PP
 \f[I]Memory registration modes\f[] : The provider implements the
 \f[I]FI_MR_BASIC\f[] memory registration mode.
 .PP
-\f[I]Data transfer operations\f[]
-.PP
-: The following data transfer interfaces are supported for all endpoint
-types: \f[I]FI_ATOMIC\f[], \f[I]FI_MSG\f[], \f[I]FI_RMA\f[],
-\f[I]FI_TAGGED\f[].
+\f[I]Data transfer operations\f[] : The following data transfer
+interfaces are supported for all endpoint types: \f[I]FI_ATOMIC\f[],
+\f[I]FI_MSG\f[], \f[I]FI_RMA\f[], \f[I]FI_TAGGED\f[].
 See DATA TRANSFER OPERATIONS below for more details.
 .PP
 \f[I]Completion events\f[] : The GNI provider supports
 \f[I]FI_CQ_FORMAT_CONTEXT\f[], \f[I]FI_CQ_FORMAT_MSG\f[],
 \f[I]FI_CQ_FORMAT_DATA\f[] and \f[I]FI_CQ_FORMAT_TAGGED\f[] with wait
-objects of type \f[I]FI_WAIT_NONE\f[], \f[I]FI_WAIT_FD\f[], and
-\f[I]FI_WAIT_MUTEX_COND\f[].
+objects of type \f[I]FI_WAIT_NONE\f[], \f[I]FI_WAIT_UNSPEC\f[],
+\f[I]FI_WAIT_SET\f[].
 .PP
 \f[I]Modes\f[] : The GNI provider does not require any operation modes.
 .PP
-\f[I]Progress\f[]
+\f[I]Progress\f[] : For both control and data progress, the GNI provider
+supports both \f[I]FI_PROGRESS_AUTO\f[] and \f[I]FI_PROGRESS_MANUAL\f[],
+with a default set to \f[I]FI_PROGRESS_AUTO\f[].
+Note that for data progress, progression is only performed when data
+transfers use the rendezvous protocol.
 .PP
-: For both control and data progress, the GNI provider supports both
-\f[I]FI_PROGRESS_AUTO\f[] and \f[I]FI_PROGRESS_MANUAL\f[], with a
-default set to \f[I]FI_PROGRESS_AUTO\f[].
+\f[I]Wait Objects\f[] : The GNI provider specifically supports wait
+object types \f[I]FI_WAIT_UNSPEC\f[], and \f[I]FI_WAIT_SET\f[].
+A wait object must be used when calling fi_cntr_wait, fi_cq_sread/from,
+fi_eq_sread/from, fi_wait.
+The GNI provider spawns an internal wait progress thread that is woken
+up when clients utilize the wait system (e.g., calling fi_wait).
 .PP
 \f[I]Additional Features\f[] : The GNI provider also supports the
 following capabilities and features: \- \f[I]FI_MULTI_RECV\f[] \-
 \f[I]FI_SOURCE\f[] \- \f[I]FI_FENCE\f[] \- \f[I]FI_RM_ENABLED\f[] \-
-\f[I]FABRIC_DIRECT\f[] compilation mode
+\f[I]FI_RMA_EVENT\f[] \- \f[I]FI_REMOTE_CQ_DATA\f[] \-
+\f[I]FABRIC_DIRECT\f[] compilation mode \- \f[I]FI_MORE\f[] (For FI_RMA)
 .SH DATA TRANSFER OPERATIONS
 .SS FI_ATOMIC
 .PP
@@ -212,6 +226,10 @@ The value must be greater than 0.
 messages using the GNI provider internal rendezvous protocol.
 The value is of type bool.
 .PP
+\f[I]GNI_DGRAM_PROGRESS_TIMEOUT\f[] : Controls timeout value in
+milliseconds for the control progress thread.
+The value is of type uint32_t.
+.PP
 The \f[C]flush_cache\f[] function allows the user to flush any stale
 registration cache entries from the cache.
 This has the effect of removing registrations from the cache that have
@@ -242,6 +260,53 @@ adds the following parameter:
 with this call are GNIX_FAB_RQ_NAMO_AX (AND and XOR), and
 GNIX_FAB_RQ_NAMO_AX_S (AND and XOR 32 bit), GNIX_FAB_RQ_NAMO_FAX (Fetch
 AND and XOR) and GNIX_FAB_RQ_NAMO_FAX_S (Fetch AND and XOR 32 bit).
+.SH NOTES
+.PP
+The default address format is FI_ADDR_GNI.
+This is the only address format used within the GNI provider for message
+passing.
+FI_ADDR_STR is always parsed and converted to FI_ADDR_GNI for use within
+the GNI provider.
+.PP
+\f[I]FI_ADDR_STR\f[] is formatted as follows:
+gni;node;service;GNIX_AV_STR_ADDR_VERSION;device_addr;cdm_id;name_type;cm_nic_cdm_id;cookie;rx_ctx_cnt
+.PP
+The GNI provider sets the domain attribute \f[I]cntr_cnt\f[] to the the
+CQ limit divided by 2.
+.PP
+The GNI provider sets the domain attribute \f[I]cq_cnt\f[] to the CQ
+limit divided by 2.
+.PP
+The GNI provider sets the domain attribute \f[I]ep_cnt\f[] to SIZE_MAX.
+.PP
+Completion queue events may report unknown source address information
+when using \f[I]FI_SOURCE\f[].
+The source address information will be reported in the err_data member
+of the struct fi_cq_err_entry populated by fi_cq_readerr.
+The err_data member will contain the source address information in the
+FI_ADDR_GNI address format.
+In order to populate the remote peer\[aq]s address vector with this
+mechanism, the application must call fi_cq_readerr to get the source
+address followed by fi_av_insert on the populated err_data member.
+.PP
+For FI_MULTI_RECV, the GNI provider generates a separate FI_MULTI_RECV
+CQ event once the receive buffer has been consumed.
+Also, owing to the out\-or\-order nature of the Cray network, the CQ
+events associated with individual messages arriving in the receive
+buffer may be generated out of order with respect to the offset into the
+buffer into which the messages were received.
+.SH KNOWN BUGS
+.PP
+The GNI provider currently treats the fi_shutdown() interface as a
+strictly local operation.
+That is, fi_shutdown() causes the local endpoint to be shut down, and a
+shutdown event to be generated on the local EQ.
+However, a connected remote peer endpoint is not notified of a call to
+fi_shutdown().
+.PP
+The GNI provider does not currently handle the case when
+FI_OPT_MULTI_RECV is set to 0 and will return \-FI_EINVAL if an
+application attempts to set this value to zero.
 .SH SEE ALSO
 .PP
 \f[C]fabric\f[](7), \f[C]fi_open_ops\f[](3), \f[C]fi_provider\f[](7),

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
  * Copyright (c) 2016 Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -48,6 +48,7 @@ extern "C" {
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -63,6 +64,7 @@ extern "C" {
 #include <rdma/fi_cm.h>
 #include <rdma/fi_errno.h>
 #include "fi.h"
+#include "ofi_atomic.h"
 #include "fi_enosys.h"
 #include "fi_list.h"
 #include "fi_util.h"
@@ -74,7 +76,7 @@ extern struct fi_provider psmx_prov;
 
 extern int psmx_am_compat_mode;
 
-#define PSMX_VERSION	(FI_VERSION(1,3))
+#define PSMX_VERSION	(FI_VERSION(1,5))
 
 #define PSMX_OP_FLAGS	(FI_INJECT | FI_MULTI_RECV | FI_COMPLETION | \
 			 FI_TRIGGER | FI_INJECT_COMPLETE | \
@@ -90,6 +92,8 @@ extern int psmx_am_compat_mode;
 
 #define PSMX_SUB_CAPS	(FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE | \
 			 FI_SEND | FI_RECV)
+
+#define PSMX_DOM_CAPS	(FI_LOCAL_COMM | FI_REMOTE_COMM)
 
 #define PSMX_MAX_MSG_SIZE	((0x1ULL << 32) - 1)
 #define PSMX_INJECT_SIZE	(64)
@@ -242,7 +246,7 @@ struct psmx_fid_fabric {
 	struct util_fabric	util_fabric;
 	struct psmx_fid_domain	*active_domain;
 	psm_uuid_t		uuid;
-	pthread_t		name_server_thread;
+	struct util_ns		name_server;
 };
 
 struct psmx_fid_domain {
@@ -295,12 +299,13 @@ struct psmx_fid_domain {
 
 #define PSMX_DEFAULT_UNIT	(-1)
 #define PSMX_DEFAULT_PORT	0
-#define PSMX_DEFAULT_SERVICE	0
+#define PSMX_ANY_SERVICE	0
 
 struct psmx_src_name {
-	int	unit;		/* start from 0. -1 means any */
-	int	port;		/* start from 1. 0 means any */
-	int	service;	/* 0 means any */
+	uint16_t	signature;	/* 0xFFFF, different from any valid epid */
+	int8_t		unit;		/* start from 0. -1 means any */
+	uint8_t		port;		/* start from 1. 0 means any */
+	uint32_t	service;	/* 0 means any */
 };
 
 struct psmx_cq_event {
@@ -468,8 +473,8 @@ struct psmx_fid_cntr {
 	struct psmx_fid_domain	*domain;
 	int			events;
 	uint64_t		flags;
-	atomic_t		counter;
-	atomic_t		error_counter;
+	ofi_atomic64_t		counter;
+	ofi_atomic64_t		error_counter;
 	struct util_wait	*wait;
 	int			wait_is_local;
 	struct psmx_trigger	*trigger;
@@ -508,10 +513,11 @@ struct psmx_fid_ep {
 	uint64_t		tx_flags;
 	uint64_t		rx_flags;
 	uint64_t		caps;
-	atomic_t		ref;
+	ofi_atomic32_t		ref;
 	struct fi_context	nocomp_send_context;
 	struct fi_context	nocomp_recv_context;
 	size_t			min_multi_recv;
+	int			service;
 };
 
 struct psmx_fid_stx {
@@ -584,32 +590,50 @@ int	psmx_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 		     struct fid_av **av, void *context);
 int	psmx_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
 		       struct fid_cntr **cntr, void *context);
+int	psmx_query_atomic(struct fid_domain *doamin, enum fi_datatype datatype,
+			  enum fi_op op, struct fi_atomic_attr *attr,
+			  uint64_t flags);
 
 static inline void psmx_fabric_acquire(struct psmx_fid_fabric *fabric)
 {
-	atomic_inc(&fabric->util_fabric.ref);
+	ofi_atomic_inc32(&fabric->util_fabric.ref);
 }
 
 static inline void psmx_fabric_release(struct psmx_fid_fabric *fabric)
 {
-	atomic_dec(&fabric->util_fabric.ref);
+	ofi_atomic_dec32(&fabric->util_fabric.ref);
 }
 
 static inline void psmx_domain_acquire(struct psmx_fid_domain *domain)
 {
-	atomic_inc(&domain->util_domain.ref);
+	ofi_atomic_inc32(&domain->util_domain.ref);
 }
 
 static inline void psmx_domain_release(struct psmx_fid_domain *domain)
 {
-	atomic_dec(&domain->util_domain.ref);
+	ofi_atomic_dec32(&domain->util_domain.ref);
 }
 
 int	psmx_domain_check_features(struct psmx_fid_domain *domain, int ep_cap);
 int	psmx_domain_enable_ep(struct psmx_fid_domain *domain, struct psmx_fid_ep *ep);
 void	psmx_domain_disable_ep(struct psmx_fid_domain *domain, struct psmx_fid_ep *ep);
-void 	*psmx_name_server(void *args);
-void	*psmx_resolve_name(const char *servername, int port);
+
+static inline
+int	psmx_ns_service_cmp(void *svc1, void *svc2)
+{
+	int service1 = *(int *)svc1, service2 = *(int *)svc2;
+	if (service1 == PSMX_ANY_SERVICE ||
+	    service2 == PSMX_ANY_SERVICE)
+		return 0;
+	return (service1 < service2) ? -1 : (service1 > service2);
+}
+
+static inline
+int	psmx_ns_is_service_wildcard(void *svc)
+{
+	return (*(int *)svc == PSMX_ANY_SERVICE);
+}
+
 void	psmx_get_uuid(psm_uuid_t uuid);
 int	psmx_uuid_to_port(psm_uuid_t uuid);
 char	*psmx_uuid_to_string(psm_uuid_t uuid);
@@ -654,7 +678,7 @@ void	psmx_cntr_add_trigger(struct psmx_fid_cntr *cntr, struct psmx_trigger *trig
 
 static inline void psmx_cntr_inc(struct psmx_fid_cntr *cntr)
 {
-	atomic_inc(&cntr->counter);
+	ofi_atomic_inc64(&cntr->counter);
 	psmx_cntr_check_trigger(cntr);
 	if (cntr->wait)
 		cntr->wait->signal(cntr->wait);

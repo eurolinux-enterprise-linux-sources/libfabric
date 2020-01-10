@@ -62,10 +62,12 @@
 #include <rdma/fi_errno.h>
 
 #include "fi.h"
+#include "ofi_atomic.h"
 #include "fi_enosys.h"
 #include "prov.h"
 #include "fi_list.h"
 #include "fi_signal.h"
+#include "fi_util.h"
 
 #ifndef AF_IB
 #define AF_IB 27
@@ -82,6 +84,7 @@
 #define VERBS_INFO(subsys, ...) FI_INFO(&fi_ibv_prov, subsys, __VA_ARGS__)
 #define VERBS_INFO_ERRNO(subsys, fn, errno) VERBS_INFO(subsys, fn ": %s(%d)\n",	\
 		strerror(errno), errno)
+#define VERBS_WARN(subsys, ...) FI_WARN(&fi_ibv_prov, subsys, __VA_ARGS__)
 
 
 #define VERBS_INJECT_FLAGS(ep, len, flags) (((flags & FI_INJECT) || \
@@ -100,8 +103,18 @@
 #define VERBS_EPE_CNT 1024
 
 #define VERBS_DEF_CQ_SIZE 1024
+#define VERBS_MR_IOV_LIMIT 1
 
 extern struct fi_provider fi_ibv_prov;
+extern struct fi_info *verbs_info;
+
+extern size_t verbs_default_tx_size;
+extern size_t verbs_default_rx_size;
+extern size_t verbs_default_tx_iov_limit;
+extern size_t verbs_default_rx_iov_limit;
+extern size_t verbs_default_inline_size;
+
+extern size_t verbs_min_rnr_timer;
 
 struct verbs_addr {
 	struct dlist_entry entry;
@@ -115,7 +128,7 @@ struct verbs_dev_info {
 };
 
 struct fi_ibv_fabric {
-	struct fid_fabric	fabric_fid;
+	struct util_fabric	util_fabric;
 };
 
 int fi_ibv_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
@@ -155,15 +168,27 @@ typedef fi_addr_t
 	(*fi_ibv_rdm_conn_to_addr_func)
 	(struct fi_ibv_rdm_ep *ep, struct fi_ibv_rdm_conn *conn);
 
+typedef struct fi_ibv_rdm_av_entry *
+	(*fi_ibv_rdm_addr_to_av_entry_func)
+	(struct fi_ibv_rdm_ep *ep, fi_addr_t addr);
+
+typedef fi_addr_t
+	(*fi_ibv_rdm_av_entry_to_addr_func)
+	(struct fi_ibv_rdm_ep *ep, struct fi_ibv_rdm_av_entry *av_entry);
+
 struct fi_ibv_av {
 	struct fid_av		av_fid;
 	struct fi_ibv_domain	*domain;
 	struct fi_ibv_rdm_ep	*ep;
+	struct fi_ibv_eq	*eq;
 	size_t			count;
 	size_t			used;
+	uint64_t		flags;
 	enum fi_av_type		type;
 	fi_ibv_rdm_addr_to_conn_func addr_to_conn;
 	fi_ibv_rdm_conn_to_addr_func conn_to_addr;
+	fi_ibv_rdm_addr_to_av_entry_func addr_to_av_entry;
+	fi_ibv_rdm_av_entry_to_addr_func av_entry_to_addr;
 };
 
 int fi_ibv_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
@@ -177,6 +202,7 @@ struct fi_ibv_pep {
 	int			backlog;
 	int			bound;
 	size_t			src_addrlen;
+	struct fi_info		*info;
 };
 
 struct fi_ops_cm *fi_ibv_pep_ops_cm(struct fi_ibv_pep *pep);
@@ -193,8 +219,11 @@ struct fi_ibv_domain {
 	 */
 	int			rdm;
 	struct fi_ibv_rdm_cm	*rdm_cm;
+	struct slist		ep_list;
 	struct fi_info		*info;
 	struct fi_ibv_fabric	*fab;
+	struct fi_ibv_eq	*eq;
+	uint64_t		eq_flags;
 };
 
 struct fi_ibv_cq;
@@ -223,7 +252,7 @@ struct fi_ibv_cq {
 	uint64_t		send_signal_wr_id;
 	uint64_t		wr_id_mask;
 	fi_ibv_trywait_func	trywait;
-	atomic_t		nevents;
+	ofi_atomic32_t		nevents;
 	struct util_buf_pool	*epe_pool;
 	struct util_buf_pool	*wce_pool;
 };
@@ -266,9 +295,10 @@ struct fi_ibv_msg_ep {
 	struct fi_ibv_srq_ep	*srq_ep;
 	uint64_t		ep_flags;
 	struct fi_info		*info;
-	atomic_t		unsignaled_send_cnt;
-	atomic_t		comp_pending;
+	ofi_atomic32_t		unsignaled_send_cnt;
+	ofi_atomic32_t		comp_pending;
 	uint64_t		ep_id;
+	struct fi_ibv_domain	*domain;
 };
 
 struct fi_ibv_msg_epe {
@@ -288,6 +318,8 @@ int fi_ibv_create_ep(const char *node, const char *service,
 void fi_ibv_destroy_ep(struct rdma_addrinfo *rai, struct rdma_cm_id **id);
 int fi_rbv_rdm_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
 			struct fid_cntr **cntr, void *context);
+int fi_ibv_rdm_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
+			struct fid_av **av_fid, void *context);
 struct fi_ops_atomic *fi_ibv_msg_ep_ops_atomic(struct fi_ibv_msg_ep *ep);
 struct fi_ops_cm *fi_ibv_msg_ep_ops_cm(struct fi_ibv_msg_ep *ep);
 struct fi_ops_msg *fi_ibv_msg_ep_ops_msg(struct fi_ibv_msg_ep *ep);
@@ -311,7 +343,6 @@ void fi_ibv_free_info();
 int fi_ibv_getinfo(uint32_t version, const char *node, const char *service,
 		   uint64_t flags, struct fi_info *hints, struct fi_info **info);
 struct fi_info *fi_ibv_get_verbs_info(const char *domain_name);
-void fi_ibv_update_info(const struct fi_info *hints, struct fi_info *info);
 int fi_ibv_fi_to_rai(const struct fi_info *fi, uint64_t flags,
 		     struct rdma_addrinfo *rai);
 int fi_ibv_get_rdma_rai(const char *node, const char *service, uint64_t flags,
@@ -326,10 +357,6 @@ struct verbs_ep_domain {
 
 extern const struct verbs_ep_domain verbs_rdm_domain;
 
-int fi_ibv_check_fabric_attr(const struct fi_fabric_attr *attr,
-			     const struct fi_info *info);
-int fi_ibv_check_domain_attr(const struct fi_domain_attr *attr,
-			     const struct fi_info *info);
 int fi_ibv_check_ep_attr(const struct fi_ep_attr *attr,
 			 const struct fi_info *info);
 int fi_ibv_check_rx_attr(const struct fi_rx_attr *attr,
@@ -349,6 +376,14 @@ ssize_t fi_ibv_send_iov_flags(struct fi_ibv_msg_ep *ep, struct ibv_send_wr *wr,
 			      void *context, uint64_t flags);
 ssize_t fi_ibv_poll_cq(struct fi_ibv_cq *cq, struct ibv_wc *wc);
 int fi_ibv_cq_signal(struct fid_cq *cq);
+
+ssize_t fi_ibv_eq_write_event(struct fi_ibv_eq *eq, uint32_t event,
+		const void *buf, size_t len);
+
+int fi_ibv_query_atomic(struct fid_domain *domain_fid, enum fi_datatype datatype,
+			enum fi_op op, struct fi_atomic_attr *attr,
+			uint64_t flags);
+int fi_ibv_set_rnr_timer(struct ibv_qp *qp);
 
 #define fi_ibv_set_sge(sge, buf, len, desc)				\
 	do {								\

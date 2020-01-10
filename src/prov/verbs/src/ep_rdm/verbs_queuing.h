@@ -113,6 +113,9 @@ fi_ibv_rdm_move_to_unexpected_queue(struct fi_ibv_rdm_request *request)
 	FI_IBV_RDM_DBG_REQUEST("move_to_unexpected_queue: ", request,
 				FI_LOG_DEBUG);
 	dlist_insert_tail(&request->queue_entry, &fi_ibv_rdm_unexp_queue);
+#if ENABLE_DEBUG
+	request->minfo.conn->unexp_counter++;
+#endif // ENABLE_DEBUG
 }
 
 static inline void
@@ -143,6 +146,11 @@ fi_ibv_rdm_move_to_posted_queue(struct fi_ibv_rdm_request *request,
 	FI_IBV_RDM_DBG_REQUEST("move_to_posted_queue: ", request, FI_LOG_DEBUG);
 	dlist_insert_tail(&request->queue_entry, &fi_ibv_rdm_posted_queue);
 	ep->posted_recvs++;
+#if ENABLE_DEBUG
+	if (request->minfo.conn) {
+		request->minfo.conn->exp_counter++;
+	}
+#endif // ENABLE_DEBUG
 }
 
 static inline void
@@ -156,19 +164,19 @@ fi_ibv_rdm_remove_from_posted_queue(struct fi_ibv_rdm_request *request,
 }
 
 static inline struct fi_ibv_rdm_request *
-fi_ibv_rdm_take_first_from_posted_queue()
+fi_ibv_rdm_take_first_from_posted_queue(struct fi_ibv_rdm_ep* ep)
 {
 	if (!dlist_empty(&fi_ibv_rdm_posted_queue)) {
 		struct fi_ibv_rdm_request *entry =
 			container_of(fi_ibv_rdm_posted_queue.next,
 				     struct fi_ibv_rdm_request, queue_entry);
-		fi_ibv_rdm_remove_from_unexp_queue(entry);
+		fi_ibv_rdm_remove_from_posted_queue(entry, ep);
 		return entry;
 	}
 	return NULL;
 }
 
-static inline void
+static inline int
 fi_ibv_rdm_move_to_postponed_queue(struct fi_ibv_rdm_request *request)
 {
 	FI_IBV_RDM_DBG_REQUEST("move_to_postponed_queue: ", request, 
@@ -180,6 +188,10 @@ fi_ibv_rdm_move_to_postponed_queue(struct fi_ibv_rdm_request *request)
 	if (dlist_empty(&conn->postponed_requests_head)) {
 		struct fi_ibv_rdm_postponed_entry *entry =
 			util_buf_alloc(fi_ibv_rdm_postponed_pool);
+		if (OFI_UNLIKELY(!entry)) {
+			VERBS_WARN(FI_LOG_EP_DATA, "Unable to alloc buffer");
+			return -FI_ENOMEM;
+		}
 
 		entry->conn = conn;	
 		conn->postponed_entry = entry;
@@ -189,6 +201,8 @@ fi_ibv_rdm_move_to_postponed_queue(struct fi_ibv_rdm_request *request)
 	}
 	dlist_insert_tail(&request->queue_entry,
 			  &conn->postponed_requests_head);
+
+	return FI_SUCCESS;
 }
 
 static inline void

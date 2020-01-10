@@ -1,4 +1,4 @@
-.TH "fi_cq" "3" "2016\-10\-24" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.4.2"
+.TH "fi_cq" "3" "2017\-06\-06" "Libfabric Programmer\[aq]s Manual" "Libfabric v1.5.3"
 .SH NAME
 .PP
 fi_cq \- Completion queue operations
@@ -205,10 +205,11 @@ object.
 Wait objects allow applications to block until the wait object is
 signaled, indicating that a completion is available to be read.
 Users may use fi_control to retrieve the underlying wait object
-associated with an CQ, in order to use it in other system calls.
+associated with a CQ, in order to use it in other system calls.
 The following values may be used to specify the type of wait object
-associated with an CQ: FI_WAIT_NONE, FI_WAIT_UNSPEC, FI_WAIT_SET,
+associated with a CQ: FI_WAIT_NONE, FI_WAIT_UNSPEC, FI_WAIT_SET,
 FI_WAIT_FD, and FI_WAIT_MUTEX_COND.
+The default is FI_WAIT_NONE.
 .IP \[bu] 2
 \f[I]FI_WAIT_NONE\f[] : Used to indicate that the user will not block
 (wait) for completions on the CQ.
@@ -248,8 +249,8 @@ associated with the CQ should target.
 This field should be treated as a hint to the provider and may be
 ignored if the provider does not support interrupt affinity.
 .PP
-\f[I]wait_cond\f[] : By default, when a completion is inserted into an
-CQ that supports blocking reads (fi_cq_sread/fi_cq_sreadfrom), the
+\f[I]wait_cond\f[] : By default, when a completion is inserted into a CQ
+that supports blocking reads (fi_cq_sread/fi_cq_sreadfrom), the
 corresponding wait object is signaled.
 Users may specify a condition that must first be met before the wait is
 satisfied.
@@ -295,7 +296,7 @@ The fi_control call is used to access provider or implementation
 specific details of the completion queue.
 Access to the CQ should be serialized across all calls when fi_control
 is invoked, as it may redirect the implementation of CQ operations.
-The following control commands are usable with an CQ.
+The following control commands are usable with a CQ.
 .PP
 \f[I]FI_GETWAIT (void **)\f[] : This command allows the user to retrieve
 the low\-level wait object associated with the CQ.
@@ -304,19 +305,33 @@ the CQ attributes.
 The fi_control arg parameter should be an address where a pointer to the
 returned wait object will be written.
 See fi_eq.3 for addition details using fi_control with FI_GETWAIT.
-.SS fi_cq_read / fi_cq_readfrom
+.SS fi_cq_read
 .PP
-The fi_cq_read and fi_cq_readfrom operations perform a non\-blocking
-read of completion data from the CQ.
+The fi_cq_read operation performs a non\-blocking read of completion
+data from the CQ.
 The format of the completion event is determined using the fi_cq_format
 option that was specified when the CQ was opened.
 Multiple completions may be retrieved from a CQ in a single call.
 The maximum number of entries to return is limited to the specified
 count parameter, with the number of entries successfully read from the
 CQ returned by the call.
+(See return values section below.)
 .PP
-The fi_cq_readfrom call allows the CQ to return source address
-information to the user for any received data.
+CQs are optimized to report operations which have completed
+successfully.
+Operations which fail are reported \[aq]out of band\[aq].
+Such operations are retrieved using the fi_cq_readerr function.
+When an operation that has completed with an unexpected error is
+encountered, it is placed into a temporary error queue.
+Attempting to read from a CQ while an item is in the error queue results
+in fi_cq_read failing with a return code of \-FI_EAVAIL.
+Applications may use this return code to determine when to call
+fi_cq_readerr.
+.SS fi_cq_readfrom
+.PP
+The fi_cq_readfrom call behaves identical to fi_cq_read, with the
+exception that it allows the CQ to return source address information to
+the user for any received data.
 Source address data is only available for those endpoints configured
 with FI_SOURCE capability.
 If fi_cq_readfrom is called on an endpoint for which source addressing
@@ -325,16 +340,29 @@ FI_ADDR_NOTAVAIL.
 The number of input src_addr entries must the the same as the count
 parameter.
 .PP
-CQs are optimized to report operations which have completed
-successfully.
-Operations which fail are reported \[aq]out of band\[aq].
-Such operations are retrieved using the fi_cq_readerr function.
-When an operation that completes with an unexpected error is inserted
-into an CQ, it is placed into a temporary error queue.
-Attempting to read from an CQ while an item is in the error queue
-results in an FI_EAVAIL failure.
-Applications may use this return code to determine when to call
-fi_cq_readerr.
+Returned source addressing data is converted from the native address
+used by the underlying fabric into an fi_addr_t, which may be used in
+transmit operations.
+Typically, returning fi_addr_t requires that the source address be
+inserted into the address vector associated with the receiving endpoint.
+For endpoints allocated using the FI_SOURCE_ERR capability, if the
+source address has not been inserted into the address vector,
+fi_cq_readfrom will return \-FI_EAVAIL.
+The completion will then be reported through fi_cq_readerr with error
+code \-FI_EADDRNOTAVAIL.
+See fi_cq_readerr for details.
+.PP
+If FI_SOURCE is specified without FI_SOURCE_ERR, source addresses which
+cannot be mapped to a local fi_addr_t will be reported as
+FI_ADDR_NOTAVAIL.
+The behavior is dependent on the type of address vector in use.
+For AVs of type FI_AV_MAP, source addresses may be mapped directly to an
+fi_addr_t value, even if the source address were not inserted into the
+AV.
+This allows the provider to optimize the reporting of the source
+fi_addr_t without the overhead of verifying whether the address is in
+the AV.
+If full address validation is necessary, FI_SOURCE_ERR must be used.
 .SS fi_cq_sread / fi_cq_sreadfrom
 .PP
 The fi_cq_sread and fi_cq_sreadfrom calls are the blocking equivalent
@@ -369,6 +397,7 @@ struct\ fi_cq_err_entry\ {
 \ \ \ \ int\ \ \ \ \ \ err;\ \ \ \ \ \ \ \ \ /*\ positive\ error\ code\ */
 \ \ \ \ int\ \ \ \ \ \ prov_errno;\ \ /*\ provider\ error\ code\ */
 \ \ \ \ void\ \ \ \ *err_data;\ \ \ \ /*\ \ error\ data\ */
+\ \ \ \ size_t\ \ \ err_data_size;\ /*\ size\ of\ err_data\ */
 };
 \f[]
 .fi
@@ -382,6 +411,20 @@ The contents of the buffer will remain valid until a subsequent read
 call against the CQ.
 Users may call fi_cq_strerror to convert provider specific error
 information into a printable string for debugging purposes.
+.PP
+Notable completion error codes are given below.
+.PP
+\f[I]FI_EADDRNOTAVAIL\f[] : This error code is used by CQs configured
+with FI_SOURCE_ERR to report completions for which a matching fi_addr_t
+source address could not be found.
+An error code of FI_EADDRNOTAVAIL indicates that the data transfer was
+successfully received and processed, with the fi_cq_err_entry fields
+containing information about the completion.
+The err_data field will be set to the source address data.
+The source address will be in the same format as specified through the
+fi_info addr_format field for the opened domain.
+This may be pass directly into an fi_av_insert call to add the source
+address to the address vector.
 .SS fi_cq_signal
 .PP
 The fi_cq_signal call will unblock any thread waiting in fi_cq_sread or
@@ -456,10 +499,21 @@ The use of this field and its meaning is provider specific.
 It is intended to be used as a debugging aid.
 See fi_cq_strerror for additional details on converting this error data
 into a human readable string.
-Providers are allowed to reuse a single internal buffer to store
-additional error information.
-As a result, error data is only guaranteed to be available until the
-next time the CQ is read.
+.PP
+\f[I]err_data_size\f[] : On input, err_data_size indicates the size of
+the err_data buffer in bytes.
+On output, err_data_size will be set to the number of bytes copied to
+the err_data buffer.
+The err_data information is typically used with fi_cq_strerror to
+provide details about the type of error that occurred.
+.PP
+For compatibility purposes, if err_data_size is 0 on input, or the
+fabric was opened with release < 1.5, err_data will be set to a data
+buffer owned by the provider.
+The contents of the buffer will remain valid until a subsequent read
+call against the CQ.
+Applications must serialize access to the CQ when processing errors to
+ensure that the buffer referenced by err_data does no change.
 .SH COMPLETION FLAGS
 .PP
 Completion flags provide additional details regarding the completed
@@ -489,6 +543,11 @@ This flag may be combined with an FI_SEND or FI_RECV flag.
 completed.
 This flag may be combined with an FI_SEND or FI_RECV flag.
 .PP
+\f[I]FI_MULTICAST\f[] : Indicates that a multicast operation completed.
+This flag may be combined with FI_MSG and relevant flags.
+This flag is only guaranteed to be valid for received messages if the
+endpoint has been configured with FI_SOURCE.
+.PP
 \f[I]FI_READ\f[] : Indicates that a locally initiated RMA or atomic read
 operation has completed.
 This flag may be combined with an FI_RMA or FI_ATOMIC flag.
@@ -502,7 +561,7 @@ atomic read operation has completed.
 This flag may be combined with an FI_RMA or FI_ATOMIC flag.
 .PP
 \f[I]FI_REMOTE_WRITE\f[] : Indicates that a remotely initiated RMA or
-atomic read operation has completed.
+atomic write operation has completed.
 This flag may be combined with an FI_RMA or FI_ATOMIC flag.
 .PP
 \f[I]FI_REMOTE_CQ_DATA\f[] : This indicates that remote CQ data is
@@ -515,7 +574,7 @@ referenced by the completion has been consumed and was released by the
 provider.
 Providers may set this flag on the last message that is received into
 the multi\- recv buffer, or may generate a separate completion that
-indicates that the buffer has been freed.
+indicates that the buffer has been released.
 .PP
 Applications can distinguish between these two cases by examining the
 completion entry flags field.
@@ -526,8 +585,30 @@ received message was placed into the multi\-recv buffer.
 Other fields in the completion entry will be determined based on the
 received message.
 If other flag bits are zero, the provider is reporting that the
-multi\-recv buffer has been freed, and the completion entry is not
+multi\-recv buffer has been released, and the completion entry is not
 associated with a received message.
+.SH NOTES
+.PP
+A completion queue must be bound to at least one enabled endpoint before
+any operation such as fi_cq_read, fi_cq_readfrom, fi_cq_sread,
+fi_cq_sreadfrom etc.
+can be called on it.
+.PP
+Completion flags may be suppressed if the FI_NOTIFY_FLAGS_ONLY mode bit
+has been set.
+When enabled, only the following flags are guaranteed to be set in
+completion data when they are valid: FI_REMOTE_READ and FI_REMOTE_WRITE
+(when FI_RMA_EVENT capability bit has been set), FI_REMOTE_CQ_DATA, and
+FI_MULTI_RECV.
+.PP
+If a completion queue has been overrun, it will be placed into an
+\[aq]overrun\[aq] state.
+Read operations will continue to return any valid, non\-corrupted
+completions, if available.
+After all valid completions have been retrieved, any attempt to read the
+CQ will result in it returning an FI_EOVERRUN error event.
+Overrun completion queues are considered fatal and may not be used to
+report additional completions once the overrun occurs.
 .SH RETURN VALUES
 .PP
 fi_cq_open / fi_cq_signal : Returns 0 on success.
