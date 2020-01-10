@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014-2016, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -47,7 +47,6 @@
 #include <sys/socket.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include <string.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -55,12 +54,13 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
+#include <rdma/fi_prov.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-#include "ofi.h"
-#include "ofi_enosys.h"
-#include "ofi_prov.h"
+#include "fi.h"
+#include "fi_enosys.h"
+#include "prov.h"
 
 #include "usnic_direct.h"
 #include "libnl_utils.h"
@@ -73,77 +73,11 @@
 #include "usdf_dgram.h"
 #include "usdf_msg.h"
 #include "usdf_rdm.h"
-#include "usdf_cm.h"
 
 struct usdf_usnic_info *__usdf_devinfo;
 
-static int usdf_fabric_getname(uint32_t version, struct usd_device_attrs *dap,
-			       char **name)
-{
-	int ret = FI_SUCCESS;
-	char *bufp = NULL;
-	struct in_addr in;
-	char *addrnetw;
-
-	if (FI_VERSION_GE(version, FI_VERSION(1, 4))) {
-		in.s_addr = dap->uda_ipaddr_be & dap->uda_netmask_be;
-		addrnetw = inet_ntoa(in);
-		ret = asprintf(&bufp, "%s/%d", addrnetw, dap->uda_prefixlen);
-		if (ret < 0) {
-			USDF_DBG(
-			    "asprintf failed while creating fabric name\n");
-			ret = -ENOMEM;
-		}
-	} else {
-		bufp = strdup(dap->uda_devname);
-		if (!bufp) {
-			USDF_DBG("strdup failed while creating fabric name\n");
-			ret = -errno;
-		}
-	}
-
-	*name = bufp;
-
-	return ret;
-}
-
-static bool usdf_fabric_checkname(uint32_t version,
-				  struct usd_device_attrs *dap, const char *hint)
-{
-	int ret;
-	bool valid = false;
-	char *reference;
-
-	USDF_DBG("checking devname: version=%d, devname='%s'\n", version, hint);
-
-	if (version) {
-		ret = usdf_fabric_getname(version, dap, &reference);
-		if (ret < 0)
-			return false;
-
-		if (strcmp(reference, hint) == 0) {
-			valid = true;
-		} else {
-			USDF_DBG("hint %s failed to match %s\n", hint,
-				 reference);
-		}
-
-		free(reference);
-		return valid;
-	}
-
-	/* The hint string itself is kind of a version check, in pre-1.4 the
-	* name was just the device name. In 1.4 and beyond, then name is
-	* actually CIDR
-	* notation.
-	*/
-	if (strstr(hint, "/"))
-		return usdf_fabric_checkname(FI_VERSION(1, 4), dap, hint);
-
-	return usdf_fabric_checkname(FI_VERSION(1, 3), dap, hint);
-}
-
-static int usdf_validate_hints(uint32_t version, const struct fi_info *hints)
+static int
+usdf_validate_hints(struct fi_info *hints, struct usd_device_attrs *dap)
 {
 	struct fi_fabric_attr *fattrp;
 	size_t size;
@@ -156,20 +90,9 @@ static int usdf_validate_hints(uint32_t version, const struct fi_info *hints)
 	case FI_SOCKADDR:
 		size = sizeof(struct sockaddr);
 		break;
-	case FI_ADDR_STR:
-		if (hints->src_addr != NULL &&
-		    strlen((char *)hints->src_addr) > USDF_ADDR_STR_LEN)
-			return -FI_ENODATA;
-
-		if (hints->dest_addr != NULL &&
-		    strlen((char *)hints->dest_addr) > USDF_ADDR_STR_LEN)
-			return -FI_ENODATA;
-
-		goto skip_sockaddr_size_check;
 	default:
 		return -FI_ENODATA;
 	}
-
 	if (hints->src_addr != NULL && hints->src_addrlen < size) {
 		return -FI_ENODATA;
 	}
@@ -177,7 +100,6 @@ static int usdf_validate_hints(uint32_t version, const struct fi_info *hints)
 		return -FI_ENODATA;
 	}
 
-skip_sockaddr_size_check:
 	if (hints->ep_attr != NULL) {
 		switch (hints->ep_attr->protocol) {
 		case FI_PROTO_UNSPEC:
@@ -185,12 +107,6 @@ skip_sockaddr_size_check:
 		case FI_PROTO_RUDP:
 			break;
 		default:
-			return -FI_ENODATA;
-		}
-
-		if (hints->ep_attr->auth_key || hints->ep_attr->auth_key_size) {
-			USDF_WARN_SYS(EP_CTRL,
-				"\"authorization key\" is not supported in this provider.\n");
 			return -FI_ENODATA;
 		}
 	}
@@ -201,92 +117,25 @@ skip_sockaddr_size_check:
 		    fattrp->prov_version != USDF_PROV_VERSION) {
 			return -FI_ENODATA;
 		}
-	}
-	return FI_SUCCESS;
-}
-
-static int
-usdf_fill_sockaddr_info(struct fi_info *fi,
-	struct sockaddr_in *src, struct sockaddr_in *dest,
-	struct usd_device_attrs *dap)
-{
-	int ret;
-	struct sockaddr_in *sin;
-
-	sin = calloc(1, sizeof(*sin));
-	fi->src_addr = sin;
-	if (sin == NULL) {
-		ret = -FI_ENOMEM;
-		return ret;
-	}
-	fi->src_addrlen = sizeof(struct sockaddr_in);
-	sin->sin_family = AF_INET;
-	sin->sin_addr.s_addr = dap->uda_ipaddr_be;
-	if (src != NULL)
-		sin->sin_port = src->sin_port;
-
-	/* copy in dest if specified */
-	if (dest != NULL) {
-		sin = calloc(1, sizeof(*sin));
-		if (NULL == sin) {
-			free(fi->src_addr);
-			return -FI_ENOMEM;
+		if (fattrp->name != NULL &&
+                    strcmp(fattrp->name, dap->uda_devname) != 0) {
+			return -FI_ENODATA;
 		}
-		*sin = *dest;
-		fi->dest_addr = sin;
-		fi->dest_addrlen = sizeof(*sin);
 	}
-	return FI_SUCCESS;
+
+	return 0;
 }
 
-static int
-usdf_fill_straddr_info(struct fi_info *fi,
-	char *src, char *dest, struct usd_device_attrs *dap)
-{
-	char *address_string;
-	struct sockaddr_in *sin;
-
-	/* If NULL, we have to create the sockaddr_in
-	 * and convert it to string format.
-	 */
-	if (src == NULL) {
-		sin = calloc(1, sizeof(*sin));
-		if (NULL == sin)
-			return -FI_ENOMEM;
-		sin->sin_family = AF_INET;
-		sin->sin_addr.s_addr = dap->uda_ipaddr_be;
-
-		address_string = calloc(1, USDF_ADDR_STR_LEN);
-		fi->src_addr = address_string;
-		fi->src_addrlen = USDF_ADDR_STR_LEN;
-
-		usdf_addr_tostr(sin, fi->src_addr, &fi->src_addrlen);
-		free(sin);
-	} else {
-	/* Otherwise, it is already in string format.
-	 * Just copy it.
-	 */
-		address_string = strdup(src);
-		if (NULL == address_string)
-			return -FI_ENOMEM;
-		fi->src_addr = address_string;
-		fi->src_addrlen = strlen(address_string);
-	}
-
-	/* Same goes for dest. */
-	if (dest != NULL) {
-		address_string = strdup(dest);
-		fi->dest_addr = address_string;
-		fi->dest_addrlen = strlen(address_string);
-	}
-
-	return FI_SUCCESS;
-}
 static int
 usdf_fill_addr_info(struct fi_info *fi, uint32_t addr_format,
-		void *src, void *dest, struct usd_device_attrs *dap)
+		struct sockaddr_in *src, struct sockaddr_in *dest,
+		struct usd_device_attrs *dap)
 {
+	struct sockaddr_in *sin;
 	int ret;
+#if ENABLE_DEBUG
+	char requested[INET_ADDRSTRLEN], actual[INET_ADDRSTRLEN];
+#endif
 
 	if (addr_format != FI_FORMAT_UNSPEC) {
 		fi->addr_format = addr_format;
@@ -297,14 +146,38 @@ usdf_fill_addr_info(struct fi_info *fi, uint32_t addr_format,
 	switch (fi->addr_format) {
 	case FI_SOCKADDR:
 	case FI_SOCKADDR_IN:
-		ret = usdf_fill_sockaddr_info(fi, src, dest, dap);
-		if (ret != FI_SUCCESS)
+		if (src != NULL &&
+		    src->sin_addr.s_addr != INADDR_ANY &&
+		    src->sin_addr.s_addr != dap->uda_ipaddr_be) {
+			USDF_DBG("src addr (%s) does not match device addr (%s)\n",
+			inet_ntop(AF_INET, &src->sin_addr.s_addr,
+				requested, sizeof(requested)),
+			inet_ntop(AF_INET, &dap->uda_ipaddr_be,
+				actual, sizeof(actual)));
+
+			ret = -FI_ENODATA;
 			goto fail;
-		break;
-	case FI_ADDR_STR:
-		ret = usdf_fill_straddr_info(fi, src, dest, dap);
-		if (ret != FI_SUCCESS)
+		}
+		sin = calloc(1, sizeof(*sin));
+		fi->src_addr = sin;
+		if (sin == NULL) {
+			ret = -FI_ENOMEM;
 			goto fail;
+		}
+		fi->src_addrlen = sizeof(*sin);
+		sin->sin_family = AF_INET;
+		sin->sin_addr.s_addr = dap->uda_ipaddr_be;
+		if (src != NULL) {
+			sin->sin_port = src->sin_port;
+		}
+
+		/* copy in dest if specified */
+		if (dest != NULL) {
+			sin = calloc(1, sizeof(*sin));
+			*sin = *dest;
+			fi->dest_addr = sin;
+			fi->dest_addrlen = sizeof(*sin);
+		}
 		break;
 	default:
 		ret = -FI_ENODATA;
@@ -317,109 +190,12 @@ fail:
 	return ret;		// fi_freeinfo() in caller frees all
 }
 
-static int validate_modebits(uint32_t version, const struct fi_info *hints,
-			       uint64_t supported, uint64_t *mode_out)
-{
-	uint64_t mode;
-
-	/* If there is no hints, return everything we supported. */
-	if (!hints) {
-		*mode_out = supported;
-		return FI_SUCCESS;
-	}
-
-	mode = hints->mode & supported;
-
-	/* Before version 1.5, FI_LOCAL_MR is a requirement. */
-	if (FI_VERSION_LT(version, FI_VERSION(1, 5))) {
-		if ((mode & FI_LOCAL_MR) == 0)
-			return -FI_ENODATA;
-	}
-
-	*mode_out = mode;
-
-	return FI_SUCCESS;
-}
-
-static int usdf_alloc_fid_nic(struct fi_info *fi,
-			struct usd_device_attrs *dap)
-{
-	int ret;
-	struct fid_nic *nic = NULL;
-	struct fi_device_attr *da = NULL;
-	struct fi_link_attr *la = NULL;
-
-	nic = ofi_nic_dup(NULL);
-	if (!nic)
-		goto nomem;
-
-	da = nic->device_attr;
-	da->name = strdup(dap->uda_devname);
-	if (!da->name)
-		goto nomem;
-	ret = asprintf(&da->device_id, "%s (%s)",
-		usd_devid_to_pid(dap->uda_vendor_id,
-				dap->uda_device_id),
-		usd_devid_to_nicname(dap->uda_vendor_id,
-				dap->uda_device_id));
-	if (ret < 0)
-		goto nomem;
-	ret = asprintf(&da->device_version, "0x%x", dap->uda_vendor_part_id);
-	if (ret < 0)
-		goto nomem;
-	ret = asprintf(&da->vendor_id, "0x%x", dap->uda_vendor_id);
-	if (ret < 0)
-		goto nomem;
-	da->driver = strdup("usnic_verbs");
-	if (!da->driver)
-		goto nomem;
-	da->firmware = strdup(dap->uda_firmware);
-	if (!da->firmware)
-		goto nomem;
-
-	// usnic does not currently expose PCI bus information, so we
-	// set the bus type to unknown.
-	nic->bus_attr->bus_type = FI_BUS_UNKNOWN;
-
-	la = nic->link_attr;
-
-	socklen_t size = INET_ADDRSTRLEN;
-	la->address = calloc(1, size);
-	if (!la->address)
-		goto nomem;
-	inet_ntop(AF_INET, &dap->uda_ipaddr_be, la->address, size);
-	la->mtu = dap->uda_mtu;
-	la->speed = dap->uda_bandwidth;
-	switch (dap->uda_link_state) {
-	case USD_LINK_UP:
-		la->state = FI_LINK_UP;
-		break;
-	case USD_LINK_DOWN:
-		la->state = FI_LINK_DOWN;
-		break;
-	default:
-		la->state = FI_LINK_UNKNOWN;
-		break;
-	}
-	la->network_type = strdup("Ethernet");
-	if (!la->network_type)
-		goto nomem;
-
-	fi->nic = nic;
-
-	return FI_SUCCESS;
-
-nomem:
-	if (nic)
-		fi_close(&nic->fid);
-	return -FI_ENOMEM;
-}
-
-static int usdf_fill_info_dgram(
+static int
+usdf_fill_info_dgram(
 	uint32_t version,
-	const struct fi_info *hints,
-	void *src,
-	void *dest,
+	struct fi_info *hints,
+	struct sockaddr_in *src,
+	struct sockaddr_in *dest,
 	struct usd_device_attrs *dap,
 	struct fi_info **fi_first,
 	struct fi_info **fi_last)
@@ -437,12 +213,8 @@ static int usdf_fill_info_dgram(
 
 	fi->caps = USDF_DGRAM_CAPS;
 
-	ret = validate_modebits(version, hints,
-				  USDF_DGRAM_SUPP_MODE, &fi->mode);
-	if (ret)
-		goto fail;
-
 	if (hints != NULL) {
+		fi->mode = hints->mode & USDF_DGRAM_SUPP_MODE;
 		addr_format = hints->addr_format;
 
 		/* check that we are capable of what's requested */
@@ -451,8 +223,15 @@ static int usdf_fill_info_dgram(
 			goto fail;
 		}
 
+		/* app must support these modes */
+		if ((hints->mode & USDF_DGRAM_REQ_MODE) != USDF_DGRAM_REQ_MODE) {
+			ret = -FI_ENODATA;
+			goto fail;
+		}
+
 		fi->handle = hints->handle;
 	} else {
+		fi->mode = USDF_DGRAM_SUPP_MODE;
 		addr_format = FI_FORMAT_UNSPEC;
 	}
 	fi->ep_attr->type = FI_EP_DGRAM;
@@ -464,8 +243,8 @@ static int usdf_fill_info_dgram(
 
 	/* fabric attrs */
 	fattrp = fi->fabric_attr;
-	ret = usdf_fabric_getname(version, dap, &fattrp->name);
-	if (ret < 0 || fattrp->name == NULL) {
+	fattrp->name = strdup(dap->uda_devname);
+	if (fattrp->name == NULL) {
 		ret = -FI_ENOMEM;
 		goto fail;
 	}
@@ -481,19 +260,15 @@ static int usdf_fill_info_dgram(
 	if (ret)
 		goto fail;
 
-	ret = usdf_dgram_fill_dom_attr(version, hints, fi, dap);
+	ret = usdf_dgram_fill_dom_attr(hints, fi);
 	if (ret)
 		goto fail;
 
-	ret = usdf_dgram_fill_tx_attr(version, hints, fi, dap);
+	ret = usdf_dgram_fill_tx_attr(hints, fi, dap);
 	if (ret)
 		goto fail;
 
-	ret = usdf_dgram_fill_rx_attr(version, hints, fi, dap);
-	if (ret)
-		goto fail;
-
-	ret = usdf_alloc_fid_nic(fi, dap);
+	ret = usdf_dgram_fill_rx_attr(hints, fi, dap);
 	if (ret)
 		goto fail;
 
@@ -514,11 +289,11 @@ fail:
 	return ret;
 }
 
-static int usdf_fill_info_msg(
-	uint32_t version,
-	const struct fi_info *hints,
-	void *src,
-	void *dest,
+static int
+usdf_fill_info_msg(
+	struct fi_info *hints,
+	struct sockaddr_in *src,
+	struct sockaddr_in *dest,
 	struct usd_device_attrs *dap,
 	struct fi_info **fi_first,
 	struct fi_info **fi_last)
@@ -536,12 +311,8 @@ static int usdf_fill_info_msg(
 
 	fi->caps = USDF_MSG_CAPS;
 
-	ret = validate_modebits(version, hints,
-				  USDF_MSG_SUPP_MODE, &fi->mode);
-	if (ret)
-		goto fail;
-
 	if (hints != NULL) {
+		fi->mode = hints->mode & USDF_MSG_SUPP_MODE;
 		addr_format = hints->addr_format;
 
 		/* check that we are capable of what's requested */
@@ -550,12 +321,19 @@ static int usdf_fill_info_msg(
 			goto fail;
 		}
 
+		/* app must support these modes */
+		if ((hints->mode & USDF_MSG_REQ_MODE) != USDF_MSG_REQ_MODE) {
+			ret = -FI_ENODATA;
+			goto fail;
+		}
+
 		fi->handle = hints->handle;
 	} else {
+		fi->mode = USDF_MSG_SUPP_MODE;
 		addr_format = FI_FORMAT_UNSPEC;
 	}
-
 	fi->ep_attr->type = FI_EP_MSG;
+
 
 	ret = usdf_fill_addr_info(fi, addr_format, src, dest, dap);
 	if (ret != 0) {
@@ -564,8 +342,8 @@ static int usdf_fill_info_msg(
 
 	/* fabric attrs */
 	fattrp = fi->fabric_attr;
-	ret = usdf_fabric_getname(version, dap, &fattrp->name);
-	if (ret < 0 || fattrp->name == NULL) {
+	fattrp->name = strdup(dap->uda_devname);
+	if (fattrp->name == NULL) {
 		ret = -FI_ENOMEM;
 		goto fail;
 	}
@@ -574,19 +352,15 @@ static int usdf_fill_info_msg(
 	if (ret)
 		goto fail;
 
-	ret = usdf_msg_fill_dom_attr(version, hints, fi, dap);
+	ret = usdf_msg_fill_dom_attr(hints, fi);
 	if (ret)
 		goto fail;
 
-	ret = usdf_msg_fill_tx_attr(version, hints, fi);
+	ret = usdf_msg_fill_tx_attr(hints, fi);
 	if (ret)
 		goto fail;
 
-	ret = usdf_msg_fill_rx_attr(version, hints, fi);
-	if (ret)
-		goto fail;
-
-	ret = usdf_alloc_fid_nic(fi, dap);
+	ret = usdf_msg_fill_rx_attr(hints, fi);
 	if (ret)
 		goto fail;
 
@@ -607,11 +381,11 @@ fail:
 	return ret;
 }
 
-static int usdf_fill_info_rdm(
-	uint32_t version,
-	const struct fi_info *hints,
-	void *src,
-	void *dest,
+static int
+usdf_fill_info_rdm(
+	struct fi_info *hints,
+	struct sockaddr_in *src,
+	struct sockaddr_in *dest,
 	struct usd_device_attrs *dap,
 	struct fi_info **fi_first,
 	struct fi_info **fi_last)
@@ -629,12 +403,8 @@ static int usdf_fill_info_rdm(
 
 	fi->caps = USDF_RDM_CAPS;
 
-	ret = validate_modebits(version, hints,
-				  USDF_RDM_SUPP_MODE, &fi->mode);
-	if (ret)
-		goto fail;
-
 	if (hints != NULL) {
+		fi->mode = hints->mode & USDF_RDM_SUPP_MODE;
 		addr_format = hints->addr_format;
 		/* check that we are capable of what's requested */
 		if ((hints->caps & ~USDF_RDM_CAPS) != 0) {
@@ -642,8 +412,15 @@ static int usdf_fill_info_rdm(
 			goto fail;
 		}
 
+		/* app must support these modes */
+		if ((hints->mode & USDF_RDM_REQ_MODE) != USDF_RDM_REQ_MODE) {
+			ret = -FI_ENODATA;
+			goto fail;
+		}
+
 		fi->handle = hints->handle;
 	} else {
+		fi->mode = USDF_RDM_SUPP_MODE;
 		addr_format = FI_FORMAT_UNSPEC;
 	}
 	fi->ep_attr->type = FI_EP_RDM;
@@ -655,8 +432,8 @@ static int usdf_fill_info_rdm(
 
 	/* fabric attrs */
 	fattrp = fi->fabric_attr;
-	ret = usdf_fabric_getname(version, dap, &fattrp->name);
-	if (ret < 0 || fattrp->name == NULL) {
+	fattrp->name = strdup(dap->uda_devname);
+	if (fattrp->name == NULL) {
 		ret = -FI_ENOMEM;
 		goto fail;
 	}
@@ -665,19 +442,15 @@ static int usdf_fill_info_rdm(
 	if (ret)
 		goto fail;
 
-	ret = usdf_rdm_fill_dom_attr(version, hints, fi, dap);
+	ret = usdf_rdm_fill_dom_attr(hints, fi);
 	if (ret)
 		goto fail;
 
-	ret = usdf_rdm_fill_tx_attr(version, hints, fi);
+	ret = usdf_rdm_fill_tx_attr(hints, fi);
 	if (ret)
 		goto fail;
 
-	ret = usdf_rdm_fill_rx_attr(version, hints, fi);
-	if (ret)
-		goto fail;
-
-	ret = usdf_alloc_fid_nic(fi, dap);
+	ret = usdf_rdm_fill_rx_attr(hints, fi);
 	if (ret)
 		goto fail;
 
@@ -777,162 +550,9 @@ usdf_get_distance(
     return ret;
 }
 
-/* Check all things related to a device. Make sure it's okay, the source address
- * matches the requested address, the destination is reachable from the device,
- * the device fabric name matches the requested fabric name, and the device
- * domain name matches the requested domain name.
- *
- * @param version Libfabric API version used to verify the domain / fabric name.
- * @param hints   Hints passed to fi_getinfo.
- * @param src     Source address being requested.
- * @param dest    Destination address to communicate with.
- * @param dep     usNIC device entry being checked.
- *
- * @return true on success, false on failure. For debug logging can be enabled
- *         to see why a device was disqualified.
- */
-static bool usdf_check_device(uint32_t version, const struct fi_info *hints,
-			      void *src, void *dest,
-			      struct usdf_dev_entry *dep)
-{
-	char dest_str[INET_ADDRSTRLEN];
-	char src_str[INET_ADDRSTRLEN];
-	char dev_str[INET_ADDRSTRLEN];
-	struct usd_device_attrs *dap;
-	struct sockaddr_in *sin;
-	int reachable;
-	int ret;
-
-	reachable = -1;
-	dap = &dep->ue_dattr;
-
-	/* Skip the device if it has problems. */
-	if (!dep->ue_dev_ok) {
-		USDF_WARN_SYS(FABRIC, "skipping %s/%s device not ok\n",
-			      dap->uda_devname, dap->uda_ifname);
-		return false;
-	}
-
-	/* If the given source address is not INADDR_ANY, compare against the
-	 * device.
-	 */
-	if (src) {
-		sin = usdf_format_to_sin(hints, src);
-		if (sin->sin_addr.s_addr != INADDR_ANY) {
-			if (sin->sin_addr.s_addr != dap->uda_ipaddr_be) {
-				inet_ntop(AF_INET, &sin->sin_addr.s_addr,
-					  src_str, sizeof(src_str));
-				inet_ntop(AF_INET, &dap->uda_ipaddr_be,
-					  dev_str, sizeof(dev_str));
-				USDF_WARN_SYS(FABRIC,
-					      "src addr<%s> != dev addr<%s>\n",
-					      src_str, dev_str);
-				goto fail;
-			}
-		}
-
-		usdf_free_sin_if_needed(hints, sin);
-	}
-
-	/* Check that the given destination address is reachable from the
-	 * interface.
-	 */
-	if (dest) {
-		sin = usdf_format_to_sin(hints, dest);
-		if (sin->sin_addr.s_addr != INADDR_ANY) {
-			ret = usdf_get_distance(dap, sin->sin_addr.s_addr,
-						&reachable);
-			if (ret) {
-				inet_ntop(AF_INET,
-					  &sin->sin_addr.s_addr, dest_str,
-					  sizeof(dest_str));
-				USDF_WARN_SYS(FABRIC,
-					      "get_distance failed @ %s\n",
-					      dest_str);
-				goto fail;
-			}
-		}
-
-		if (reachable == -1) {
-			inet_ntop(AF_INET, &sin->sin_addr.s_addr, dest_str,
-				  sizeof(dest_str));
-			USDF_WARN_SYS(FABRIC,
-				      "dest %s unreachable from %s/%s, skipping\n",
-				      dest_str, dap->uda_devname,
-				      dap->uda_ifname);
-			goto fail;
-		}
-
-		usdf_free_sin_if_needed(hints, sin);
-	}
-
-	/* Checks that the fabric name is correct for the given interface. The
-	 * fabric name contains the CIDR notation for the interface.
-	 */
-	if (hints && hints->fabric_attr && hints->fabric_attr->name) {
-		if (!usdf_fabric_checkname(version, dap,
-					  hints->fabric_attr->name))
-			return false;
-	}
-
-	/* Check that the domain name is correct for the given interface. The
-	 * domain name is the device name.
-	 */
-	if (hints && hints->domain_attr && hints->domain_attr->name) {
-		if (!usdf_domain_checkname(version, dap,
-					   hints->domain_attr->name))
-			return false;
-	}
-
-	return true;
-
-fail:
-	usdf_free_sin_if_needed(hints, sin);
-
-	return false;
-}
-
-static int
-usdf_handle_node_and_service(const char *node, const char *service,
-		uint64_t flags, void **src, void **dest,
-		const struct fi_info *hints, struct addrinfo **ai)
-{
-	int ret;
-	struct sockaddr_in *sin;
-
-	if (node != NULL || service != NULL) {
-		if (hints && hints->addr_format == FI_ADDR_STR) {
-			/* FI_ADDR_STR can't have service param. */
-			if (service)
-				return -FI_EINVAL;
-
-			sin = usdf_format_to_sin(hints, node);
-
-			if (!sin)
-				/* This could be invalid or no memory. */
-				return -FI_EINVAL;
-		} else {
-			ret = getaddrinfo(node, service, NULL, ai);
-			if (ret != 0) {
-				USDF_DBG("getaddrinfo failed: %d: <%s>\n", ret,
-					 gai_strerror(ret));
-				return ret;
-			}
-			sin = (struct sockaddr_in *)(*ai)->ai_addr;
-		}
-
-		if (flags & FI_SOURCE)
-			*src = usdf_sin_to_format(hints, sin, NULL);
-		else
-			*dest = usdf_sin_to_format(hints, sin, NULL);
-	}
-
-	return FI_SUCCESS;
-}
-
 static int
 usdf_getinfo(uint32_t version, const char *node, const char *service,
-	       uint64_t flags, const struct fi_info *hints, struct fi_info **info)
+	       uint64_t flags, struct fi_info *hints, struct fi_info **info)
 {
 	struct usdf_usnic_info *dp;
 	struct usdf_dev_entry *dep;
@@ -940,9 +560,10 @@ usdf_getinfo(uint32_t version, const char *node, const char *service,
 	struct fi_info *fi_first;
 	struct fi_info *fi_last;
 	struct addrinfo *ai;
-	void *src;
-	void *dest;
+	struct sockaddr_in *src;
+	struct sockaddr_in *dest;
 	enum fi_ep_type ep_type;
+	int metric;
 	int d;
 	int ret;
 
@@ -969,44 +590,69 @@ usdf_getinfo(uint32_t version, const char *node, const char *service,
 	}
 	dp = __usdf_devinfo;
 
-	/* Check the hints up front and fail if they're invalid. */
-	if (hints) {
-		ret = usdf_validate_hints(version, hints);
-		if (ret) {
-			USDF_WARN_SYS(FABRIC, "hints failed to validate\n");
+	if (node != NULL || service != NULL) {
+		ret = getaddrinfo(node, service, NULL, &ai);
+		if (ret != 0) {
+			USDF_DBG("getaddrinfo failed, likely bad node/service specified (%s:%s)\n",
+				node, service);
+			ret = -errno;
 			goto fail;
 		}
+		if (flags & FI_SOURCE) {
+			src = (struct sockaddr_in *)ai->ai_addr;
+		} else {
+			dest = (struct sockaddr_in *)ai->ai_addr;
+		}
 	}
-
-	/* Get the src and dest if user specified. */
-	ret = usdf_handle_node_and_service(node, service, flags,
-					   &src, &dest, hints, &ai);
-	if (ret) {
-		USDF_WARN_SYS(FABRIC, "failed to handle node and service.\n");
-		goto fail;
-	}
-
 	if (hints != NULL) {
-		if (dest == NULL && hints->dest_addr != NULL)
+		if (dest == NULL && hints->dest_addr != NULL) {
 			dest = hints->dest_addr;
-		if (src == NULL && hints->src_addr != NULL)
+		}
+		if (src == NULL && hints->src_addr != NULL) {
 			src = hints->src_addr;
+		}
 	}
 
 	for (d = 0; d < dp->uu_num_devs; ++d) {
 		dep = &dp->uu_info[d];
 		dap = &dep->ue_dattr;
 
-		/* If the device has an issue or the hints don't match the
-		 * device information, then skip.
-		 */
-		if (!usdf_check_device(version, hints, src, dest, dep))
+		/* skip this device if it has some problem */
+		if (!dep->ue_dev_ok) {
+			USDF_DBG("skipping %s/%s\n", dap->uda_devname,
+				dap->uda_ifname);
 			continue;
+		}
 
-		if (hints && hints->ep_attr)
-			ep_type = hints->ep_attr->type;
-		else
+		/* See if dest is reachable from this device */
+		if (dest != NULL && dest->sin_addr.s_addr != INADDR_ANY) {
+			ret = usdf_get_distance(dap,
+					dest->sin_addr.s_addr, &metric);
+			if (ret != 0) {
+				goto fail;
+			}
+			if (metric == -1) {
+				USDF_DBG("dest %s unreachable from %s/%s, skipping\n",
+					inet_ntoa(dest->sin_addr),
+					dap->uda_devname, dap->uda_ifname);
+				continue;
+			}
+		}
+
+		/* Does this device match requested attributes? */
+		if (hints != NULL) {
+			ret = usdf_validate_hints(hints, dap);
+			if (ret != 0) {
+				USDF_DBG("hints do not match for %s/%s, skipping\n",
+					dap->uda_devname, dap->uda_ifname);
+				continue;
+			}
+
+			ep_type = hints->ep_attr ? hints->ep_attr->type :
+				  FI_EP_UNSPEC;
+		} else {
 			ep_type = FI_EP_UNSPEC;
+		}
 
 		if (ep_type == FI_EP_DGRAM || ep_type == FI_EP_UNSPEC) {
 			ret = usdf_fill_info_dgram(version, hints, src, dest,
@@ -1017,16 +663,16 @@ usdf_getinfo(uint32_t version, const char *node, const char *service,
 		}
 
 		if (ep_type == FI_EP_MSG || ep_type == FI_EP_UNSPEC) {
-			ret = usdf_fill_info_msg(version, hints, src, dest,
-					dap, &fi_first, &fi_last);
+			ret = usdf_fill_info_msg(hints, src, dest, dap,
+					&fi_first, &fi_last);
 			if (ret != 0 && ret != -FI_ENODATA) {
 				goto fail;
 			}
 		}
 
 		if (ep_type == FI_EP_RDM || ep_type == FI_EP_UNSPEC) {
-			ret = usdf_fill_info_rdm(version, hints, src, dest,
-					dap, &fi_first, &fi_last);
+			ret = usdf_fill_info_rdm(hints, src, dest, dap,
+					&fi_first, &fi_last);
 			if (ret != 0 && ret != -FI_ENODATA) {
 				goto fail;
 			}
@@ -1040,16 +686,16 @@ usdf_getinfo(uint32_t version, const char *node, const char *service,
 		ret = -FI_ENODATA;
 	}
 
-
 fail:
-	if (ai)
-		freeaddrinfo(ai);
-
 	if (ret != 0) {
 		fi_freeinfo(fi_first);
+	}
+	if (ai != NULL) {
+		freeaddrinfo(ai);
+	}
+	if (ret != 0) {
 		USDF_INFO("returning %d (%s)\n", ret, fi_strerror(-ret));
 	}
-
 	return ret;
 }
 
@@ -1063,7 +709,7 @@ usdf_fabric_close(fid_t fid)
 	USDF_TRACE("\n");
 
 	fp = fab_fidtou(fid);
-	if (ofi_atomic_get32(&fp->fab_refcnt) > 0) {
+	if (atomic_get(&fp->fab_refcnt) > 0) {
 		return -FI_EBUSY;
 	}
 	/* Tell progression thread to exit */
@@ -1131,7 +777,7 @@ usdf_fabric_open(struct fi_fabric_attr *fattrp, struct fid_fabric **fabric,
 	for (d = 0; d < dp->uu_num_devs; ++d) {
 		dep = &dp->uu_info[d];
 		if (dep->ue_dev_ok &&
-		    usdf_fabric_checkname(0, &(dep->ue_dattr), fattrp->name)) {
+			strcmp(fattrp->name, dep->ue_dattr.uda_devname) == 0) {
 			break;
 		}
 	}
@@ -1213,8 +859,8 @@ usdf_fabric_open(struct fi_fabric_attr *fattrp, struct fid_fabric **fabric,
 		goto fail;
 	}
 
-	ofi_atomic_initialize32(&fp->fab_refcnt, 0);
-	ofi_atomic_initialize32(&fp->num_blocked_waiting, 0);
+	atomic_initialize(&fp->fab_refcnt, 0);
+	atomic_initialize(&fp->num_blocked_waiting, 0);
 
 	ret = pthread_create(&fp->fab_thread, NULL,
 			usdf_fabric_progression_thread, fp);
@@ -1248,7 +894,7 @@ static void usdf_fini(void)
 struct fi_provider usdf_ops = {
 	.name = USDF_PROV_NAME,
 	.version = USDF_PROV_VERSION,
-	.fi_version = FI_VERSION(1, 7),
+	.fi_version = FI_VERSION(1, 3),
 	.getinfo = usdf_getinfo,
 	.fabric = usdf_fabric_open,
 	.cleanup =  usdf_fini
@@ -1256,7 +902,7 @@ struct fi_provider usdf_ops = {
 
 USNIC_INI
 {
-#if USNIC_BUILD_FAKE_VERBS_DRIVER
+#if HAVE_VERBS
 	usdf_setup_fake_ibv_provider();
 #endif
 	return (&usdf_ops);

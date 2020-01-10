@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -73,7 +73,7 @@ static int psmx_progress_set_affinity(char *affinity)
 
 		if (n < 2)
 			end = start;
-
+	
 		if (stride < 1)
 			stride = 1;
 
@@ -173,21 +173,14 @@ static void psmx_domain_stop_progress(struct psmx_fid_domain *domain)
 	}
 }
 
-static int psmx_domain_close(fid_t fid)
+void psmx_domain_release(struct psmx_fid_domain *domain)
 {
-	struct psmx_fid_domain *domain;
 	int err;
 
-	domain = container_of(fid, struct psmx_fid_domain,
-			      util_domain.domain_fid.fid);
+	FI_INFO(&psmx_prov, FI_LOG_DOMAIN, "refcnt=%d\n", domain->refcnt);
 
-	FI_INFO(&psmx_prov, FI_LOG_DOMAIN, "refcnt=%d\n",
-		ofi_atomic_get32(&domain->util_domain.ref));
-
-	psmx_domain_release(domain);
-
-	if (ofi_domain_close(&domain->util_domain))
-		return 0;
+	if (--domain->refcnt > 0)
+		return;
 
 	if (domain->progress_thread_enabled)
 		psmx_domain_stop_progress(domain);
@@ -223,7 +216,21 @@ static int psmx_domain_close(fid_t fid)
 
 	domain->fabric->active_domain = NULL;
 
+	psmx_fabric_release(domain->fabric);
+
 	free(domain);
+}
+
+static int psmx_domain_close(fid_t fid)
+{
+	struct psmx_fid_domain *domain;
+
+	FI_INFO(&psmx_prov, FI_LOG_DOMAIN, "\n");
+
+	domain = container_of(fid, struct psmx_fid_domain, domain.fid);
+
+	psmx_domain_release(domain);
+
 	return 0;
 }
 
@@ -242,10 +249,9 @@ static struct fi_ops_domain psmx_domain_ops = {
 	.endpoint = psmx_ep_open,
 	.scalable_ep = fi_no_scalable_ep,
 	.cntr_open = psmx_cntr_open,
-	.poll_open = fi_poll_create,
+	.poll_open = psmx_poll_open,
 	.stx_ctx = psmx_stx_ctx,
 	.srx_ctx = fi_no_srx_context,
-	.query_atomic = psmx_query_atomic,
 };
 
 static int psmx_key_compare(void *key1, void *key2)
@@ -253,39 +259,65 @@ static int psmx_key_compare(void *key1, void *key2)
 	return (key1 < key2) ? -1 : (key1 > key2);
 }
 
-static int psmx_domain_init(struct psmx_fid_domain *domain,
-			    struct psmx_src_name *src_addr)
+int psmx_domain_open(struct fid_fabric *fabric, struct fi_info *info,
+		     struct fid_domain **domain, void *context)
 {
-	struct psmx_fid_fabric *fabric = domain->fabric;
+	struct psmx_fid_fabric *fabric_priv;
+	struct psmx_fid_domain *domain_priv;
 	struct psm_ep_open_opts opts;
 	int err;
 
-	psm_ep_open_opts_get_defaults(&opts);
+	FI_INFO(&psmx_prov, FI_LOG_DOMAIN, "\n");
 
-	FI_INFO(&psmx_prov, FI_LOG_CORE,
-		"uuid: %s\n", psmx_uuid_to_string(fabric->uuid));
+	fabric_priv = container_of(fabric, struct psmx_fid_fabric, fabric);
+	psmx_fabric_acquire(fabric_priv);
 
-	if (src_addr) {
-		opts.unit = src_addr->unit;
-		opts.port = src_addr->port;
-		FI_INFO(&psmx_prov, FI_LOG_CORE,
-			"ep_open_opts: unit=%d port=%u\n", opts.unit, opts.port);
+	if (fabric_priv->active_domain) {
+		psmx_domain_acquire(fabric_priv->active_domain);
+		*domain = &fabric_priv->active_domain->domain;
+		return 0;
 	}
 
-	err = psm_ep_open(fabric->uuid, &opts,
-			  &domain->psm_ep, &domain->psm_epid);
+	if (!info->domain_attr->name || strcmp(info->domain_attr->name, PSMX_DOMAIN_NAME)) {
+		err = -FI_EINVAL;
+		goto err_out;
+	}
+
+	domain_priv = (struct psmx_fid_domain *) calloc(1, sizeof *domain_priv);
+	if (!domain_priv) {
+		err = -FI_ENOMEM;
+		goto err_out;
+	}
+
+	domain_priv->domain.fid.fclass = FI_CLASS_DOMAIN;
+	domain_priv->domain.fid.context = context;
+	domain_priv->domain.fid.ops = &psmx_fi_ops;
+	domain_priv->domain.ops = &psmx_domain_ops;
+	domain_priv->domain.mr = &psmx_mr_ops;
+	domain_priv->mr_mode = info->domain_attr->mr_mode;
+	domain_priv->mode = info->mode;
+	domain_priv->caps = info->caps;
+	domain_priv->fabric = fabric_priv;
+	domain_priv->progress_thread_enabled =
+		(info->domain_attr->data_progress == FI_PROGRESS_AUTO && psmx_env.prog_thread);
+
+	psm_ep_open_opts_get_defaults(&opts);
+
+	FI_INFO(&psmx_prov, FI_LOG_CORE, "uuid: %s\n", psmx_uuid_to_string(fabric_priv->uuid));
+
+	err = psm_ep_open(fabric_priv->uuid, &opts,
+			  &domain_priv->psm_ep, &domain_priv->psm_epid);
 	if (err != PSM_OK) {
 		FI_WARN(&psmx_prov, FI_LOG_CORE,
 			"psm_ep_open returns %d, errno=%d\n", err, errno);
 		err = psmx_errno(err);
-		goto err_out;
+		goto err_out_free_domain;
 	}
 
-	FI_INFO(&psmx_prov, FI_LOG_CORE,
-		"epid: 0x%016lx\n", domain->psm_epid);
+	FI_INFO(&psmx_prov, FI_LOG_CORE, "epid: 0x%016lx\n", domain_priv->psm_epid);
 
-	err = psm_mq_init(domain->psm_ep, PSM_MQ_ORDERMASK_ALL,
-			  NULL, 0, &domain->psm_mq);
+	err = psm_mq_init(domain_priv->psm_ep, PSM_MQ_ORDERMASK_ALL,
+			  NULL, 0, &domain_priv->psm_mq);
 	if (err != PSM_OK) {
 		FI_WARN(&psmx_prov, FI_LOG_CORE,
 			"psm_mq_init returns %d, errno=%d\n", err, errno);
@@ -293,23 +325,23 @@ static int psmx_domain_init(struct psmx_fid_domain *domain,
 		goto err_out_close_ep;
 	}
 
-	err = fastlock_init(&domain->mr_lock);
+	err = fastlock_init(&domain_priv->mr_lock);
 	if (err) {
 		FI_WARN(&psmx_prov, FI_LOG_CORE,
 			"fastlock_init(mr_lock) returns %d\n", err);
 		goto err_out_finalize_mq;
 	}
 
-	domain->mr_map = rbtNew(&psmx_key_compare);
-	if (!domain->mr_map) {
+	domain_priv->mr_map = rbtNew(&psmx_key_compare);
+	if (!domain_priv->mr_map) {
 		FI_WARN(&psmx_prov, FI_LOG_CORE,
 			"rbtNew failed\n");
 		goto err_out_destroy_mr_lock;
 	}
 
-	domain->mr_reserved_key = 1;
-
-	err = fastlock_init(&domain->poll_lock);
+	domain_priv->mr_reserved_key = 1;
+	
+	err = fastlock_init(&domain_priv->poll_lock);
 	if (err) {
 		FI_WARN(&psmx_prov, FI_LOG_CORE,
 			"fastlock_init(poll_lock) returns %d\n", err);
@@ -322,142 +354,67 @@ static int psmx_domain_init(struct psmx_fid_domain *domain,
 	 * active_domain becomes NULL again only when the domain is closed.
 	 * At that time the AM handlers are gone with the PSM endpoint.
 	 */
-	fabric->active_domain = domain;
+	fabric_priv->active_domain = domain_priv;
 
-	if (psmx_domain_enable_ep(domain, NULL) < 0)
+	if (psmx_domain_enable_ep(domain_priv, NULL) < 0)
 		goto err_out_reset_active_domain;
 
-	if (domain->progress_thread_enabled)
-		psmx_domain_start_progress(domain);
+	if (domain_priv->progress_thread_enabled)
+		psmx_domain_start_progress(domain_priv);
 
+	domain_priv->refcnt = 1;
+	*domain = &domain_priv->domain;
 	return 0;
 
 err_out_reset_active_domain:
-	fabric->active_domain = NULL;
-	fastlock_destroy(&domain->poll_lock);
+	fabric_priv->active_domain = NULL;
+	fastlock_destroy(&domain_priv->poll_lock);
 
 err_out_delete_mr_map:
-	rbtDelete(domain->mr_map);
+	rbtDelete(domain_priv->mr_map);
 
 err_out_destroy_mr_lock:
-	fastlock_destroy(&domain->mr_lock);
+	fastlock_destroy(&domain_priv->mr_lock);
 
 err_out_finalize_mq:
-	psm_mq_finalize(domain->psm_mq);
+	psm_mq_finalize(domain_priv->psm_mq);
 
 err_out_close_ep:
-	if (psm_ep_close(domain->psm_ep, PSM_EP_CLOSE_GRACEFUL,
+	if (psm_ep_close(domain_priv->psm_ep, PSM_EP_CLOSE_GRACEFUL,
 			 (int64_t) psmx_env.timeout * 1000000000LL) != PSM_OK)
-		psm_ep_close(domain->psm_ep, PSM_EP_CLOSE_FORCE, 0);
-
-err_out:
-	return err;
-}
-
-int psmx_domain_open(struct fid_fabric *fabric, struct fi_info *info,
-		     struct fid_domain **domain, void *context)
-{
-	struct psmx_fid_fabric *fabric_priv;
-	struct psmx_fid_domain *domain_priv;
-	int err;
-
-	FI_INFO(&psmx_prov, FI_LOG_DOMAIN, "\n");
-
-	fabric_priv = container_of(fabric, struct psmx_fid_fabric,
-				   util_fabric.fabric_fid);
-
-	if (fabric_priv->active_domain) {
-		psmx_domain_acquire(fabric_priv->active_domain);
-		*domain = &fabric_priv->active_domain->util_domain.domain_fid;
-		return 0;
-	}
-
-	if (!info->domain_attr->name ||
-	    strcmp(info->domain_attr->name, PSMX_DOMAIN_NAME)) {
-		err = -FI_EINVAL;
-		goto err_out;
-	}
-
-	domain_priv = (struct psmx_fid_domain *) calloc(1, sizeof *domain_priv);
-	if (!domain_priv) {
-		err = -FI_ENOMEM;
-		goto err_out;
-	}
-
-	err = ofi_domain_init(fabric, info, &domain_priv->util_domain, context);
-	if (err)
-		goto err_out_free_domain;
-
-	/* fclass & context are set in ofi_domain_init */
-	domain_priv->util_domain.domain_fid.fid.ops = &psmx_fi_ops;
-	domain_priv->util_domain.domain_fid.ops = &psmx_domain_ops;
-	domain_priv->util_domain.domain_fid.mr = &psmx_mr_ops;
-	domain_priv->mr_mode = info->domain_attr->mr_mode;
-	domain_priv->mode = info->mode;
-	domain_priv->caps = info->caps;
-	domain_priv->fabric = fabric_priv;
-	domain_priv->progress_thread_enabled =
-		(info->domain_attr->data_progress == FI_PROGRESS_AUTO && psmx_env.prog_thread);
-
-	err = psmx_domain_init(domain_priv, info->src_addr);
-	if (err)
-		goto err_out_close_domain;
-
-	/* tale the reference to count for multiple domain open calls */
-	psmx_domain_acquire(fabric_priv->active_domain);
-
-	*domain = &domain_priv->util_domain.domain_fid;
-	return 0;
-
-err_out_close_domain:
-	ofi_domain_close(&domain_priv->util_domain);
+		psm_ep_close(domain_priv->psm_ep, PSM_EP_CLOSE_FORCE, 0);
 
 err_out_free_domain:
 	free(domain_priv);
 
 err_out:
+	psmx_fabric_release(fabric_priv);
 	return err;
 }
 
-static int psmx_domain_check_ep_caps(uint64_t domain_caps, uint64_t ep_caps)
+int psmx_domain_check_features(struct psmx_fid_domain *domain, int ep_cap)
 {
-	domain_caps &= ~PSMX_SUB_CAPS;
-	ep_caps &= ~PSMX_SUB_CAPS;
-
-	if ((domain_caps & ep_caps) != ep_caps) {
+	if ((domain->caps & ep_cap & ~PSMX_SUB_CAPS) != (ep_cap & ~PSMX_SUB_CAPS)) {
 		FI_INFO(&psmx_prov, FI_LOG_CORE,
-			"caps mismatch: domain_caps=%s\n",
-			fi_tostr(&domain_caps, FI_TYPE_CAPS));
-
-		FI_INFO(&psmx_prov, FI_LOG_CORE,
-			"caps mismatch: ep_caps=%s\n",
-			fi_tostr(&ep_caps, FI_TYPE_CAPS));
-
+			"caps mismatch: domain->caps=%llx, ep->caps=%llx, mask=%llx\n",
+			domain->caps, ep_cap, ~PSMX_SUB_CAPS);
 		return -FI_EOPNOTSUPP;
 	}
 
-	return 0;
-}
-
-int psmx_domain_check_features(struct psmx_fid_domain *domain, uint64_t ep_cap)
-{
-	if (psmx_domain_check_ep_caps(domain->caps, ep_cap))
-		return -FI_EOPNOTSUPP;
-
 	if ((ep_cap & FI_TAGGED) && domain->tagged_ep &&
-	    ofi_recv_allowed(ep_cap))
+	    fi_recv_allowed(ep_cap))
 		return -FI_EBUSY;
 
 	if ((ep_cap & FI_MSG) && domain->msg_ep &&
-	    ofi_recv_allowed(ep_cap))
+	    fi_recv_allowed(ep_cap))
 		return -FI_EBUSY;
 
 	if ((ep_cap & FI_RMA) && domain->rma_ep &&
-	    ofi_rma_target_allowed(ep_cap))
+	    fi_rma_target_allowed(ep_cap))
 		return -FI_EBUSY;
 
 	if ((ep_cap & FI_ATOMICS) && domain->atomics_ep &&
-	    ofi_rma_target_allowed(ep_cap))
+	    fi_rma_target_allowed(ep_cap))
 		return -FI_EBUSY;
 
 	return 0;
@@ -470,8 +427,12 @@ int psmx_domain_enable_ep(struct psmx_fid_domain *domain, struct psmx_fid_ep *ep
 	if (ep)
 		ep_cap = ep->caps;
 
-	if (psmx_domain_check_ep_caps(domain->caps, ep_cap))
+	if ((domain->caps & ep_cap & ~PSMX_SUB_CAPS) != (ep_cap & ~PSMX_SUB_CAPS)) {
+		FI_INFO(&psmx_prov, FI_LOG_CORE,
+			"caps mismatch: domain->caps=%llx, ep->caps=%llx, mask=%llx\n",
+			domain->caps, ep_cap, ~PSMX_SUB_CAPS);
 		return -FI_EOPNOTSUPP;
+	}
 
 	if (ep_cap & FI_MSG)
 		domain->reserved_tag_bits |= PSMX_MSG_BIT;
@@ -491,16 +452,16 @@ int psmx_domain_enable_ep(struct psmx_fid_domain *domain, struct psmx_fid_ep *ep
 		domain->am_initialized = 1;
 	}
 
-	if ((ep_cap & FI_RMA) && ofi_rma_target_allowed(ep_cap))
+	if ((ep_cap & FI_RMA) && fi_rma_target_allowed(ep_cap))
 		domain->rma_ep = ep;
 
-	if ((ep_cap & FI_ATOMICS) && ofi_rma_target_allowed(ep_cap))
+	if ((ep_cap & FI_ATOMICS) && fi_rma_target_allowed(ep_cap))
 		domain->atomics_ep = ep;
 
-	if ((ep_cap & FI_TAGGED) && ofi_recv_allowed(ep_cap))
+	if ((ep_cap & FI_TAGGED) && fi_recv_allowed(ep_cap))
 		domain->tagged_ep = ep;
 
-	if ((ep_cap & FI_MSG) && ofi_recv_allowed(ep_cap))
+	if ((ep_cap & FI_MSG) && fi_recv_allowed(ep_cap))
 		domain->msg_ep = ep;
 
 	return 0;

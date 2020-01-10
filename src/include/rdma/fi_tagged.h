@@ -30,8 +30,8 @@
  * SOFTWARE.
  */
 
-#ifndef FI_TAGGED_H
-#define FI_TAGGED_H
+#ifndef _FI_TAGGED_H_
+#define _FI_TAGGED_H_
 
 #include <rdma/fabric.h>
 #include <rdma/fi_endpoint.h>
@@ -41,6 +41,8 @@
 extern "C" {
 #endif
 
+#define FI_CLAIM		(1ULL << 59)
+#define FI_DISCARD		(1ULL << 58)
 
 struct fi_msg_tagged {
 	const struct iovec	*msg_iov;
@@ -155,4 +157,4 @@ fi_tinjectdata(struct fid_ep *ep, const void *buf, size_t len,
 }
 #endif
 
-#endif /* FI_TAGGED_H */
+#endif /* _FI_TAGGED_H_ */

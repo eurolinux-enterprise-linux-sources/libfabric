@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2018 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -74,7 +74,7 @@ static int psmx2_progress_set_affinity(char *affinity)
 
 		if (n < 2)
 			end = start;
-
+	
 		if (stride < 1)
 			stride = 1;
 
@@ -127,7 +127,7 @@ static void *psmx2_progress_func(void *args)
 	ts.tv_nsec = (sleep_usec % 1000000) * 1000;
 
 	while (1) {
-		psmx2_progress_all(domain);
+		psmx2_progress(domain);
 		nanosleep(&ts, NULL);
 	}
 
@@ -177,53 +177,55 @@ static void psmx2_domain_stop_progress(struct psmx2_fid_domain *domain)
 static int psmx2_domain_close(fid_t fid)
 {
 	struct psmx2_fid_domain *domain;
+	int err;
 
 	domain = container_of(fid, struct psmx2_fid_domain,
 			      util_domain.domain_fid.fid);
 
 	FI_INFO(&psmx2_prov, FI_LOG_DOMAIN, "refcnt=%d\n",
-		ofi_atomic_get32(&domain->util_domain.ref));
+		atomic_get(&domain->util_domain.ref));
 
-	if (ofi_domain_close(&domain->util_domain))
+	psmx2_domain_release(domain);
+
+	if (util_domain_close(&domain->util_domain))
 		return 0;
 
 	if (domain->progress_thread_enabled)
 		psmx2_domain_stop_progress(domain);
 
-	fastlock_destroy(&domain->sep_lock);
-	fastlock_destroy(&domain->mr_lock);
-	rbtDelete(domain->mr_map);
+	if (domain->am_initialized)
+		psmx2_am_fini(domain);
 
-	psmx2_lock(&domain->fabric->domain_lock, 1);
-	dlist_remove(&domain->entry);
-	psmx2_unlock(&domain->fabric->domain_lock, 1);
-	psmx2_fabric_release(domain->fabric);
+	fastlock_destroy(&domain->poll_lock);
+	fastlock_destroy(&domain->vl_lock);
+	rbtDelete(domain->mr_map);
+	fastlock_destroy(&domain->mr_lock);
+
+#if 0
+	/* AM messages could arrive after MQ is finalized, causing segfault
+	 * when trying to dereference the MQ pointer. There is no mechanism
+	 * to properly shutdown AM. The workaround is to keep MQ valid.
+	 */
+	psm2_mq_finalize(domain->psm2_mq);
+#endif
+
+	/* workaround for:
+	 * Assertion failure at psm2_ep.c:1059: ep->mctxt_master == ep
+	 */
+	sleep(psmx2_env.delay);
+
+	if (psmx2_env.timeout)
+		err = psm2_ep_close(domain->psm2_ep, PSM2_EP_CLOSE_GRACEFUL,
+				    (int64_t) psmx2_env.timeout * 1000000000LL);
+	else
+		err = PSM2_EP_CLOSE_TIMEOUT;
+
+	if (err != PSM2_OK)
+		psm2_ep_close(domain->psm2_ep, PSM2_EP_CLOSE_FORCE, 0);
+
+	domain->fabric->active_domain = NULL;
 
 	free(domain);
-	return 0;
-}
-
-DIRECT_FN
-STATIC int psmx2_domain_control(fid_t fid, int command, void *arg)
-{
-	struct fi_mr_map_raw *map;
-
-	switch (command) {
-	case FI_MAP_RAW_MR:
-		map = arg;
-		if (!map || !map->key || !map->raw_key)
-			return -FI_EINVAL;
-		*(uint64_t *)map->key = *(uint64_t *)map->raw_key;
-		break;
-
-	case FI_UNMAP_KEY:
-		/* Nothing to do here */
-		break;
-
-	default:
-		return -FI_ENOSYS;
-	}
-
 	return 0;
 }
 
@@ -231,7 +233,7 @@ static struct fi_ops psmx2_fi_ops = {
 	.size = sizeof(struct fi_ops),
 	.close = psmx2_domain_close,
 	.bind = fi_no_bind,
-	.control = psmx2_domain_control,
+	.control = fi_no_control,
 	.ops_open = fi_no_ops_open,
 };
 
@@ -240,12 +242,11 @@ static struct fi_ops_domain psmx2_domain_ops = {
 	.av_open = psmx2_av_open,
 	.cq_open = psmx2_cq_open,
 	.endpoint = psmx2_ep_open,
-	.scalable_ep = psmx2_sep_open,
+	.scalable_ep = fi_no_scalable_ep,
 	.cntr_open = psmx2_cntr_open,
 	.poll_open = fi_poll_create,
 	.stx_ctx = psmx2_stx_ctx,
 	.srx_ctx = fi_no_srx_context,
-	.query_atomic = psmx2_query_atomic,
 };
 
 static int psmx2_key_compare(void *key1, void *key2)
@@ -253,16 +254,43 @@ static int psmx2_key_compare(void *key1, void *key2)
 	return (key1 < key2) ?  -1 : (key1 > key2);
 }
 
-static int psmx2_domain_init(struct psmx2_fid_domain *domain,
-			     struct psmx2_ep_name *src_addr)
+static int psmx2_domain_init(struct psmx2_fid_domain *domain)
 {
+	struct psmx2_fid_fabric *fabric = domain->fabric;
+	struct psm2_ep_open_opts opts;
 	int err;
+
+	psm2_ep_open_opts_get_defaults(&opts);
+
+	FI_INFO(&psmx2_prov, FI_LOG_CORE,
+		"uuid: %s\n", psmx2_uuid_to_string(fabric->uuid));
+
+	err = psm2_ep_open(fabric->uuid, &opts,
+			   &domain->psm2_ep, &domain->psm2_epid);
+	if (err != PSM2_OK) {
+		FI_WARN(&psmx2_prov, FI_LOG_CORE,
+			"psm2_ep_open returns %d, errno=%d\n", err, errno);
+		err = psmx2_errno(err);
+		goto err_out;
+	}
+
+	FI_INFO(&psmx2_prov, FI_LOG_CORE,
+		"epid: 0x%016lx\n", domain->psm2_epid);
+
+	err = psm2_mq_init(domain->psm2_ep, PSM2_MQ_ORDERMASK_ALL,
+			   NULL, 0, &domain->psm2_mq);
+	if (err != PSM2_OK) {
+		FI_WARN(&psmx2_prov, FI_LOG_CORE,
+			"psm2_mq_init returns %d, errno=%d\n", err, errno);
+		err = psmx2_errno(err);
+		goto err_out_close_ep;
+	}
 
 	err = fastlock_init(&domain->mr_lock);
 	if (err) {
 		FI_WARN(&psmx2_prov, FI_LOG_CORE,
 			"fastlock_init(mr_lock) returns %d\n", err);
-		goto err_out;
+		goto err_out_finalize_mq;
 	}
 
 	domain->mr_map = rbtNew(&psmx2_key_compare);
@@ -273,40 +301,81 @@ static int psmx2_domain_init(struct psmx2_fid_domain *domain,
 	}
 
 	domain->mr_reserved_key = 1;
-	domain->max_atomic_size = INT_MAX;
+	
+	err = fastlock_init(&domain->vl_lock);
+	if (err) {
+		FI_WARN(&psmx2_prov, FI_LOG_CORE,
+			"fastlock_init(vl_lock) returns %d\n", err);
+		goto err_out_delete_mr_map;
+	}
+	memset(domain->vl_map, 0, sizeof(domain->vl_map));
+	domain->vl_alloc = 0;
 
-	ofi_atomic_initialize32(&domain->sep_cnt, 0);
-	fastlock_init(&domain->sep_lock);
-	dlist_init(&domain->sep_list);
-	dlist_init(&domain->trx_ctxt_list);
-	fastlock_init(&domain->trx_ctxt_lock);
+	err = fastlock_init(&domain->poll_lock);
+	if (err) {
+		FI_WARN(&psmx2_prov, FI_LOG_CORE,
+			"fastlock_init(poll_lock) returns %d\n", err);
+		goto err_out_destroy_vl_lock;
+	}
+
+	/* Set active domain before psmx2_domain_enable_ep() installs the
+	 * AM handlers to ensure that psmx2_active_fabric->active_domain
+	 * is always non-NULL inside the handlers. Notice that the vlaue
+	 * active_domain becomes NULL again only when the domain is closed.
+	 * At that time the AM handlers are gone with the PSM endpoint.
+	 */
+	fabric->active_domain = domain;
+
+	if (psmx2_domain_enable_ep(domain, NULL) < 0)
+		goto err_out_reset_active_domain;
 
 	if (domain->progress_thread_enabled)
 		psmx2_domain_start_progress(domain);
 
 	return 0;
 
+err_out_reset_active_domain:
+	fabric->active_domain = NULL;
+	fastlock_destroy(&domain->poll_lock);
+
+err_out_destroy_vl_lock:
+	fastlock_destroy(&domain->vl_lock);
+
+err_out_delete_mr_map:
+	rbtDelete(domain->mr_map);
+
 err_out_destroy_mr_lock:
 	fastlock_destroy(&domain->mr_lock);
+
+err_out_finalize_mq:
+	psm2_mq_finalize(domain->psm2_mq);
+
+err_out_close_ep:
+	if (psm2_ep_close(domain->psm2_ep, PSM2_EP_CLOSE_GRACEFUL,
+			  (int64_t) psmx2_env.timeout * 1000000000LL) != PSM2_OK)
+		psm2_ep_close(domain->psm2_ep, PSM2_EP_CLOSE_FORCE, 0);
 
 err_out:
 	return err;
 }
 
-DIRECT_FN
 int psmx2_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 		      struct fid_domain **domain, void *context)
 {
 	struct psmx2_fid_fabric *fabric_priv;
 	struct psmx2_fid_domain *domain_priv;
-	struct psmx2_ep_name *src_addr = info->src_addr;
-	int mr_mode = (info->domain_attr->mr_mode & FI_MR_BASIC) ? FI_MR_BASIC : 0;
-	int err, tmp;
+	int err;
 
 	FI_INFO(&psmx2_prov, FI_LOG_DOMAIN, "\n");
 
 	fabric_priv = container_of(fabric, struct psmx2_fid_fabric,
 				   util_fabric.fabric_fid);
+
+	if (fabric_priv->active_domain) {
+		psmx2_domain_acquire(fabric_priv->active_domain);
+		*domain = &fabric_priv->active_domain->util_domain.domain_fid;
+		return 0;
+	}
 
 	if (!info->domain_attr->name ||
 	    strcmp(info->domain_attr->name, PSMX2_DOMAIN_NAME)) {
@@ -320,145 +389,33 @@ int psmx2_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 		goto err_out;
 	}
 
-	err = ofi_domain_init(fabric, info, &domain_priv->util_domain, context);
+	err = fi_domain_init(fabric, info, &domain_priv->util_domain, context);
 	if (err)
 		goto err_out_free_domain;
-
-	/* fclass & context are set in ofi_domain_init */
+		
+	/* fclass & context are set in fi_domain_init */
 	domain_priv->util_domain.domain_fid.fid.ops = &psmx2_fi_ops;
 	domain_priv->util_domain.domain_fid.ops = &psmx2_domain_ops;
 	domain_priv->util_domain.domain_fid.mr = &psmx2_mr_ops;
-	domain_priv->mr_mode = mr_mode;
+	domain_priv->mr_mode = info->domain_attr->mr_mode;
 	domain_priv->mode = info->mode;
 	domain_priv->caps = info->caps;
 	domain_priv->fabric = fabric_priv;
 	domain_priv->progress_thread_enabled =
 		(info->domain_attr->data_progress == FI_PROGRESS_AUTO);
-	domain_priv->addr_format = info->addr_format;
 
-	if (info->addr_format == FI_ADDR_STR)
-		src_addr = psmx2_string_to_ep_name(info->src_addr);
-
-	/* Use generic lock/unlock functions by default */
-	domain_priv->av_lock_fn = psmx2_lock;
-	domain_priv->am_req_pool_lock_fn = psmx2_lock;
-	domain_priv->trx_ctxt_lock_fn = psmx2_lock;
-	domain_priv->rma_queue_lock_fn = psmx2_lock;
-	domain_priv->trigger_queue_lock_fn = psmx2_lock;
-	domain_priv->peer_lock_fn = psmx2_lock;
-	domain_priv->sep_lock_fn = psmx2_lock;
-	domain_priv->trigger_lock_fn = psmx2_lock;
-	domain_priv->cq_lock_fn = psmx2_lock;
-	domain_priv->mr_lock_fn = psmx2_lock;
-	domain_priv->context_lock_fn = psmx2_lock;
-	domain_priv->poll_trylock_fn = psmx2_trylock;
-
-	domain_priv->av_unlock_fn = psmx2_unlock;
-	domain_priv->am_req_pool_unlock_fn = psmx2_unlock;
-	domain_priv->trx_ctxt_unlock_fn = psmx2_unlock;
-	domain_priv->rma_queue_unlock_fn = psmx2_unlock;
-	domain_priv->trigger_queue_unlock_fn = psmx2_unlock;
-	domain_priv->peer_unlock_fn = psmx2_unlock;
-	domain_priv->sep_unlock_fn = psmx2_unlock;
-	domain_priv->trigger_unlock_fn = psmx2_unlock;
-	domain_priv->cq_unlock_fn = psmx2_unlock;
-	domain_priv->mr_unlock_fn = psmx2_unlock;
-	domain_priv->context_unlock_fn = psmx2_unlock;
-	domain_priv->poll_unlock_fn = psmx2_unlock;
-
-	/* If lock_level env is unset, then set locks based off threading model*/
-	err = fi_param_get_bool(&psmx2_prov, "lock_level", &tmp);
-	if (err < 0) {
-		switch (info->domain_attr->threading) {
-		case FI_THREAD_DOMAIN:
-			/* Disable locks not required when serializing access to a domain */
-			domain_priv->av_lock_fn = psmx2_lock_disabled;
-			domain_priv->trx_ctxt_lock_fn = psmx2_lock_disabled;
-			domain_priv->trigger_queue_lock_fn = psmx2_lock_disabled;
-			domain_priv->peer_lock_fn = psmx2_lock_disabled;
-			domain_priv->sep_lock_fn = psmx2_lock_disabled;
-			domain_priv->trigger_lock_fn = psmx2_lock_disabled;
-			domain_priv->cq_lock_fn = psmx2_lock_disabled;
-			domain_priv->mr_lock_fn = psmx2_lock_disabled;
-			domain_priv->context_lock_fn = psmx2_lock_disabled;
-			domain_priv->poll_trylock_fn = psmx2_trylock_disabled;
-
-			domain_priv->av_unlock_fn = psmx2_lock_disabled;
-			domain_priv->trx_ctxt_unlock_fn = psmx2_lock_disabled;
-			domain_priv->trigger_queue_unlock_fn = psmx2_lock_disabled;
-			domain_priv->peer_unlock_fn = psmx2_lock_disabled;
-			domain_priv->sep_unlock_fn = psmx2_lock_disabled;
-			domain_priv->trigger_unlock_fn = psmx2_lock_disabled;
-			domain_priv->cq_unlock_fn = psmx2_lock_disabled;
-			domain_priv->mr_unlock_fn = psmx2_lock_disabled;
-			domain_priv->context_unlock_fn = psmx2_lock_disabled;
-			domain_priv->poll_unlock_fn = psmx2_lock_disabled;
-
-			/*
-			 * If FI_RMA or FI_ATOMIC caps are enabled, then locks are
-			 * required for the CQ, am_req_poll, & rma_queue
-			 * due to the PSM2 Recv thread.
-			 * NOTE: am_req_poll & rma_queue are only used when FI_RMA
-			 * and FI_ATOMIC capabilities are enabled.
-			 */
-			if ((info->caps & FI_RMA) || (info->caps & FI_ATOMIC)) {
-				domain_priv->cq_lock_fn = psmx2_lock_enabled;
-				domain_priv->am_req_pool_lock_fn = psmx2_lock_enabled;
-				domain_priv->rma_queue_lock_fn = psmx2_lock_enabled;
-				domain_priv->cq_unlock_fn = psmx2_unlock_enabled;
-				domain_priv->am_req_pool_unlock_fn = psmx2_unlock_enabled;
-				domain_priv->rma_queue_unlock_fn = psmx2_unlock_enabled;
-			}
-			break;
-		default:
-			/* Otherwise, enable all locks */
-			domain_priv->av_lock_fn = psmx2_lock_enabled;
-			domain_priv->am_req_pool_lock_fn = psmx2_lock_enabled;
-			domain_priv->trx_ctxt_lock_fn = psmx2_lock_enabled;
-			domain_priv->rma_queue_lock_fn = psmx2_lock_enabled;
-			domain_priv->trigger_queue_lock_fn = psmx2_lock_enabled;
-			domain_priv->peer_lock_fn = psmx2_lock_enabled;
-			domain_priv->sep_lock_fn = psmx2_lock_enabled;
-			domain_priv->trigger_lock_fn = psmx2_lock_enabled;
-			domain_priv->cq_lock_fn = psmx2_lock_enabled;
-			domain_priv->mr_lock_fn = psmx2_lock_enabled;
-			domain_priv->context_lock_fn = psmx2_lock_enabled;
-			domain_priv->poll_trylock_fn = psmx2_trylock_enabled;
-
-			domain_priv->av_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->am_req_pool_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->trx_ctxt_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->rma_queue_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->trigger_queue_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->peer_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->sep_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->trigger_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->cq_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->mr_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->context_unlock_fn = psmx2_unlock_enabled;
-			domain_priv->poll_unlock_fn = psmx2_unlock_enabled;
-			break;
-		}
-	}
-
-	err = psmx2_domain_init(domain_priv, src_addr);
-	if (info->addr_format == FI_ADDR_STR)
-		free(src_addr);
+	err = psmx2_domain_init(domain_priv);
 	if (err)
 		goto err_out_close_domain;
 
-	psmx2_fabric_acquire(fabric_priv);
-	psmx2_lock(&fabric_priv->domain_lock, 1);
-	dlist_insert_before(&domain_priv->entry, &fabric_priv->domain_list);
-	psmx2_unlock(&fabric_priv->domain_lock, 1);
-
-	psmx2_init_tag_layout(info);
+	/* take the reference to count for multiple domain open calls */
+	psmx2_domain_acquire(fabric_priv->active_domain);
 
 	*domain = &domain_priv->util_domain.domain_fid;
 	return 0;
 
 err_out_close_domain:
-	ofi_domain_close(&domain_priv->util_domain);
+	util_domain_close(&domain_priv->util_domain);
 
 err_out_free_domain:
 	free(domain_priv);
@@ -467,22 +424,14 @@ err_out:
 	return err;
 }
 
-static int psmx2_domain_check_features(struct psmx2_fid_domain *domain,
-				       uint64_t ep_caps)
+int psmx2_domain_check_features(struct psmx2_fid_domain *domain, int ep_cap)
 {
-	uint64_t domain_caps = domain->caps & ~PSMX2_SUB_CAPS;
-
-	ep_caps &= ~PSMX2_SUB_CAPS;
-
-	if ((domain_caps & ep_caps) != ep_caps) {
+	if ((domain->caps & ep_cap & ~PSMX2_SUB_CAPS) !=
+	    (ep_cap & ~PSMX2_SUB_CAPS)) {
 		FI_INFO(&psmx2_prov, FI_LOG_CORE,
-			"caps mismatch: domain_caps=%s;\n",
-			fi_tostr(&domain_caps, FI_TYPE_CAPS));
-
-		FI_INFO(&psmx2_prov, FI_LOG_CORE,
-			"caps mismatch: ep_caps=%s.\n",
-			fi_tostr(&ep_caps, FI_TYPE_CAPS));
-
+			"caps mismatch: domain->caps=%llx, "
+			"ep->caps=%llx, mask=%llx\n",
+			domain->caps, ep_cap, ~PSMX2_SUB_CAPS);
 		return -FI_EOPNOTSUPP;
 	}
 
@@ -492,20 +441,27 @@ static int psmx2_domain_check_features(struct psmx2_fid_domain *domain,
 int psmx2_domain_enable_ep(struct psmx2_fid_domain *domain,
 			   struct psmx2_fid_ep *ep)
 {
-	int err;
+	uint64_t ep_cap = 0;
 
-	err = psmx2_domain_check_features(domain, ep->caps);
-	if (err)
-		return err;
+	if (ep)
+		ep_cap = ep->caps;
 
-	if ((ep->caps & FI_RMA) || (ep->caps & FI_ATOMICS)) {
-		if (ep->tx) {
-			err = psmx2_am_init(ep->tx);
-			if (err)
-				return err;
-		}
-		if (ep->rx && ep->rx != ep->tx)
-			return psmx2_am_init(ep->rx);
+	if ((domain->caps & ep_cap & ~PSMX2_SUB_CAPS) !=
+	    (ep_cap & ~PSMX2_SUB_CAPS)) {
+		FI_INFO(&psmx2_prov, FI_LOG_CORE,
+			"caps mismatch: domain->caps=%llx, "
+			"ep->caps=%llx, mask=%llx\n",
+			domain->caps, ep_cap, ~PSMX2_SUB_CAPS);
+		return -FI_EOPNOTSUPP;
+	}
+
+	if (((ep_cap & FI_RMA) || (ep_cap & FI_ATOMICS)) &&
+	    !domain->am_initialized) {
+		int err = psmx2_am_init(domain);
+		if (err)
+			return err;
+
+		domain->am_initialized = 1;
 	}
 
 	return 0;

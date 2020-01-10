@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014-2016, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -39,7 +39,7 @@
 #include <sys/queue.h>
 #include <pthread.h>
 
-#include <rdma/providers/fi_log.h>
+#include <rdma/fi_log.h>
 
 #include "usdf_progress.h"
 #include "usd.h"
@@ -76,13 +76,6 @@ extern struct fi_provider usdf_ops;
 #define USDF_EVENT_FLAG_ERROR (1ULL << 62)
 #define USDF_EVENT_FLAG_FREE_BUF (1ULL << 63)
 
-/* usdf domain capability: no loopback */
-#define USDF_DOM_CAPS (FI_REMOTE_COMM)
-
-#define USDF_MR_IOV_LIMIT 1
-#define USDF_MR_CNT (65535)
-#define USDF_ADDR_STR_LEN (INET6_ADDRSTRLEN+8)
-
 /*
  *  TAILQ stuff that should exist
  */
@@ -113,8 +106,8 @@ struct usdf_fabric {
 	struct fi_fabric_attr fab_attr;
 	struct usd_device_attrs *fab_dev_attrs;
 	int fab_arp_sockfd;
-	ofi_atomic32_t fab_refcnt;
-	ofi_atomic32_t num_blocked_waiting;
+	atomic_t fab_refcnt;
+	atomic_t num_blocked_waiting;
 	LIST_HEAD(,usdf_domain) fab_domain_list;
 
 	/* progression */
@@ -139,7 +132,7 @@ struct usdf_domain {
 	struct fid_domain   dom_fid;
 	struct usdf_fabric *dom_fabric;
 	struct fi_info *dom_info;
-	ofi_atomic32_t dom_refcnt;
+	atomic_t dom_refcnt;
 	struct usdf_eq *dom_eq;
 	struct usd_device   *dom_dev;
 
@@ -149,7 +142,7 @@ struct usdf_domain {
 
 	struct usdf_rdm_connection **dom_rdc_hashtab;
 	SLIST_HEAD(,usdf_rdm_connection) dom_rdc_free;
-	ofi_atomic32_t dom_rdc_free_cnt;
+	atomic_t dom_rdc_free_cnt;
 	size_t dom_rdc_total;
 
 	/* used only by connected endpoints */
@@ -174,14 +167,11 @@ enum usdf_pep_state {
 
 struct usdf_pep {
 	struct fid_pep pep_fid;
-	ofi_atomic32_t pep_refcnt;
+	atomic_t pep_refcnt;
 	struct usdf_fabric *pep_fabric;
 	struct usdf_eq *pep_eq;
 	int pep_sock;
-	union {
-		struct sockaddr_in sin;
-		char addr_str[USDF_ADDR_STR_LEN];
-	} pep_src_addr;
+	struct sockaddr_in pep_src_addr;
 	enum usdf_pep_state pep_state;
 	struct usdf_poll_item pep_pollitem;
 	struct fi_info *pep_info;
@@ -200,7 +190,7 @@ struct usdf_pep {
 
 struct usdf_tx {
 	struct fid_stx tx_fid;
-	ofi_atomic32_t tx_refcnt;
+	atomic_t tx_refcnt;
 	struct usdf_domain *tx_domain;
 	TAILQ_ENTRY(usdf_tx) tx_link;
 
@@ -222,7 +212,7 @@ struct usdf_tx {
 		struct {
 			struct usdf_cq_hard *tx_hcq;
 
-			ofi_atomic32_t tx_next_msg_id;
+			atomic_t tx_next_msg_id;
 			struct usdf_rdm_qe *tx_wqe_buf;
 			uint8_t *tx_inject_bufs;
 			TAILQ_HEAD(,usdf_rdm_qe) tx_free_wqe;
@@ -239,7 +229,7 @@ struct usdf_tx {
 
 struct usdf_rx {
 	struct fid_ep rx_fid;
-	ofi_atomic32_t rx_refcnt;
+	atomic_t rx_refcnt;
 	struct usdf_domain *rx_domain;
 
 	struct fi_rx_attr rx_attr;
@@ -273,14 +263,10 @@ struct usdf_rx {
 #define rx_utof(RX) (&(RX)->rx_fid)
 #define rx_utofid(RX) (&(RX)->rx_fid.fid)
 
-enum {
-	USDF_EP_ENABLED = (1 << 0)
-};
-
 struct usdf_ep {
 	struct fid_ep ep_fid;
 	struct usdf_domain *ep_domain;
-	ofi_atomic32_t ep_refcnt;
+	atomic_t ep_refcnt;
 	uint64_t ep_caps;
 	uint64_t ep_mode;
 
@@ -289,8 +275,6 @@ struct usdf_ep {
 
 	uint8_t ep_tx_completion;
 	uint8_t ep_rx_completion;
-
-	uint32_t flags;
 
 	uint32_t ep_wqe;	/* requested queue sizes */
 	uint32_t ep_rqe;
@@ -369,10 +353,10 @@ struct usdf_mr {
 struct usdf_cq_hard {
 	struct usdf_cq *cqh_cq;
 	struct usd_cq *cqh_ucq;
-	ofi_atomic32_t cqh_refcnt;
+	atomic_t cqh_refcnt;
 	void (*cqh_progress)(struct usdf_cq_hard *hcq);
 	void (*cqh_post)(struct usdf_cq_hard *hcq, void *context, size_t len,
-			int prov_errno, uint64_t flags);
+			int prov_errno);
 	TAILQ_ENTRY(usdf_cq_hard) cqh_link;
 	TAILQ_ENTRY(usdf_cq_hard) cqh_dom_link;
 };
@@ -388,7 +372,7 @@ struct usdf_cq_soft_entry {
 
 struct usdf_cq {
 	struct fid_cq cq_fid;
-	ofi_atomic32_t cq_refcnt;
+	atomic_t cq_refcnt;
 	struct usdf_domain *cq_domain;
 	struct fi_cq_attr cq_attr;
 	uint8_t cq_is_soft;
@@ -426,12 +410,6 @@ enum {
 #define cq_fidtou(FID) container_of(FID, struct usdf_cq, cq_fid.fid)
 #define cq_utof(CQ) (&(CQ)->cq_fid)
 
-struct usdf_err_data_entry {
-	struct slist_entry entry;
-	uint8_t seen;
-	uint8_t err_data[0];
-};
-
 struct usdf_event {
 	uint32_t ue_event;
 	void *ue_buf;
@@ -442,7 +420,7 @@ struct usdf_event {
 struct usdf_eq {
 	struct fid_eq eq_fid;
 	struct usdf_fabric *eq_fabric;
-	ofi_atomic32_t eq_refcnt;
+	atomic_t eq_refcnt;
 
 	pthread_spinlock_t eq_lock;
 
@@ -452,7 +430,7 @@ struct usdf_eq {
 	struct usdf_event *eq_ev_tail;
 	struct usdf_event *eq_ev_end;
 	int eq_ev_ring_size;
-	ofi_atomic32_t eq_num_events;
+	atomic_t eq_num_events;
 
 	/* various ways to wait */
 	struct fi_eq_attr eq_attr;
@@ -460,7 +438,6 @@ struct usdf_eq {
 		int eq_fd;
 	};
 
-	struct slist eq_err_data;
 	struct fi_ops_eq eq_ops_data;
 };
 #define eq_ftou(FEQ) container_of(FEQ, struct usdf_eq, eq_fid)
@@ -489,39 +466,17 @@ int usdf_endpoint_open(struct fid_domain *domain, struct fi_info *info,
 		struct fid_ep **ep, void *context);
 int usdf_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 		 struct fid_av **av_o, void *context);
-int usdf_query_atomic(struct fid_domain *domain, enum fi_datatype datatype,
-		enum fi_op op, struct fi_atomic_attr *attr, uint64_t flags);
 
-/* Domain name functionality */
-int usdf_domain_getname(uint32_t version, struct usd_device_attrs *dap,
-			char **name);
-bool usdf_domain_checkname(uint32_t version, struct usd_device_attrs *dap,
-			const char *hint);
 
 /* fi_ops_mr */
 int usdf_reg_mr(struct fid *fid, const void *buf, size_t len,
-		uint64_t access, uint64_t offset, uint64_t requested_key,
-		uint64_t flags, struct fid_mr **mr_o, void *context);
-int usdf_regv_mr(struct fid *fid, const struct iovec *iov,
-		 size_t count, uint64_t access,
-		 uint64_t offset, uint64_t requested_key,
-		 uint64_t flags, struct fid_mr **mr, void *context);
-int usdf_regattr(struct fid *fid, const struct fi_mr_attr *attr,
-		 uint64_t flags, struct fid_mr **mr);
+	uint64_t access, uint64_t offset, uint64_t requested_key,
+	uint64_t flags, struct fid_mr **mr_o, void *context);
 
 /* Fake IBV provider */
 void usdf_setup_fake_ibv_provider(void);
 
 /* passive endpoint functions */
 int usdf_pep_steal_socket(struct usdf_pep *pep, int *is_bound, int *sock_o);
-
-/* Utility functions */
-int usdf_catch_dom_attr(uint32_t version, const struct fi_info *hints,
-			struct fi_domain_attr *dom_attr);
-int usdf_catch_tx_attr(uint32_t version, const struct fi_tx_attr *tx_attr);
-int usdf_catch_rx_attr(uint32_t version, const struct fi_rx_attr *rx_attr);
-struct sockaddr_in *usdf_format_to_sin(const struct fi_info *info, const void *addr);
-void *usdf_sin_to_format(const struct fi_info *info, void *addr, size_t *len);
-void usdf_free_sin_if_needed(const struct fi_info *info, struct sockaddr_in *sin);
 
 #endif /* _USDF_H_ */

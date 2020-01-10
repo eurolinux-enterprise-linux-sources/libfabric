@@ -72,7 +72,7 @@ const struct fi_ep_attr sock_rdm_ep_attr = {
 };
 
 const struct fi_tx_attr sock_rdm_tx_attr = {
-	.caps = SOCK_EP_RDM_CAP_BASE,
+	.caps = SOCK_EP_RDM_CAP,
 	.mode = SOCK_MODE,
 	.op_flags = SOCK_EP_DEFAULT_OP_FLAGS,
 	.msg_order = SOCK_EP_MSG_ORDER,
@@ -83,7 +83,7 @@ const struct fi_tx_attr sock_rdm_tx_attr = {
 };
 
 const struct fi_rx_attr sock_rdm_rx_attr = {
-	.caps = SOCK_EP_RDM_CAP_BASE,
+	.caps = SOCK_EP_RDM_CAP,
 	.mode = SOCK_MODE,
 	.op_flags = 0,
 	.msg_order = SOCK_EP_MSG_ORDER,
@@ -118,8 +118,7 @@ static int sock_rdm_verify_rx_attr(const struct fi_rx_attr *attr)
 		return -FI_ENODATA;
 	}
 
-	if (sock_get_tx_size(attr->size) >
-	     sock_get_tx_size(sock_rdm_rx_attr.size)) {
+	if (attr->size > sock_rdm_rx_attr.size) {
 		SOCK_LOG_DBG("Rx size too large\n");
 		return -FI_ENODATA;
 	}
@@ -152,8 +151,7 @@ static int sock_rdm_verify_tx_attr(const struct fi_tx_attr *attr)
 		return -FI_ENODATA;
 	}
 
-	if (sock_get_tx_size(attr->size) >
-	     sock_get_tx_size(sock_rdm_tx_attr.size)) {
+	if (attr->size > sock_rdm_tx_attr.size) {
 		SOCK_LOG_DBG("Tx size too large\n");
 		return -FI_ENODATA;
 	}
@@ -171,9 +169,9 @@ static int sock_rdm_verify_tx_attr(const struct fi_tx_attr *attr)
 	return 0;
 }
 
-int sock_rdm_verify_ep_attr(const struct fi_ep_attr *ep_attr,
-			    const struct fi_tx_attr *tx_attr,
-			    const struct fi_rx_attr *rx_attr)
+int sock_rdm_verify_ep_attr(struct fi_ep_attr *ep_attr,
+			    struct fi_tx_attr *tx_attr,
+			    struct fi_rx_attr *rx_attr)
 {
 	int ret;
 
@@ -241,17 +239,15 @@ int sock_rdm_verify_ep_attr(const struct fi_ep_attr *ep_attr,
 	return 0;
 }
 
-int sock_rdm_fi_info(uint32_t version, void *src_addr, void *dest_addr,
-		     const struct fi_info *hints, struct fi_info **info)
+int sock_rdm_fi_info(void *src_addr, void *dest_addr, struct fi_info *hints,
+		     struct fi_info **info)
 {
-	*info = sock_fi_info(version, FI_EP_RDM, hints, src_addr, dest_addr);
+	*info = sock_fi_info(FI_EP_RDM, hints, src_addr, dest_addr);
 	if (!*info)
 		return -FI_ENOMEM;
 
 	*(*info)->tx_attr = sock_rdm_tx_attr;
-	(*info)->tx_attr->size = sock_get_tx_size(sock_rdm_tx_attr.size);
 	*(*info)->rx_attr = sock_rdm_rx_attr;
-	(*info)->rx_attr->size = sock_get_tx_size(sock_rdm_rx_attr.size);
 	*(*info)->ep_attr = sock_rdm_ep_attr;
 
 	if (hints && hints->ep_attr) {
@@ -319,7 +315,7 @@ static int sock_rdm_endpoint(struct fid_domain *domain, struct fi_info *info,
 		return ret;
 
 	if (!info || !info->ep_attr)
-		(*ep)->attr->ep_attr = sock_rdm_ep_attr;
+		(*ep)->ep_attr = sock_rdm_ep_attr;
 
 	if (!info || !info->tx_attr)
 		(*ep)->tx_attr = sock_rdm_tx_attr;

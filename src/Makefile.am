@@ -1,31 +1,23 @@
 #
 # Copyright (c) 2016 Cisco Systems, Inc.  All rights reserved.
-# Copyright (c) 2017-2018 Intel Corporation, Inc. All right reserved.
-# Copyright (c) 2018 Amazon.com, Inc. or its affiliates. All rights reserved.
 #
 # Makefile.am for libfabric
 
 AM_CPPFLAGS = \
 	-I$(srcdir)/include \
-	-D_GNU_SOURCE -D__USE_XOPEN2K8 \
+	-D_GNU_SOURCE \
 	-DSYSCONFDIR=\"$(sysconfdir)\" \
 	-DRDMADIR=\"@rdmadir@\" \
 	-DPROVDLDIR=\"$(pkglibdir)\"
 
-noinst_LTLIBRARIES =
-lib_LTLIBRARIES =
-
-if EMBEDDED
-noinst_LTLIBRARIES += src/libfabric.la
-else
-lib_LTLIBRARIES += src/libfabric.la
-endif
+lib_LTLIBRARIES = src/libfabric.la
 
 pkglib_LTLIBRARIES = $(DL_PROVIDERS)
 
+noinst_LTLIBRARIES =
 
 ACLOCAL_AMFLAGS = -I config
-AM_CFLAGS = -Wall
+AM_CFLAGS = -g -Wall
 
 if HAVE_LD_VERSION_SCRIPT
     libfabric_version_script = -Wl,--version-script=$(builddir)/libfabric.map
@@ -38,67 +30,28 @@ rdmaincludedir = $(includedir)/rdma
 rdmainclude_HEADERS =
 
 # internal utility functions shared by in-tree providers:
-common_srcs =				\
-	src/common.c			\
-	src/enosys.c			\
-	src/rbtree.c			\
-	src/tree.c			\
-	src/fasthash.c			\
-	src/indexer.c			\
-	src/mem.c			\
-	src/iov.c			\
-	src/shared/ofi_str.c		\
-	prov/util/src/util_atomic.c	\
-	prov/util/src/util_attr.c	\
-	prov/util/src/util_av.c		\
-	prov/util/src/util_cq.c		\
-	prov/util/src/util_cntr.c	\
-	prov/util/src/util_domain.c	\
-	prov/util/src/util_ep.c		\
-	prov/util/src/util_pep.c	\
-	prov/util/src/util_eq.c		\
-	prov/util/src/util_fabric.c	\
-	prov/util/src/util_main.c	\
-	prov/util/src/util_poll.c	\
-	prov/util/src/util_wait.c	\
-	prov/util/src/util_buf.c	\
-	prov/util/src/util_mr_map.c	\
-	prov/util/src/util_ns.c		\
-	prov/util/src/util_shm.c	\
-	prov/util/src/util_mem_monitor.c\
-	prov/util/src/util_mr_cache.c
-
-
-if MACOS
-common_srcs += src/unix/osd.c
-common_srcs += include/osx/osd.h
-common_srcs += include/unix/osd.h
-endif
-
-if FREEBSD
-common_srcs += src/unix/osd.c
-common_srcs += include/freebsd/osd.h
-common_srcs += include/unix/osd.h
-endif
-
-if LINUX
-common_srcs += src/unix/osd.c
-common_srcs += src/linux/osd.c
-if HAVE_LINUX_PERF_RDPMC
-common_srcs += src/linux/rdpmc.c
-endif
-common_srcs += include/linux/rdpmc.h
-common_srcs += include/linux/osd.h
-common_srcs += include/unix/osd.h
-endif
+common_srcs = \
+	src/common.c \
+	src/enosys.c \
+	src/rbtree.c \
+	src/fasthash.c \
+	src/indexer.c \
+	prov/util/src/util_attr.c   \
+	prov/util/src/util_av.c     \
+	prov/util/src/util_cq.c     \
+	prov/util/src/util_domain.c \
+	prov/util/src/util_eq.c     \
+	prov/util/src/util_fabric.c \
+	prov/util/src/util_main.c   \
+	prov/util/src/util_poll.c   \
+	prov/util/src/util_wait.c   \
+	prov/util/src/util_buf.c
 
 # ensure dl-built providers link back to libfabric
-linkback = src/libfabric.la
+linkback = $(top_builddir)/src/libfabric.la
 
 bin_PROGRAMS = \
-	util/fi_info \
-	util/fi_strerror \
-	util/fi_pingpong
+	util/fi_info
 
 bin_SCRIPTS =
 
@@ -106,74 +59,49 @@ util_fi_info_SOURCES = \
 	util/info.c
 util_fi_info_LDADD = $(linkback)
 
-util_fi_strerror_SOURCES = \
-	util/strerror.c
-util_fi_strerror_LDADD = $(linkback)
-
-util_fi_pingpong_SOURCES = \
-	util/pingpong.c
-util_fi_pingpong_LDADD = $(linkback)
-
-nodist_src_libfabric_la_SOURCES =
-src_libfabric_la_SOURCES =			\
-	include/ofi.h				\
-	include/ofi_abi.h			\
-	include/ofi_atom.h			\
-	include/ofi_enosys.h			\
-	include/ofi_file.h			\
-	include/ofi_hook.h			\
-	include/ofi_indexer.h			\
-	include/ofi_iov.h			\
-	include/ofi_list.h			\
-	include/shared/ofi_str.h		\
-	include/ofi_lock.h			\
-	include/ofi_mem.h			\
-	include/ofi_osd.h			\
-	include/ofi_proto.h			\
-	include/ofi_recvwin.h			\
-	include/ofi_rbuf.h			\
-	include/ofi_shm.h			\
-	include/ofi_signal.h			\
-	include/ofi_epoll.h			\
-	include/ofi_tree.h			\
-	include/ofi_util.h			\
-	include/ofi_atomic.h			\
-	include/ofi_mr.h			\
-	include/ofi_net.h			\
-	include/ofi_perf.h			\
-	include/fasthash.h			\
-	include/rbtree.h			\
-	include/uthash.h			\
-	include/ofi_prov.h			\
-	include/rdma/providers/fi_log.h		\
-	include/rdma/providers/fi_prov.h	\
-	src/fabric.c				\
-	src/fi_tostr.c				\
-	src/perf.c				\
-	src/log.c				\
-	src/var.c				\
-	src/abi_1_0.c				\
-	prov/hook/src/hook.c			\
-	prov/hook/src/hook_av.c			\
-	prov/hook/src/hook_cm.c			\
-	prov/hook/src/hook_cntr.c		\
-	prov/hook/src/hook_cq.c			\
-	prov/hook/src/hook_domain.c		\
-	prov/hook/src/hook_ep.c			\
-	prov/hook/src/hook_eq.c			\
-	prov/hook/src/hook_wait.c		\
-	prov/hook/src/hook_xfer.c		\
+src_libfabric_la_SOURCES = \
+	include/fi.h \
+	include/fi_abi.h \
+	include/fi_atom.h \
+	include/fi_enosys.h \
+	include/fi_file.h \
+	include/fi_indexer.h \
+	include/fi_list.h \
+	include/fi_lock.h \
+	include/fi_mem.h \
+	include/fi_osd.h \
+	include/fi_proto.h \
+	include/fi_rbuf.h \
+	include/fi_signal.h \
+	include/fi_util.h \
+	include/fasthash.h \
+	include/rbtree.h \
+	include/prov.h \
+	src/fabric.c \
+	src/fi_tostr.c \
+	src/log.c \
+	src/var.c \
 	$(common_srcs)
+
+if MACOS
+src_libfabric_la_SOURCES += src/osx/osd.c
+src_libfabric_la_SOURCES += include/osx/osd.h
+endif
+
+if FREEBSD
+src_libfabric_la_SOURCES += include/freebsd/osd.h
+endif
+
+if LINUX
+src_libfabric_la_SOURCES += include/linux/osd.h
+endif
 
 src_libfabric_la_CPPFLAGS = $(AM_CPPFLAGS)
 src_libfabric_la_LDFLAGS =
 src_libfabric_la_LIBADD =
 src_libfabric_la_DEPENDENCIES = libfabric.map
 
-if !EMBEDDED
-src_libfabric_la_LDFLAGS += -version-info 11:0:10
-endif
-src_libfabric_la_LDFLAGS += -export-dynamic \
+src_libfabric_la_LDFLAGS += -version-info 3:0:2 -export-dynamic \
 			   $(libfabric_version_script)
 rdmainclude_HEADERS += \
 	$(top_srcdir)/include/rdma/fabric.h \
@@ -181,6 +109,8 @@ rdmainclude_HEADERS += \
 	$(top_srcdir)/include/rdma/fi_cm.h \
 	$(top_srcdir)/include/rdma/fi_domain.h \
 	$(top_srcdir)/include/rdma/fi_eq.h \
+	$(top_srcdir)/include/rdma/fi_log.h \
+	$(top_srcdir)/include/rdma/fi_prov.h \
 	$(top_srcdir)/include/rdma/fi_rma.h \
 	$(top_srcdir)/include/rdma/fi_endpoint.h \
 	$(top_srcdir)/include/rdma/fi_errno.h \
@@ -189,6 +119,7 @@ rdmainclude_HEADERS += \
 
 if HAVE_DIRECT
 nodist_rdmainclude_HEADERS = \
+	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct.h \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_domain.h \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_endpoint.h \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_tagged.h \
@@ -198,17 +129,9 @@ nodist_rdmainclude_HEADERS = \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_cm.h \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_eq.h \
 	$(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct_trigger.h
-if FI_DIRECT_H_IN
-nodist_rdmainclude_HEADERS += $(top_builddir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct.h
-else
-nodist_rdmainclude_HEADERS += $(top_srcdir)/prov/$(PROVIDER_DIRECT)/include/rdma/fi_direct.h
-endif
 endif HAVE_DIRECT
 
 real_man_pages = \
-        man/man1/fi_info.1 \
-        man/man1/fi_pingpong.1 \
-        man/man1/fi_strerror.1 \
         man/man3/fi_av.3 \
         man/man3/fi_cm.3 \
         man/man3/fi_cntr.3 \
@@ -222,14 +145,12 @@ real_man_pages = \
         man/man3/fi_getinfo.3 \
         man/man3/fi_mr.3 \
         man/man3/fi_msg.3 \
-	man/man3/fi_nic.3 \
         man/man3/fi_poll.3 \
         man/man3/fi_rma.3 \
         man/man3/fi_tagged.3 \
         man/man3/fi_trigger.3 \
         man/man3/fi_version.3 \
         man/man7/fabric.7 \
-	man/man7/fi_hook.7 \
         man/man7/fi_provider.7 \
         man/man7/fi_direct.7
 
@@ -349,17 +270,16 @@ pkgconfigdir = $(libdir)/pkgconfig
 pkgconfig_DATA = libfabric.pc
 
 nroff:
-	@for file in $(real_man_pages) $(prov_install_man_pages); do \
+	@for file in $(real_man_pages); do \
 	    source=`echo $$file | sed -e 's@/man[0-9]@@'`; \
-	    perl $(top_srcdir)/config/md2nroff.pl --source=$(top_srcdir)/$$source.md; \
+	    config/md2nroff.pl --source=$$source.md; \
 	done
 
 dist-hook: libfabric.spec
 	cp libfabric.spec $(distdir)
-	perl $(top_srcdir)/config/distscript.pl "$(distdir)" "$(PACKAGE_VERSION)"
+	"$(top_srcdir)/config/distscript.pl" "$(distdir)" "$(PACKAGE_VERSION)"
 
-TESTS = \
-	util/fi_info
+TESTS = util/fi_info
 
 test:
 	./util/fi_info
@@ -369,7 +289,6 @@ rpm: dist
 
 prov_install_man_pages=
 prov_dist_man_pages=
-EXTRA_DIST=
 
 include prov/sockets/Makefile.include
 include prov/udp/Makefile.include
@@ -377,21 +296,12 @@ include prov/verbs/Makefile.include
 include prov/usnic/Makefile.include
 include prov/psm/Makefile.include
 include prov/psm2/Makefile.include
+include prov/mxm/Makefile.include
 include prov/gni/Makefile.include
-include prov/rxm/Makefile.include
-include prov/mrail/Makefile.include
-include prov/rxd/Makefile.include
-include prov/bgq/Makefile.include
-include prov/mlx/Makefile.include
-include prov/shm/Makefile.include
-include prov/tcp/Makefile.include
-include prov/rstream/Makefile.include
-include prov/hook/Makefile.include
-include prov/hook/perf/Makefile.include
 
 man_MANS = $(real_man_pages) $(prov_install_man_pages) $(dummy_man_pages)
 
-EXTRA_DIST += \
+EXTRA_DIST = \
         NEWS.md \
         libfabric.spec.in \
         config/distscript.pl \

@@ -1,6 +1,5 @@
 /*
- * Copyright (c) 2015-2017 Intel Corporation. All rights reserved.
- * Copyright (c) 2017, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2015-2016 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -31,8 +30,6 @@
  * SOFTWARE.
  */
 
-#include "config.h"
-
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -41,20 +38,15 @@
 #include <sys/types.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <inttypes.h>
 
-#if HAVE_GETIFADDRS
-#include <net/if.h>
-#include <ifaddrs.h>
-#endif
-
-#include <ofi_util.h>
+#include <fi_util.h>
 
 
 enum {
 	UTIL_NO_ENTRY = -1,
 	UTIL_DEFAULT_AV_SIZE = 1024,
 };
+
 
 static int fi_get_src_sockaddr(const struct sockaddr *dest_addr, size_t dest_addrlen,
 			       struct sockaddr **src_addr, size_t *src_addrlen)
@@ -97,62 +89,12 @@ static int fi_get_src_sockaddr(const struct sockaddr *dest_addr, size_t dest_add
 	}
 
 out:
-	ofi_close_socket(sock);
+	close(sock);
 	return ret;
 
 }
 
-void ofi_getnodename(uint16_t sa_family, char *buf, int buflen)
-{
-	int ret;
-	struct addrinfo ai, *rai = NULL;
-	struct ifaddrs *ifaddrs, *ifa;
-
-	assert(buf && buflen > 0);
-	ret = gethostname(buf, buflen);
-	buf[buflen - 1] = '\0';
-	if (ret == 0) {
-		memset(&ai, 0, sizeof(ai));
-		ai.ai_family = sa_family  ? sa_family : AF_INET;
-		ret = getaddrinfo(buf, NULL, &ai, &rai);
-		if (!ret) {
-			freeaddrinfo(rai);
-			return;
-		}
-	}
-
-#if HAVE_GETIFADDRS
-	ret = ofi_getifaddrs(&ifaddrs);
-	if (!ret) {
-		for (ifa = ifaddrs; ifa != NULL; ifa = ifa->ifa_next) {
-			if (ifa->ifa_addr == NULL || !(ifa->ifa_flags & IFF_UP))
-				continue;
-
-			if (sa_family) {
-				if (ifa->ifa_addr->sa_family != sa_family)
-					continue;
-			} else if ((ifa->ifa_addr->sa_family != AF_INET) &&
-				   (ifa->ifa_addr->sa_family != AF_INET6)) {
-				continue;
-			}
-
-			ret = getnameinfo(ifa->ifa_addr, ofi_sizeofaddr(ifa->ifa_addr),
-				  	  buf, buflen, NULL, 0, NI_NUMERICHOST);
-			buf[buflen - 1] = '\0';
-			if (ret == 0) {
-				freeifaddrs(ifaddrs);
-				return;
-			}
-		}
-		freeifaddrs(ifaddrs);
-	}
-#endif
-	/* no reasonable address found, use ipv4 loopback */
-	strncpy(buf, "127.0.0.1", buflen);
-	buf[buflen - 1] = '\0';
-}
-
-int ofi_get_src_addr(uint32_t addr_format,
+int fi_get_src_addr(uint32_t addr_format,
 		    const void *dest_addr, size_t dest_addrlen,
 		    void **src_addr, size_t *src_addrlen)
 {
@@ -168,7 +110,7 @@ int ofi_get_src_addr(uint32_t addr_format,
 	}
 }
 
-static int fi_get_sockaddr(int *sa_family, uint64_t flags,
+static int fi_get_sockaddr(int sa_family, uint64_t flags,
 			   const char *node, const char *service,
 			   struct sockaddr **addr, size_t *addrlen)
 {
@@ -176,7 +118,7 @@ static int fi_get_sockaddr(int *sa_family, uint64_t flags,
 	int ret;
 
 	memset(&hints, 0, sizeof hints);
-	hints.ai_family = *sa_family;
+	hints.ai_family = sa_family;
 	hints.ai_socktype = SOCK_STREAM;
 	if (flags & FI_SOURCE)
 		hints.ai_flags = AI_PASSIVE;
@@ -191,63 +133,48 @@ static int fi_get_sockaddr(int *sa_family, uint64_t flags,
 		goto out;
 	}
 
-	*sa_family = ai->ai_family;
 	*addrlen = ai->ai_addrlen;
 out:
 	freeaddrinfo(ai);
 	return ret;
 }
 
-void ofi_get_str_addr(const char *node, const char *service,
-		      char **addr, size_t *addrlen)
-{
-	if (!node || !strstr(node, "://"))
-		return;
-
-	*addr = strdup(node);
-	*addrlen = strlen(node) + 1;
-}
-
-int ofi_get_addr(uint32_t *addr_format, uint64_t flags,
+int fi_get_addr(uint32_t addr_format, uint64_t flags,
 		const char *node, const char *service,
 		void **addr, size_t *addrlen)
 {
-	int sa_family, ret;
-
-	switch (*addr_format) {
+	switch (addr_format) {
 	case FI_SOCKADDR:
-		sa_family = 0;
-		ret = fi_get_sockaddr(&sa_family, flags, node, service,
-				      (struct sockaddr **) addr, addrlen);
-		if (ret)
-			return ret;
-		*addr_format = sa_family == AF_INET ?
-			       FI_SOCKADDR_IN : FI_SOCKADDR_IN6;
-		return 0;
+		return fi_get_sockaddr(0, flags, node, service,
+				       (struct sockaddr **) addr, addrlen);
 	case FI_SOCKADDR_IN:
-		sa_family = AF_INET;
-		return fi_get_sockaddr(&sa_family, flags, node, service,
+		return fi_get_sockaddr(AF_INET, flags, node, service,
 				       (struct sockaddr **) addr, addrlen);
 	case FI_SOCKADDR_IN6:
-		sa_family = AF_INET6;
-		return fi_get_sockaddr(&sa_family, flags, node, service,
+		return fi_get_sockaddr(AF_INET6, flags, node, service,
 				       (struct sockaddr **) addr, addrlen);
-	case FI_ADDR_STR:
-		ofi_get_str_addr(node, service, (char **) addr, addrlen);
-		return 0;
 	default:
 		return -FI_ENOSYS;
 	}
 }
 
-void *ofi_av_get_addr(struct util_av *av, fi_addr_t fi_addr)
+static void *util_av_get_data(struct util_av *av, int index)
 {
-	struct util_av_entry *entry =
-		util_buf_get_by_index(av->av_entry_pool, fi_addr);
-	return entry->addr;
+	return (char *) av->data + (index * av->addrlen);
 }
 
-int ofi_verify_av_insert(struct util_av *av, uint64_t flags)
+void *fi_av_get_addr(struct util_av *av, int index)
+{
+	return util_av_get_data(av, index);
+}
+
+static void util_av_set_data(struct util_av *av, int index,
+			     const void *data, size_t len)
+{
+	memcpy(util_av_get_data(av, index), data, len);
+}
+
+static int fi_verify_av_insert(struct util_av *av, uint64_t flags)
 {
 	if ((av->flags & FI_EVENT) && !av->eq) {
 		FI_WARN(av->prov, FI_LOG_AV, "no EQ bound to AV\n");
@@ -265,82 +192,151 @@ int ofi_verify_av_insert(struct util_av *av, uint64_t flags)
 /*
  * Must hold AV lock
  */
-int ofi_av_insert_addr(struct util_av *av, const void *addr, fi_addr_t *fi_addr)
+static int util_av_hash_insert(struct util_av_hash *hash, int slot, int index)
 {
-	struct util_av_entry *entry = NULL;
+	int entry, i;
 
-	HASH_FIND(hh, av->hash, addr, av->addrlen, entry);
-	if (entry) {
-		if (fi_addr)
-			*fi_addr = util_get_buf_index(av->av_entry_pool, entry);
-		ofi_atomic_inc32(&entry->use_cnt);
+	if (slot < 0 || slot >= hash->slots)
+		return -FI_EINVAL;
+
+	if (hash->table[slot].index == UTIL_NO_ENTRY) {
+		hash->table[slot].index = index;
 		return 0;
-	} else {
-		entry = util_buf_indexed_alloc(av->av_entry_pool);
-		if (!entry)
-			return -FI_ENOMEM;
-		if (fi_addr)
-			*fi_addr = util_get_buf_index(av->av_entry_pool, entry);
-		memcpy(entry->addr, addr, av->addrlen);
-		ofi_atomic_initialize32(&entry->use_cnt, 1);
-		HASH_ADD(hh, av->hash, addr, av->addrlen, entry);
 	}
+
+	if (hash->free_list == UTIL_NO_ENTRY)
+		return -FI_ENOSPC;
+
+	entry = hash->free_list;
+	hash->free_list = hash->table[hash->free_list].next;
+
+	for (i = slot; hash->table[i].next != UTIL_NO_ENTRY; )
+		i = hash->table[i].next;
+
+	hash->table[i].next = entry;
+	hash->table[entry].index = index;
+	hash->table[entry].next = UTIL_NO_ENTRY;
 	return 0;
 }
 
-int ofi_av_elements_iter(struct util_av *av, ofi_av_apply_func apply, void *arg)
+static int fi_av_insert_addr(struct util_av *av, const void *addr, int slot,
+			     int *index)
 {
-	struct util_av_entry *av_entry = NULL, *av_entry_tmp = NULL;
-	int ret;
+	int ret = 0;
 
-	HASH_ITER(hh, av->hash, av_entry, av_entry_tmp) {
-		ret = apply(av, av_entry->addr,
-			    util_get_buf_index(av->av_entry_pool, av_entry),
-			    arg);
-		if (OFI_UNLIKELY(ret))
-			return ret;
+	fastlock_acquire(&av->lock);
+	if (av->free_list == UTIL_NO_ENTRY) {
+		FI_WARN(av->prov, FI_LOG_AV, "AV is full\n");
+		ret = -FI_ENOSPC;
+		goto out;
 	}
-	return 0;
+
+	if (av->flags & FI_SOURCE) {
+		ret = util_av_hash_insert(&av->hash, slot, av->free_list);
+		if (ret) {
+			FI_WARN(av->prov, FI_LOG_AV,
+				"failed to insert addr into hash table\n");
+			goto out;
+		}
+	}
+
+	*index = av->free_list;
+	av->free_list = *(int *) util_av_get_data(av, av->free_list);
+	util_av_set_data(av, *index, addr, av->addrlen);
+out:
+	fastlock_release(&av->lock);
+	return ret;
 }
 
 /*
  * Must hold AV lock
  */
-int ofi_av_remove_addr(struct util_av *av, fi_addr_t fi_addr)
+static void util_av_hash_remove(struct util_av_hash *hash, int slot, int index)
 {
-	struct util_av_entry *av_entry =
-		util_buf_get_by_index(av->av_entry_pool, fi_addr);
-	if (!av_entry)
-		return -FI_ENOENT;
+	int i;
 
-	if (ofi_atomic_dec32(&av_entry->use_cnt))
-		return FI_SUCCESS;
+	if (slot < 0 || slot >= hash->slots)
+		return;
 
-	HASH_DELETE(hh, av->hash, av_entry);
-	util_buf_indexed_release(av->av_entry_pool, av_entry);
+	if (slot == index) {
+		if (hash->table[slot].next == UTIL_NO_ENTRY) {
+			hash->table[slot].index = UTIL_NO_ENTRY;
+			return;
+		} else {
+			index = hash->table[slot].next;
+			hash->table[slot] = hash->table[index];
+		}
+	} else {
+		for (i = slot; hash->table[i].next != index; )
+			i = hash->table[i].next;
+
+		hash->table[i].next = hash->table[index].next;
+	}
+	hash->table[index].next = hash->free_list;
+	hash->free_list = index;
+}
+
+static int fi_av_remove_addr(struct util_av *av, int slot, int index)
+{
+	int *entry, *next, i;
+
+	if (index < 0 || index > av->count) {
+		FI_WARN(av->prov, FI_LOG_AV, "index out of range\n");
+		return -FI_EINVAL;
+	}
+
+	fastlock_acquire(&av->lock);
+	if (av->flags & FI_SOURCE)
+		util_av_hash_remove(&av->hash, slot, index);
+
+	entry = util_av_get_data(av, index);
+	if (av->free_list == UTIL_NO_ENTRY || index < av->free_list) {
+		*entry = av->free_list;
+		av->free_list = index;
+	} else {
+		i = av->free_list;
+		for (next = util_av_get_data(av, i); index > *next;) {
+			i = *next;
+			next = util_av_get_data(av, i);
+		}
+		util_av_set_data(av, index, next, sizeof index);
+		*next = index;
+	}
+
+	fastlock_release(&av->lock);
 	return 0;
 }
 
-fi_addr_t ofi_av_lookup_fi_addr(struct util_av *av, const void *addr)
+static int fi_av_lookup_index(struct util_av *av, const void *addr, int slot)
 {
-	struct util_av_entry *entry = NULL;
+	int i, ret = -FI_ENODATA;
+
+	if (slot < 0 || slot >= av->hash.slots) {
+		FI_WARN(av->prov, FI_LOG_AV, "invalid slot (%d)\n", slot);
+		return -FI_EINVAL;
+	}
 
 	fastlock_acquire(&av->lock);
-	HASH_FIND(hh, av->hash, addr, av->addrlen, entry);
+	if (av->hash.table[slot].index == UTIL_NO_ENTRY) {
+		FI_DBG(av->prov, FI_LOG_AV, "no entry at slot (%d)\n", slot);
+		goto out;
+	}
+
+	for (i = slot; i != UTIL_NO_ENTRY; i = av->hash.table[i].next) {
+		if (!memcmp(fi_av_get_addr(av, av->hash.table[i].index), addr,
+			    av->addrlen)) {
+			ret = av->hash.table[i].index;
+			FI_DBG(av->prov, FI_LOG_AV, "entry at index (%d)\n", ret);
+			break;
+		}
+	}
+out:
+	FI_DBG(av->prov, FI_LOG_AV, "%d\n", ret);
 	fastlock_release(&av->lock);
-
-	return entry ? util_get_buf_index(av->av_entry_pool, entry) :
-		       FI_ADDR_NOTAVAIL;
+	return ret;
 }
 
-static void *
-ofi_av_lookup_addr(struct util_av *av, fi_addr_t fi_addr, size_t *addrlen)
-{
-	*addrlen = av->addrlen;
-	return ofi_av_get_addr(av, fi_addr);
-}
-
-int ofi_av_bind(struct fid *av_fid, struct fid *eq_fid, uint64_t flags)
+static int util_av_bind(struct fid *av_fid, struct fid *eq_fid, uint64_t flags)
 {
 	struct util_av *av;
 	struct util_eq *eq;
@@ -358,104 +354,95 @@ int ofi_av_bind(struct fid *av_fid, struct fid *eq_fid, uint64_t flags)
 
 	eq = container_of(eq_fid, struct util_eq, eq_fid.fid);
 	av->eq = eq;
-	ofi_atomic_inc32(&eq->ref);
+	atomic_inc(&eq->ref);
 	return 0;
 }
 
-static void util_av_close(struct util_av *av)
+static int fi_av_free(struct fid *av_fid)
 {
-	HASH_CLEAR(hh, av->hash);
-	util_buf_pool_destroy(av->av_entry_pool);
-}
+	struct util_av *av;
 
-int ofi_av_close_lightweight(struct util_av *av)
-{
-	if (ofi_atomic_get32(&av->ref)) {
+	av = container_of(av_fid, struct util_av, av_fid.fid);
+	if (atomic_get(&av->ref)) {
 		FI_WARN(av->prov, FI_LOG_AV, "AV is busy\n");
 		return -FI_EBUSY;
 	}
 
 	if (av->eq)
-		ofi_atomic_dec32(&av->eq->ref);
+		atomic_dec(&av->eq->ref);
 
-	ofi_atomic_dec32(&av->domain->ref);
+	atomic_dec(&av->domain->ref);
 	fastlock_destroy(&av->lock);
-
+	/* TODO: unmap data? */
+	free(av->data);
+	free(av);
 	return 0;
 }
 
-int ofi_av_close(struct util_av *av)
+static void util_av_hash_init(struct util_av_hash *hash)
 {
-	int ret = ofi_av_close_lightweight(av);
-	if (ret)
-		return ret;
-	util_av_close(av);
-	return 0;
-}
+	int i;
 
-static int util_verify_av_util_attr(struct util_domain *domain,
-				    const struct util_av_attr *util_attr)
-{
-	if (util_attr->flags) {
-		FI_WARN(domain->prov, FI_LOG_AV, "invalid internal flags\n");
-		return -FI_EINVAL;
+	for (i = 0; i < hash->slots; i++) {
+		hash->table[i].index = UTIL_NO_ENTRY;
+		hash->table[i].next = UTIL_NO_ENTRY;
 	}
 
-	return 0;
+	hash->free_list = hash->slots;
+	for (i = hash->slots; i < hash->total_count; i++) {
+		hash->table[i].index = UTIL_NO_ENTRY;
+		hash->table[i].next = i + 1;
+	}
+	hash->table[hash->total_count - 1].next = UTIL_NO_ENTRY;
 }
 
 static int util_av_init(struct util_av *av, const struct fi_av_attr *attr,
 			const struct util_av_attr *util_attr)
 {
-	int ret = 0;
-	size_t max_count;
-	struct util_buf_attr pool_attr = {
-		.size		= util_attr->addrlen +
-				  sizeof(struct util_av_entry),
-		.alignment	= 16,
-		.max_cnt	= 0,
-		/* Don't use track of buffer, because user can close
-		 * the AV without prior deletion of addresses */
-		.track_used	= 0,
-		.indexing	= {
-			.used		= 1,
-			.ordered	= 1,
-		},
-	};
+	int *entry, i, ret = 0;
+
+	atomic_initialize(&av->ref, 0);
+	fastlock_init(&av->lock);
+	av->count = attr->count ? attr->count : UTIL_DEFAULT_AV_SIZE;
+	av->count = roundup_power_of_two(av->count);
+	av->addrlen = util_attr->addrlen;
+	av->flags = util_attr->flags | attr->flags;
+
+	FI_INFO(av->prov, FI_LOG_AV, "AV size %zu\n", av->count);
 
 	/* TODO: Handle FI_READ */
 	/* TODO: Handle mmap - shared AV */
 
-	ret = util_verify_av_util_attr(av->domain, util_attr);
-	if (ret)
-		return ret;
-
-	if (attr->count) {
-		max_count = attr->count;
-	} else {
-		if (fi_param_get_size_t(NULL, "universe_size", &max_count))
-			max_count = UTIL_DEFAULT_AV_SIZE;
+	if (util_attr->flags & FI_SOURCE) {
+		av->hash.slots = av->count;
+		av->hash.total_count = av->count + util_attr->overhead;
+		FI_INFO(av->prov, FI_LOG_AV,
+		       "FI_SOURCE requested, hash size %zu\n", av->hash.total_count);
 	}
 
-	av->count = roundup_power_of_two(max_count ?
-					 max_count :
-					 UTIL_DEFAULT_AV_SIZE);
-	FI_INFO(av->prov, FI_LOG_AV, "AV size %zu\n", av->count);
+	av->data = malloc((av->count * util_attr->addrlen) +
+			  (av->hash.total_count * sizeof(*av->hash.table)));
+	if (!av->data)
+		return -FI_ENOMEM;
 
-	av->addrlen = util_attr->addrlen;
-	av->flags = util_attr->flags | attr->flags;
-	av->hash = NULL;
+	for (i = 0; i < av->count - 1; i++) {
+		entry = util_av_get_data(av, i);
+		*entry = i + 1;
+	}
+	entry = util_av_get_data(av, av->count - 1);
+	*entry = UTIL_NO_ENTRY;
 
-	pool_attr.chunk_cnt = av->count;
-	ret = util_buf_pool_create_attr(&pool_attr, &av->av_entry_pool);
-	if (ret)
-		return ret;
+	if (util_attr->flags & FI_SOURCE) {
+		av->hash.table = util_av_get_data(av, av->count);
+		util_av_hash_init(&av->hash);
+	}
 
 	return ret;
 }
 
 static int util_verify_av_attr(struct util_domain *domain,
-			       const struct fi_av_attr *attr)
+			       const struct fi_av_attr *attr,
+			       const struct util_av_attr *util_attr)
 {
 	switch (attr->type) {
 	case FI_AV_MAP:
@@ -471,31 +458,46 @@ static int util_verify_av_attr(struct util_domain *domain,
 		return -FI_EINVAL;
 	}
 
-	if (attr->name) {
-		FI_WARN(domain->prov, FI_LOG_AV, "Shared AV is unsupported\n");
-		return -FI_ENOSYS;
-	}
-
 	if (attr->flags & ~(FI_EVENT | FI_READ | FI_SYMMETRIC)) {
 		FI_WARN(domain->prov, FI_LOG_AV, "invalid flags\n");
 		return -FI_EINVAL;
 	}
 
+	if (util_attr->flags & ~(FI_SOURCE)) {
+		FI_WARN(domain->prov, FI_LOG_AV, "invalid internal flags\n");
+		return -FI_EINVAL;
+	}
+
+	if (util_attr->addrlen < sizeof(int)) {
+		FI_WARN(domain->prov, FI_LOG_AV, "unsupported address size\n");
+		return -FI_ENOSYS;
+	}
+
 	return 0;
 }
 
-int ofi_av_init_lightweight(struct util_domain *domain, const struct fi_av_attr *attr,
-			    struct util_av *av, void *context)
+int fi_av_create(struct util_domain *domain, const struct fi_av_attr *attr,
+		 const struct util_av_attr *util_attr,
+		 struct fid_av **av_fid, void *context)
 {
+	struct util_av *av;
 	int ret;
 
-	ret = util_verify_av_attr(domain, attr);
+	ret = util_verify_av_attr(domain, attr, util_attr);
 	if (ret)
 		return ret;
 
+	av = calloc(1, sizeof(*av));
+	if (!av)
+		return -FI_ENOMEM;
+
 	av->prov = domain->prov;
-	ofi_atomic_initialize32(&av->ref, 0);
-	fastlock_init(&av->lock);
+	ret = util_av_init(av, attr, util_attr);
+	if (ret) {
+		free(av);
+		return ret;
+	}
+
 	av->av_fid.fid.fclass = FI_CLASS_AV;
 	/*
 	 * ops set by provider
@@ -503,30 +505,60 @@ int ofi_av_init_lightweight(struct util_domain *domain, const struct fi_av_attr 
 	 * av->av_fid.ops = &prov_av_ops;
 	 */
 	av->context = context;
+
 	av->domain = domain;
-	dlist_init(&av->ep_list);
-	ofi_atomic_inc32(&domain->ref);
+	atomic_inc(&domain->ref);
+
+	*av_fid = &av->av_fid;
 	return 0;
 }
 
-int ofi_av_init(struct util_domain *domain, const struct fi_av_attr *attr,
-		const struct util_av_attr *util_attr,
-		struct util_av *av, void *context)
-{
-	int ret = ofi_av_init_lightweight(domain, attr, av, context);
-	if (ret)
-		return ret;
 
-	ret = util_av_init(av, attr, util_attr);
-	if (ret)
-		return ret;
-	return ret;
+/*************************************************************************
+ *
+ * AV for IP addressing
+ *
+ *************************************************************************/
+
+static int ip_av_slot(struct util_av *av, const struct sockaddr *sa)
+{
+	uint16_t host;
+	uint16_t port;
+
+	if (!sa)
+		return UTIL_NO_ENTRY;
+
+	switch (((struct sockaddr *) sa)->sa_family) {
+	case AF_INET:
+		host = (uint16_t) ntohl(((struct sockaddr_in *) sa)->
+					sin_addr.s_addr);
+		port = ntohs(((struct sockaddr_in *) sa)->sin_port);
+		break;
+	case AF_INET6:
+		host = (uint16_t) ((struct sockaddr_in6 *) sa)->
+					sin6_addr.s6_addr[15];
+		port = ntohs(((struct sockaddr_in6 *) sa)->sin6_port);
+		break;
+	default:
+		assert(0);
+		return UTIL_NO_ENTRY;
+	}
+
+	/* TODO: Find a good hash function */
+	FI_DBG(av->prov, FI_LOG_AV, "slot %d\n",
+		((host << 16) | port) % av->hash.slots);
+	return ((host << 16) | port) % av->hash.slots;
 }
 
-void ofi_av_write_event(struct util_av *av, uint64_t data,
-			int err, void *context)
+int ip_av_get_index(struct util_av *av, const void *addr)
 {
-	struct fi_eq_err_entry entry = { 0 };
+	return fi_av_lookup_index(av, addr, ip_av_slot(av, addr));
+}
+
+static void ip_av_write_event(struct util_av *av, uint64_t data,
+			      int err, void *context)
+{
+	struct fi_eq_err_entry entry;
 	size_t size;
 	ssize_t ret;
 	uint64_t flags;
@@ -552,17 +584,6 @@ void ofi_av_write_event(struct util_av *av, uint64_t data,
 		FI_WARN(av->prov, FI_LOG_AV, "error writing to EQ\n");
 }
 
-/*************************************************************************
- *
- * AV for IP addressing
- *
- *************************************************************************/
-
-fi_addr_t ofi_ip_av_get_fi_addr(struct util_av *av, const void *addr)
-{
-	return ofi_av_lookup_fi_addr(av, addr);
-}
-
 static int ip_av_valid_addr(struct util_av *av, const void *addr)
 {
 	const struct sockaddr_in *sin = addr;
@@ -582,48 +603,47 @@ static int ip_av_valid_addr(struct util_av *av, const void *addr)
 static int ip_av_insert_addr(struct util_av *av, const void *addr,
 			     fi_addr_t *fi_addr, void *context)
 {
-	int ret;
-	fi_addr_t fi_addr_ret;
+	int ret, index = -1;
 
 	if (ip_av_valid_addr(av, addr)) {
-		fastlock_acquire(&av->lock);
-		ret = ofi_av_insert_addr(av, addr, &fi_addr_ret);
-		fastlock_release(&av->lock);
+		ret = fi_av_insert_addr(av, addr, ip_av_slot(av, addr), &index);
 	} else {
 		ret = -FI_EADDRNOTAVAIL;
 		FI_WARN(av->prov, FI_LOG_AV, "invalid address\n");
 	}
 
 	if (fi_addr)
-		*fi_addr = !ret ? fi_addr_ret : FI_ADDR_NOTAVAIL;
-
-	ofi_straddr_dbg(av->prov, FI_LOG_AV, "av_insert addr", addr);
-	if (fi_addr)
-		FI_DBG(av->prov, FI_LOG_AV, "av_insert fi_addr: %" PRIu64 "\n",
-		       *fi_addr);
-
+		*fi_addr = !ret ? index : FI_ADDR_NOTAVAIL;
 	return ret;
 }
 
-int ofi_ip_av_insertv(struct util_av *av, const void *addr, size_t addrlen,
-		      size_t count, fi_addr_t *fi_addr, void *context)
+static int ip_av_insert(struct fid_av *av_fid, const void *addr, size_t count,
+			fi_addr_t *fi_addr, uint64_t flags, void *context)
 {
-	int ret, success_cnt = 0;
-	size_t i;
+	struct util_av *av;
+	int i, ret, success_cnt = 0;
+	size_t addrlen;
 
-	FI_DBG(av->prov, FI_LOG_AV, "inserting %zu addresses\n", count);
+	av = container_of(av_fid, struct util_av, av_fid);
+	ret = fi_verify_av_insert(av, flags);
+	if (ret)
+		return ret;
+
+	addrlen = ((struct sockaddr *) addr)->sa_family == AF_INET ?
+		  sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+	FI_DBG(av->prov, FI_LOG_AV, "inserting %d addresses\n", count);
 	for (i = 0; i < count; i++) {
 		ret = ip_av_insert_addr(av, (const char *) addr + i * addrlen,
 					fi_addr ? &fi_addr[i] : NULL, context);
 		if (!ret)
 			success_cnt++;
 		else if (av->eq)
-			ofi_av_write_event(av, i, -ret, context);
+			ip_av_write_event(av, i, -ret, context);
 	}
 
 	FI_DBG(av->prov, FI_LOG_AV, "%d addresses successful\n", success_cnt);
 	if (av->eq) {
-		ofi_av_write_event(av, success_cnt, 0, context);
+		ip_av_write_event(av, success_cnt, 0, context);
 		ret = 0;
 	} else {
 		ret = success_cnt;
@@ -631,19 +651,35 @@ int ofi_ip_av_insertv(struct util_av *av, const void *addr, size_t addrlen,
 	return ret;
 }
 
-int ofi_ip_av_insert(struct fid_av *av_fid, const void *addr, size_t count,
-		     fi_addr_t *fi_addr, uint64_t flags, void *context)
+static int ip_av_insert_svc(struct util_av *av, const char *node,
+			    const char *service, fi_addr_t *fi_addr,
+			    void *context)
 {
-	struct util_av *av;
+	struct addrinfo hints, *ai;
 	int ret;
 
-	av = container_of(av_fid, struct util_av, av_fid);
-	ret = ofi_verify_av_insert(av, flags);
+	FI_INFO(av->prov, FI_LOG_AV, "inserting %s-%s\n", node, service);
+
+	memset(&hints, 0, sizeof hints);
+	hints.ai_socktype = SOCK_DGRAM;
+	switch (av->domain->addr_format) {
+	case FI_SOCKADDR_IN:
+		hints.ai_family = AF_INET;
+		break;
+	case FI_SOCKADDR_IN6:
+		hints.ai_family = AF_INET6;
+		break;
+	default:
+		break;
+	}
+
+	ret = getaddrinfo(node, service, &hints, &ai);
 	if (ret)
 		return ret;
 
-	return ofi_ip_av_insertv(av, addr, ofi_sizeofaddr(addr),
-				 count, fi_addr, context);
+	ret = ip_av_insert_addr(av, ai->ai_addr, fi_addr, context);
+	freeaddrinfo(ai);
+	return ret;
 }
 
 static int ip_av_insertsvc(struct fid_av *av, const char *node,
@@ -653,98 +689,77 @@ static int ip_av_insertsvc(struct fid_av *av, const char *node,
 	return fi_av_insertsym(av, node, 1, service, 1, fi_addr, flags, context);
 }
 
-/* Caller should free *addr */
-static int
-ip_av_ip4sym_getaddr(struct util_av *av, struct in_addr ip, size_t ipcnt,
-		     uint16_t port, size_t portcnt, void **addr, size_t *addrlen)
+static int ip_av_insert_ip4sym(struct util_av *av,
+			       struct in_addr ip, size_t ipcnt,
+			       uint16_t port, size_t portcnt,
+			       fi_addr_t *fi_addr, void *context)
 {
-	struct sockaddr_in *sin;
-	int count = ipcnt * portcnt;
-	size_t i, p, k;
+	struct sockaddr_in sin;
+	int i, p, fi, ret, success_cnt = 0;
 
-	*addrlen = sizeof(*sin);
-	sin = calloc(count, *addrlen);
-	if (!sin)
-		return -FI_ENOMEM;
+	memset(&sin, 0, sizeof sin);
+	sin.sin_family = AF_INET;
 
-	for (i = 0, k = 0; i < ipcnt; i++) {
-		for (p = 0; p < portcnt; p++, k++) {
-			sin[k].sin_family = AF_INET;
-			/* TODO: should we skip addresses x.x.x.0 and x.x.x.255? */
-			sin[k].sin_addr.s_addr = htonl(ntohl(ip.s_addr) + i);
-			sin[k].sin_port = htons(port + p);
+	for (i = 0, fi = 0; i < ipcnt; i++) {
+		/* TODO: should we skip addresses x.x.x.0 and x.x.x.255? */
+		sin.sin_addr.s_addr = htonl(ntohl(ip.s_addr) + i);
+
+		for (p = 0; p < portcnt; p++, fi++) {
+			sin.sin_port = htons(port + p);
+			ret = ip_av_insert_addr(av, &sin, fi_addr ?
+						&fi_addr[fi] : NULL, context);
+			if (!ret)
+				success_cnt++;
+			else if (av->eq)
+				ip_av_write_event(av, fi, -ret, context);
 		}
 	}
-	*addr = sin;
-	return count;
+
+	return success_cnt;
 }
 
-/* Caller should free *addr */
-static int
-ip_av_ip6sym_getaddr(struct util_av *av, struct in6_addr ip, size_t ipcnt,
-		     uint16_t port, size_t portcnt, void **addr, size_t *addrlen)
+static int ip_av_insert_ip6sym(struct util_av *av,
+			       struct in6_addr ip, size_t ipcnt,
+			       uint16_t port, size_t portcnt,
+			       fi_addr_t *fi_addr, void *context)
 {
-	struct sockaddr_in6 *sin6, sin6_temp;
-	int j, count = ipcnt * portcnt;
-	size_t i, p, k;
+	struct sockaddr_in6 sin6;
+	int i, j, p, fi, ret, success_cnt = 0;
 
-	*addrlen = sizeof(*sin6);
-	sin6 = calloc(count, *addrlen);
-	if (!sin6)
-		return -FI_ENOMEM;
+	memset(&sin6, 0, sizeof sin6);
+	sin6.sin6_family = AF_INET6;
+	sin6.sin6_addr = ip;
 
-	sin6_temp.sin6_addr = ip;
-
-	for (i = 0, k = 0; i < ipcnt; i++) {
-		for (p = 0; p < portcnt; p++, k++) {
-			sin6[k].sin6_family = AF_INET6;
-			sin6[k].sin6_addr = sin6_temp.sin6_addr;
-			sin6[k].sin6_port = htons(port + p);
+	for (i = 0, fi = 0; i < ipcnt; i++) {
+		for (p = 0; p < portcnt; p++, fi++) {
+			sin6.sin6_port = htons(port + p);
+			ret = ip_av_insert_addr(av, &sin6, fi_addr ?
+						&fi_addr[fi] : NULL, context);
+			if (!ret)
+				success_cnt++;
+			else if (av->eq)
+				ip_av_write_event(av, fi, -ret, context);
 		}
+
 		/* TODO: should we skip addresses x::0 and x::255? */
 		for (j = 15; j >= 0; j--) {
-			if (++sin6_temp.sin6_addr.s6_addr[j] < 255)
+			if (++sin6.sin6_addr.s6_addr[j] < 255)
 				break;
 		}
 	}
-	*addr = sin6;
-	return count;
+
+	return success_cnt;
 }
 
-/* Caller should free *addr */
-static int ip_av_nodesym_getaddr(struct util_av *av, const char *node,
-				 size_t nodecnt, const char *service,
-				 size_t svccnt, void **addr, size_t *addrlen)
+static int ip_av_insert_nodesym(struct util_av *av,
+				const char *node, size_t nodecnt,
+				const char *service, size_t svccnt,
+				fi_addr_t *fi_addr, void *context)
 {
-	struct addrinfo hints, *ai;
-	void *addr_temp;
 	char name[FI_NAME_MAX];
 	char svc[FI_NAME_MAX];
-	size_t name_len, n, s;
-	int ret, name_index, svc_index, count = nodecnt * svccnt;
-
-	memset(&hints, 0, sizeof hints);
-
-	hints.ai_socktype = SOCK_DGRAM;
-	switch (av->domain->addr_format) {
-	case FI_SOCKADDR_IN:
-		hints.ai_family = AF_INET;
-		*addrlen = sizeof(struct sockaddr_in);
-		break;
-	case FI_SOCKADDR_IN6:
-		hints.ai_family = AF_INET6;
-		*addrlen = sizeof(struct sockaddr_in6);
-		break;
-	default:
-		FI_INFO(av->prov, FI_LOG_AV, "Unknown address format!\n");
-		return -FI_EINVAL;
-	}
-
-	*addr = calloc(nodecnt * svccnt, *addrlen);
-	if (!*addr)
-		return -FI_ENOMEM;
-
-	addr_temp = *addr;
+	size_t name_len;
+	int fi, n, s, ret, name_index, svc_index, success_cnt = 0;
 
 	for (name_len = strlen(node); isdigit(node[name_len - 1]); )
 		name_len--;
@@ -753,49 +768,49 @@ static int ip_av_nodesym_getaddr(struct util_av *av, const char *node,
 	name_index = atoi(node + name_len);
 	svc_index = atoi(service);
 
-	for (n = 0; n < nodecnt; n++) {
+	for (n = 0, fi = 0; n < nodecnt; n++) {
 		if (nodecnt == 1) {
 			strncpy(name, node, sizeof(name) - 1);
 			name[FI_NAME_MAX - 1] = '\0';
 		} else {
 			snprintf(name + name_len, sizeof(name) - name_len - 1,
-				 "%zu", name_index + n);
+				 "%d", name_index + n);
 		}
 
-		for (s = 0; s < svccnt; s++) {
+		for (s = 0; s < svccnt; s++, fi++) {
 			if (svccnt == 1) {
 				strncpy(svc, service, sizeof(svc) - 1);
 				svc[FI_NAME_MAX - 1] = '\0';
 			} else {
 				snprintf(svc, sizeof(svc) - 1,
-					 "%zu", svc_index + s);
+					 "%d", svc_index + s);
 			}
-			FI_INFO(av->prov, FI_LOG_AV, "resolving %s:%s for AV "
-				"insert\n", node, service);
 
-			ret = getaddrinfo(node, service, &hints, &ai);
-			if (ret)
-				goto err;
-
-			memcpy(addr_temp, ai->ai_addr, *addrlen);
-			addr_temp = (char *)addr_temp + *addrlen;
-			freeaddrinfo(ai);
+			ret = ip_av_insert_svc(av, name, svc, fi_addr ?
+					       &fi_addr[fi] : NULL, context);
+			if (!ret)
+				success_cnt++;
+			else if (av->eq)
+				ip_av_write_event(av, fi, -ret, context);
 		}
 	}
-	return count;
-err:
-	free(*addr);
-	return ret;
+
+	return success_cnt;
 }
 
-/* Caller should free *addr */
-int ofi_ip_av_sym_getaddr(struct util_av *av, const char *node,
-			  size_t nodecnt, const char *service,
-			  size_t svccnt, void **addr, size_t *addrlen)
+static int ip_av_insertsym(struct fid_av *av_fid, const char *node, size_t nodecnt,
+			   const char *service, size_t svccnt, fi_addr_t *fi_addr,
+			   uint64_t flags, void *context)
 {
+	struct util_av *av;
 	struct in6_addr ip6;
 	struct in_addr ip4;
 	int ret;
+
+	av = container_of(av_fid, struct util_av, av_fid);
+	ret = fi_verify_av_insert(av, flags);
+	if (ret)
+		return ret;
 
 	if (strlen(node) >= FI_NAME_MAX || strlen(service) >= FI_NAME_MAX) {
 		FI_WARN(av->prov, FI_LOG_AV,
@@ -806,54 +821,38 @@ int ofi_ip_av_sym_getaddr(struct util_av *av, const char *node,
 	ret = inet_pton(AF_INET, node, &ip4);
 	if (ret == 1) {
 		FI_INFO(av->prov, FI_LOG_AV, "insert symmetric IPv4\n");
-		return ip_av_ip4sym_getaddr(av, ip4, nodecnt,
+		ret = ip_av_insert_ip4sym(av, ip4, nodecnt,
 					  (uint16_t) strtol(service, NULL, 0),
-					  svccnt, addr, addrlen);
+					  svccnt, fi_addr, context);
+		goto out;
 	}
 
 	ret = inet_pton(AF_INET6, node, &ip6);
 	if (ret == 1) {
 		FI_INFO(av->prov, FI_LOG_AV, "insert symmetric IPv6\n");
-		return ip_av_ip6sym_getaddr(av, ip6, nodecnt,
+		ret = ip_av_insert_ip6sym(av, ip6, nodecnt,
 					  (uint16_t) strtol(service, NULL, 0),
-					  svccnt, addr, addrlen);
+					  svccnt, fi_addr, context);
+		goto out;
 	}
 
 	FI_INFO(av->prov, FI_LOG_AV, "insert symmetric host names\n");
-	return ip_av_nodesym_getaddr(av, node, nodecnt, service,
-				     svccnt, addr, addrlen);
-}
+	ret = ip_av_insert_nodesym(av, node, nodecnt, service, svccnt,
+				  fi_addr, context);
 
-static int ip_av_insertsym(struct fid_av *av_fid, const char *node,
-			   size_t nodecnt, const char *service, size_t svccnt,
-			   fi_addr_t *fi_addr, uint64_t flags, void *context)
-{
-	struct util_av *av;
-	void *addr;
-	size_t addrlen;
-	int ret, count;
-
-	av = container_of(av_fid, struct util_av, av_fid);
-	ret = ofi_verify_av_insert(av, flags);
-	if (ret)
-		return ret;
-
-	count = ofi_ip_av_sym_getaddr(av, node, nodecnt, service,
-				      svccnt, &addr, &addrlen);
-	if (count <= 0)
-		return count;
-
-	ret = ofi_ip_av_insertv(av, addr, addrlen, count,
-				fi_addr, context);
-	free(addr);
+out:
+	if (av->eq) {
+		ip_av_write_event(av, ret, 0, context);
+		ret = 0;
+	}
 	return ret;
 }
 
-int ofi_ip_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
-		     size_t count, uint64_t flags)
+static int ip_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr, size_t count,
+			uint64_t flags)
 {
 	struct util_av *av;
-	int i, ret;
+	int i, slot, index, ret;
 
 	av = container_of(av_fid, struct util_av, av_fid);
 	if (flags) {
@@ -868,75 +867,77 @@ int ofi_ip_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 	 * Thus, we walk through the array backwards.
 	 */
 	for (i = count - 1; i >= 0; i--) {
-		fastlock_acquire(&av->lock);
-		ret = ofi_av_remove_addr(av, fi_addr[i]);
-		fastlock_release(&av->lock);
+		index = (int) fi_addr[i];
+		slot = ip_av_slot(av, ip_av_get_addr(av, index));
+		ret = fi_av_remove_addr(av, slot, index);
 		if (ret) {
 			FI_WARN(av->prov, FI_LOG_AV,
-				"removal of fi_addr %"PRIu64" failed\n",
-				fi_addr[i]);
+				"removal of fi_addr %d failed\n", index);
 		}
 	}
 	return 0;
 }
 
-int ofi_ip_av_lookup(struct fid_av *av_fid, fi_addr_t fi_addr,
-		     void *addr, size_t *addrlen)
+static int ip_av_lookup(struct fid_av *av_fid, fi_addr_t fi_addr, void *addr,
+			size_t *addrlen)
 {
-	struct util_av *av =
-		container_of(av_fid, struct util_av, av_fid);
-	size_t av_addrlen;
-	void *av_addr = ofi_av_lookup_addr(av, fi_addr, &av_addrlen);
-	
-	memcpy(addr, av_addr, MIN(*addrlen, av_addrlen));
-	*addrlen = av->addrlen;
+	struct util_av *av;
+	int index;
 
+	av = container_of(av_fid, struct util_av, av_fid);
+	index = (int) fi_addr;
+	if (index < 0 || index > av->count) {
+		FI_WARN(av->prov, FI_LOG_AV, "unknown address\n");
+		return -FI_EINVAL;
+	}
+
+	memcpy(addr, ip_av_get_addr(av, index),
+	       MIN(*addrlen, av->addrlen));
+	*addrlen = av->addrlen;
 	return 0;
 }
 
-const char *
-ofi_ip_av_straddr(struct fid_av *av, const void *addr, char *buf, size_t *len)
+static const char *ip_av_straddr(struct fid_av *av, const void *addr,
+				  char *buf, size_t *len)
 {
-	return ofi_straddr(buf, len, FI_SOCKADDR, addr);
+	char str[INET6_ADDRSTRLEN + 8];
+	size_t size;
+
+	if (!inet_ntop(((struct sockaddr *) addr)->sa_family, addr,
+			str, sizeof str))
+		return NULL;
+
+	size = strlen(str);
+	size += snprintf(&str[size], sizeof(str) - size, ":%d",
+			 ((struct sockaddr_in *) addr)->sin_port);
+	memcpy(buf, str, MIN(*len, size));
+	*len = size + 1;
+	return buf;
 }
 
 static struct fi_ops_av ip_av_ops = {
 	.size = sizeof(struct fi_ops_av),
-	.insert = ofi_ip_av_insert,
+	.insert = ip_av_insert,
 	.insertsvc = ip_av_insertsvc,
 	.insertsym = ip_av_insertsym,
-	.remove = ofi_ip_av_remove,
-	.lookup = ofi_ip_av_lookup,
-	.straddr = ofi_ip_av_straddr,
+	.remove = ip_av_remove,
+	.lookup = ip_av_lookup,
+	.straddr = ip_av_straddr,
 };
-
-static int ip_av_close(struct fid *av_fid)
-{
-	struct util_av *av;
-	int ret;
-
-	av = container_of(av_fid, struct util_av, av_fid.fid);
-	ret = ofi_av_close(av);
-	if (ret)
-		return ret;
-	free(av);
-	return 0;
-}
 
 static struct fi_ops ip_av_fi_ops = {
 	.size = sizeof(struct fi_ops),
-	.close = ip_av_close,
-	.bind = ofi_av_bind,
+	.close = fi_av_free,
+	.bind = util_av_bind,
 	.control = fi_no_control,
 	.ops_open = fi_no_ops_open,
 };
 
-int ofi_ip_av_create_flags(struct fid_domain *domain_fid, struct fi_av_attr *attr,
-			   struct fid_av **av, void *context, int flags)
+int ip_av_create(struct fid_domain *domain_fid, struct fi_av_attr *attr,
+		 struct fid_av **av, void *context)
 {
 	struct util_domain *domain;
 	struct util_av_attr util_attr;
-	struct util_av *util_av;
 	int ret;
 
 	domain = container_of(domain_fid, struct util_domain, domain_fid);
@@ -945,29 +946,17 @@ int ofi_ip_av_create_flags(struct fid_domain *domain_fid, struct fi_av_attr *att
 	else
 		util_attr.addrlen = sizeof(struct sockaddr_in6);
 
-	util_attr.flags = flags;
+	util_attr.overhead = attr->count >> 2;
+	util_attr.flags = domain->caps & FI_SOURCE ? FI_SOURCE : 0;
 
 	if (attr->type == FI_AV_UNSPEC)
 		attr->type = FI_AV_MAP;
 
-	util_av = calloc(1, sizeof(*util_av));
-	if (!util_av)
-		return -FI_ENOMEM;
-
-	ret = ofi_av_init(domain, attr, &util_attr, util_av, context);
-	if (ret) {
-		free(util_av);
+	ret = fi_av_create(domain, attr, &util_attr, av, context);
+	if (ret)
 		return ret;
-	}
 
-	*av = &util_av->av_fid;
 	(*av)->fid.ops = &ip_av_fi_ops;
 	(*av)->ops = &ip_av_ops;
 	return 0;
-}
-
-int ofi_ip_av_create(struct fid_domain *domain_fid, struct fi_av_attr *attr,
-		     struct fid_av **av, void *context)
-{
-	return ofi_ip_av_create_flags(domain_fid, attr, av, context, 0);
 }

@@ -1,6 +1,5 @@
 /*
- * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
- * Copyright (c) 2016 Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -48,13 +47,13 @@ extern "C" {
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <inttypes.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <complex.h>
 #include <rdma/fabric.h>
+#include <rdma/fi_prov.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_tagged.h>
@@ -63,12 +62,10 @@ extern "C" {
 #include <rdma/fi_trigger.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_errno.h>
-#include "ofi.h"
-#include "ofi_atomic.h"
-#include "ofi_enosys.h"
-#include "ofi_list.h"
-#include "ofi_util.h"
-#include "ofi_file.h"
+#include <rdma/fi_log.h>
+#include "fi.h"
+#include "fi_enosys.h"
+#include "fi_list.h"
 #include "rbtree.h"
 #include "version.h"
 
@@ -76,16 +73,14 @@ extern struct fi_provider psmx_prov;
 
 extern int psmx_am_compat_mode;
 
-#define PSMX_VERSION	(FI_VERSION(1, 7))
-
 #define PSMX_OP_FLAGS	(FI_INJECT | FI_MULTI_RECV | FI_COMPLETION | \
 			 FI_TRIGGER | FI_INJECT_COMPLETE | \
 			 FI_TRANSMIT_COMPLETE | FI_DELIVERY_COMPLETE)
 
 #define PSMX_CAPS	(FI_TAGGED | FI_MSG | FI_ATOMICS | \
 			 FI_RMA | FI_MULTI_RECV | \
-			 FI_READ | FI_WRITE | FI_SEND | FI_RECV | \
-			 FI_REMOTE_READ | FI_REMOTE_WRITE | \
+                         FI_READ | FI_WRITE | FI_SEND | FI_RECV | \
+                         FI_REMOTE_READ | FI_REMOTE_WRITE | \
 			 FI_TRIGGER | FI_RMA_EVENT)
 
 #define PSMX_CAPS2	((PSMX_CAPS | FI_DIRECTED_RECV) & ~FI_TAGGED)
@@ -93,12 +88,9 @@ extern int psmx_am_compat_mode;
 #define PSMX_SUB_CAPS	(FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE | \
 			 FI_SEND | FI_RECV)
 
-#define PSMX_DOM_CAPS	(FI_LOCAL_COMM | FI_REMOTE_COMM)
-
 #define PSMX_MAX_MSG_SIZE	((0x1ULL << 32) - 1)
 #define PSMX_INJECT_SIZE	(64)
-#define PSMX_MSG_ORDER	(FI_ORDER_SAS | FI_ORDER_RAR | FI_ORDER_RAW | \
-			 FI_ORDER_WAR | FI_ORDER_WAW)
+#define PSMX_MSG_ORDER	FI_ORDER_SAS
 #define PSMX_COMP_ORDER	FI_ORDER_NONE
 
 #define PSMX_MSG_BIT	(0x1ULL << 63)
@@ -139,7 +131,6 @@ union psmx_pi {
 #define PSMX_AM_CHUNK_SIZE	2032	/* The maximum that's actually working:
 					 * 2032 for inter-node, 2072 for intra-node.
 					 */
-#define PSMX_RMA_ORDER_SIZE	PSMX_AM_CHUNK_SIZE
 
 #define PSMX_AM_OP_MASK		0x0000FFFF
 #define PSMX_AM_FLAG_MASK	0xFFFF0000
@@ -168,7 +159,7 @@ struct psmx_am_request {
 	int op;
 	union {
 		struct {
-			uint8_t	*buf;
+			void	*buf;
 			size_t	len;
 			uint64_t addr;
 			uint64_t key;
@@ -178,7 +169,7 @@ struct psmx_am_request {
 			uint64_t data;
 		} write;
 		struct {
-			uint8_t	*buf;
+			void	*buf;
 			size_t	len;
 			uint64_t addr;
 			uint64_t key;
@@ -187,7 +178,7 @@ struct psmx_am_request {
 			size_t	len_read;
 		} read;
 		struct {
-			uint8_t	*buf;
+			void	*buf;
 			size_t	len;
 			void	*context;
 			void	*peer_context;
@@ -196,19 +187,19 @@ struct psmx_am_request {
 			size_t	len_sent;
 		} send;
 		struct {
-			uint8_t	*buf;
+			void	*buf;
 			size_t	len;
 			void	*context;
 			void	*src_addr;
 			size_t  len_received;
 		} recv;
 		struct {
-			uint8_t	*buf;
+			void	*buf;
 			size_t	len;
 			uint64_t addr;
 			uint64_t key;
 			void	*context;
-			uint8_t	*result;
+			void 	*result;
 		} atomic;
 	};
 	uint64_t cq_flags;
@@ -236,7 +227,7 @@ struct psmx_req_queue {
 struct psmx_multi_recv {
 	uint64_t	tag;
 	uint64_t	tagsel;
-	uint8_t		*buf;
+	void		*buf;
 	size_t		len;
 	size_t		offset;
 	int		min_buf_size;
@@ -245,15 +236,17 @@ struct psmx_multi_recv {
 };
 
 struct psmx_fid_fabric {
-	struct util_fabric	util_fabric;
+	struct fid_fabric	fabric;
+	int			refcnt;
 	struct psmx_fid_domain	*active_domain;
 	psm_uuid_t		uuid;
-	struct util_ns		name_server;
+	pthread_t		name_server_thread;
 };
 
 struct psmx_fid_domain {
-	struct util_domain	util_domain;
+	struct fid_domain	domain;
 	struct psmx_fid_fabric	*fabric;
+	int			refcnt;
 	psm_ep_t		psm_ep;
 	psm_epid_t		psm_epid;
 	psm_mq_t		psm_mq;
@@ -299,17 +292,6 @@ struct psmx_fid_domain {
 	pthread_t		progress_thread;
 };
 
-#define PSMX_DEFAULT_UNIT	(-1)
-#define PSMX_DEFAULT_PORT	0
-#define PSMX_ANY_SERVICE	0
-
-struct psmx_src_name {
-	uint16_t	signature;	/* 0xFFFF, different from any valid epid */
-	int8_t		unit;		/* start from 0. -1 means any */
-	uint8_t		port;		/* start from 1. 0 means any */
-	uint32_t	service;	/* 0 means any */
-};
-
 struct psmx_cq_event {
 	union {
 		struct fi_cq_entry		context;
@@ -323,6 +305,42 @@ struct psmx_cq_event {
 	struct slist_entry list_entry;
 };
 
+struct psmx_eq_event {
+	int event;
+	union {
+		struct fi_eq_entry		data;
+		struct fi_eq_cm_entry		cm;
+		struct fi_eq_err_entry		err;
+	} eqe;
+	int error;
+	size_t entry_size;
+	struct slist_entry list_entry;
+};
+
+struct psmx_fid_wait {
+	struct fid_wait			wait;
+	struct psmx_fid_fabric		*fabric;
+	int				type;
+	union {
+		int			fd[2];
+		struct {
+			pthread_mutex_t	mutex;
+			pthread_cond_t	cond;
+		};
+	};
+};
+
+struct psmx_poll_list {
+	struct dlist_entry		entry;
+	struct fid			*fid;
+};
+
+struct psmx_fid_poll {
+	struct fid_poll			poll;
+	struct psmx_fid_domain		*domain;
+	struct dlist_entry		poll_list_head;
+};
+
 struct psmx_fid_cq {
 	struct fid_cq			cq;
 	struct psmx_fid_domain		*domain;
@@ -333,8 +351,19 @@ struct psmx_fid_cq {
 	struct slist			free_list;
 	fastlock_t			lock;
 	struct psmx_cq_event		*pending_error;
-	struct util_wait		*wait;
+	struct psmx_fid_wait		*wait;
 	int				wait_cond;
+	int				wait_is_local;
+};
+
+struct psmx_fid_eq {
+	struct fid_eq			eq;
+	struct psmx_fid_fabric		*fabric;
+	struct slist			event_queue;
+	struct slist			error_queue;
+	struct slist			free_list;
+	fastlock_t			lock;
+	struct psmx_fid_wait		*wait;
 	int				wait_is_local;
 };
 
@@ -468,16 +497,15 @@ struct psmx_trigger {
 };
 
 struct psmx_fid_cntr {
-	union {
-		struct fid_cntr		cntr;
-		struct util_cntr	util_cntr; /* for util_poll_run */
-	};
+	struct fid_cntr		cntr;
 	struct psmx_fid_domain	*domain;
 	int			events;
 	uint64_t		flags;
-	ofi_atomic64_t		counter;
-	ofi_atomic64_t		error_counter;
-	struct util_wait	*wait;
+	volatile uint64_t	counter;
+	volatile uint64_t	error_counter;
+	uint64_t		counter_last_read;
+	uint64_t		error_counter_last_read;
+	struct psmx_fid_wait	*wait;
 	int			wait_is_local;
 	struct psmx_trigger	*trigger;
 	pthread_mutex_t		trigger_lock;
@@ -486,7 +514,7 @@ struct psmx_fid_cntr {
 struct psmx_fid_av {
 	struct fid_av		av;
 	struct psmx_fid_domain	*domain;
-	struct fid_eq		*eq;
+	struct psmx_fid_eq	*eq;
 	int			type;
 	uint64_t		flags;
 	size_t			addrlen;
@@ -498,7 +526,6 @@ struct psmx_fid_av {
 
 struct psmx_fid_ep {
 	struct fid_ep		ep;
-	struct psmx_fid_ep	*base_ep;
 	struct psmx_fid_domain	*domain;
 	struct psmx_fid_av	*av;
 	struct psmx_fid_cq	*send_cq;
@@ -511,15 +538,11 @@ struct psmx_fid_ep {
 	struct psmx_fid_cntr	*remote_read_cntr;
 	unsigned		send_selective_completion:1;
 	unsigned		recv_selective_completion:1;
-	unsigned		enabled:1;
-	uint64_t		tx_flags;
-	uint64_t		rx_flags;
+	uint64_t		flags;
 	uint64_t		caps;
-	ofi_atomic32_t		ref;
 	struct fi_context	nocomp_send_context;
 	struct fi_context	nocomp_recv_context;
 	size_t			min_multi_recv;
-	int			service;
 };
 
 struct psmx_fid_stx {
@@ -580,62 +603,39 @@ int	psmx_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 			 struct fid_domain **domain, void *context);
 int	psmx_wait_open(struct fid_fabric *fabric, struct fi_wait_attr *attr,
 		       struct fid_wait **waitset);
-int	psmx_wait_trywait(struct fid_fabric *fabric, struct fid **fids,
-			  int count);
 int	psmx_ep_open(struct fid_domain *domain, struct fi_info *info,
 		     struct fid_ep **ep, void *context);
 int	psmx_stx_ctx(struct fid_domain *domain, struct fi_tx_attr *attr,
 		     struct fid_stx **stx, void *context);
 int	psmx_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 		     struct fid_cq **cq, void *context);
+int	psmx_eq_open(struct fid_fabric *fabric, struct fi_eq_attr *attr,
+		     struct fid_eq **eq, void *context);
 int	psmx_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 		     struct fid_av **av, void *context);
 int	psmx_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
 		       struct fid_cntr **cntr, void *context);
-int	psmx_query_atomic(struct fid_domain *doamin, enum fi_datatype datatype,
-			  enum fi_op op, struct fi_atomic_attr *attr,
-			  uint64_t flags);
+int	psmx_poll_open(struct fid_domain *domain, struct fi_poll_attr *attr,
+		       struct fid_poll **pollset);
 
 static inline void psmx_fabric_acquire(struct psmx_fid_fabric *fabric)
 {
-	ofi_atomic_inc32(&fabric->util_fabric.ref);
+	++fabric->refcnt;
 }
 
-static inline void psmx_fabric_release(struct psmx_fid_fabric *fabric)
-{
-	ofi_atomic_dec32(&fabric->util_fabric.ref);
-}
+void	psmx_fabric_release(struct psmx_fid_fabric *fabric);
 
 static inline void psmx_domain_acquire(struct psmx_fid_domain *domain)
 {
-	ofi_atomic_inc32(&domain->util_domain.ref);
+	++domain->refcnt;
 }
 
-static inline void psmx_domain_release(struct psmx_fid_domain *domain)
-{
-	ofi_atomic_dec32(&domain->util_domain.ref);
-}
-
-int	psmx_domain_check_features(struct psmx_fid_domain *domain, uint64_t ep_caps);
+void	psmx_domain_release(struct psmx_fid_domain *domain);
+int	psmx_domain_check_features(struct psmx_fid_domain *domain, int ep_cap);
 int	psmx_domain_enable_ep(struct psmx_fid_domain *domain, struct psmx_fid_ep *ep);
 void	psmx_domain_disable_ep(struct psmx_fid_domain *domain, struct psmx_fid_ep *ep);
-
-static inline
-int	psmx_ns_service_cmp(void *svc1, void *svc2)
-{
-	int service1 = *(int *)svc1, service2 = *(int *)svc2;
-	if (service1 == PSMX_ANY_SERVICE ||
-	    service2 == PSMX_ANY_SERVICE)
-		return 0;
-	return (service1 < service2) ? -1 : (service1 > service2);
-}
-
-static inline
-int	psmx_ns_is_service_wildcard(void *svc)
-{
-	return (*(int *)svc == PSMX_ANY_SERVICE);
-}
-
+void 	*psmx_name_server(void *args);
+void	*psmx_resolve_name(const char *servername, int port);
 void	psmx_get_uuid(psm_uuid_t uuid);
 int	psmx_uuid_to_port(psm_uuid_t uuid);
 char	*psmx_uuid_to_string(psm_uuid_t uuid);
@@ -644,6 +644,12 @@ int	psmx_epid_to_epaddr(struct psmx_fid_domain *domain,
 			    psm_epid_t epid, psm_epaddr_t *epaddr);
 void	psmx_query_mpi(void);
 
+void	psmx_eq_enqueue_event(struct psmx_fid_eq *eq, struct psmx_eq_event *event);
+struct	psmx_eq_event *psmx_eq_create_event(struct psmx_fid_eq *eq,
+					uint32_t event_num,
+					void *context, uint64_t data,
+					int err, int prov_errno,
+					void *err_data, size_t err_data_size);
 void	psmx_cq_enqueue_event(struct psmx_fid_cq *cq, struct psmx_cq_event *event);
 struct	psmx_cq_event *psmx_cq_create_event(struct psmx_fid_cq *cq,
 					void *op_context, void *buf,
@@ -652,6 +658,9 @@ struct	psmx_cq_event *psmx_cq_create_event(struct psmx_fid_cq *cq,
 					size_t olen, int err);
 int	psmx_cq_poll_mq(struct psmx_fid_cq *cq, struct psmx_fid_domain *domain,
 			struct psmx_cq_event *event, int count, fi_addr_t *src_addr);
+int	psmx_wait_get_obj(struct psmx_fid_wait *wait, void *arg);
+int	psmx_wait_wait(struct fid_wait *wait, int timeout);
+void	psmx_wait_signal(struct fid_wait *wait);
 
 int	psmx_am_init(struct psmx_fid_domain *domain);
 int	psmx_am_fini(struct psmx_fid_domain *domain);
@@ -680,10 +689,10 @@ void	psmx_cntr_add_trigger(struct psmx_fid_cntr *cntr, struct psmx_trigger *trig
 
 static inline void psmx_cntr_inc(struct psmx_fid_cntr *cntr)
 {
-	ofi_atomic_inc64(&cntr->counter);
+	cntr->counter++;
 	psmx_cntr_check_trigger(cntr);
 	if (cntr->wait)
-		cntr->wait->signal(cntr->wait);
+		psmx_wait_signal((struct fid_wait *)cntr->wait);
 }
 
 static inline void psmx_progress(struct psmx_fid_domain *domain)

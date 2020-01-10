@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -39,6 +39,7 @@
 #define USDF_RDM_CAPS (FI_MSG | FI_SOURCE | FI_SEND | FI_RECV)
 
 #define USDF_RDM_SUPP_MODE (FI_LOCAL_MR)
+#define USDF_RDM_REQ_MODE (FI_LOCAL_MR)
 
 #define USDF_RDM_SUPP_SENDMSG_FLAGS \
 	(FI_INJECT_COMPLETE | FI_TRANSMIT_COMPLETE | FI_INJECT | FI_COMPLETION)
@@ -54,10 +55,6 @@
 #define USDF_RDM_MAX_INJECT_SIZE 64
 #define USDF_RDM_IOV_LIMIT (USDF_RDM_DFLT_SGE)
 #define USDF_RDM_RMA_IOV_LIMIT 0
-#define USDF_RDM_MR_IOV_LIMIT (USDF_MR_IOV_LIMIT)
-#define USDF_RDM_MR_CNT (USDF_MR_CNT)
-
-#define USDF_RDM_CNTR_CNT 0
 
 #define USDF_RDM_MSG_ORDER (FI_ORDER_NONE)
 #define USDF_RDM_COMP_ORDER (FI_ORDER_NONE)
@@ -111,7 +108,7 @@ enum {
  * This connection struct is used to manage messages in flight.
  */
 struct usdf_rdm_connection {
-	ofi_atomic32_t dc_refcnt;
+	atomic_t dc_refcnt;
 
 	struct usdf_tx *dc_tx;
 	struct usd_udp_hdr dc_hdr;
@@ -141,14 +138,12 @@ struct usdf_rdm_connection {
 	struct usdf_rdm_connection *dc_hash_next;
 };
 
-int usdf_rdm_fill_ep_attr(const struct fi_info *hints, struct fi_info *fi,
+
+int usdf_rdm_fill_ep_attr(struct fi_info *hints, struct fi_info *fi,
 		struct usd_device_attrs *dap);
-int usdf_rdm_fill_dom_attr(uint32_t version, const struct fi_info *hints,
-			   struct fi_info *fi, struct usd_device_attrs *dap);
-int usdf_rdm_fill_tx_attr(uint32_t version, const struct fi_info *hints,
-			   struct fi_info *fi);
-int usdf_rdm_fill_rx_attr(uint32_t version, const struct fi_info *hints,
-			  struct fi_info *fi);
+int usdf_rdm_fill_dom_attr(struct fi_info *hints, struct fi_info *fi);
+int usdf_rdm_fill_tx_attr(struct fi_info *hints, struct fi_info *fi);
+int usdf_rdm_fill_rx_attr(struct fi_info *hints, struct fi_info *fi);
 
 int usdf_rdm_post_recv(struct usdf_rx *rx, void *buf, size_t len);
 int usdf_cq_rdm_poll(struct usd_cq *ucq, struct usd_completion *comp);

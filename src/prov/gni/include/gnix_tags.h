@@ -150,8 +150,8 @@
 #define PROV_GNI_SRC_GNIX_TAGS_H_
 
 #include <stdlib.h>
-#include <ofi.h>
-#include <ofi_list.h>
+#include <fi.h>
+#include <fi_list.h>
 
 #include "gnix_util.h"
 
@@ -301,7 +301,7 @@ struct gnix_tag_kdtree {
  *                  data structure to use for storing data
  */
 struct gnix_tag_storage {
-	ofi_atomic32_t seq;
+	atomic_t seq;
 	int state;
 	int gen;
 	int (*match_func)(struct dlist_entry *entry, const void *arg);

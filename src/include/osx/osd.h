@@ -1,7 +1,5 @@
 /*
  * Copyright (c) 2015 Los Alamos Nat. Security, LLC. All rights reserved.
- * Copyright (c) 2016 Cisco Systems, Inc. All rights reserved.
- * Copyright (c) 2018 Amazon.com, Inc. or its affiliates. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -32,8 +30,8 @@
  * SOFTWARE.
  */
 
-#ifndef OSX_OSD_H
-#define OSX_OSD_H
+#ifndef _MACH_CLOCK_GETTIME_H_
+#define _MACH_CLOCK_GETTIME_H_
 
 #include <sys/time.h>
 #include <time.h>
@@ -45,9 +43,8 @@
 
 #include <pthread.h>
 
-#include "unix/osd.h"
-#include "rdma/fi_errno.h"
-#include "config.h"
+#define CLOCK_REALTIME CALENDAR_CLOCK
+#define CLOCK_MONOTONIC SYSTEM_CLOCK
 
 #define pthread_yield pthread_yield_np
 
@@ -59,29 +56,13 @@
 #define HOST_NAME_MAX 255
 #endif
 
+typedef int clockid_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-static inline int ofi_shm_remap(struct util_shm *shm, size_t newsize, void **mapped)
-{
-	return -1;
-}
-
-static inline ssize_t ofi_get_hugepage_size(void)
-{
-	return -FI_ENOSYS;
-}
-
-static inline int ofi_alloc_hugepage_buf(void **memptr, size_t size)
-{
-	return -FI_ENOSYS;
-}
-
-static inline int ofi_free_hugepage_buf(void *memptr, size_t size)
-{
-	return -FI_ENOSYS;
-}
+int clock_gettime(clockid_t clk_id, struct timespec *tp);
 
 #ifdef __cplusplus
 }

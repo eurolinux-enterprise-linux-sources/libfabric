@@ -1,7 +1,6 @@
 /*
- * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
- * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
- *                         All rights reserved.
+ * Copyright (c) 2015-2016 Cray Inc. All rights reserved.
+ * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -42,7 +41,6 @@
 #include "gnix.h"
 #include "gnix_cntr.h"
 #include "gnix_nic.h"
-#include "gnix_trigger.h"
 
 /*******************************************************************************
  * Forward declarations for filling functions.
@@ -73,46 +71,21 @@ static int __verify_cntr_attr(struct fi_cntr_attr *attr)
 		return -FI_EINVAL;
 	}
 
+	/*
+	 * TODO: need to support wait objects on cntr
+	 */
 	switch (attr->wait_obj) {
 	case FI_WAIT_UNSPEC:
 	case FI_WAIT_NONE:
-	case FI_WAIT_SET:
 		break;
+	case FI_WAIT_SET:
 	case FI_WAIT_FD:
 	case FI_WAIT_MUTEX_COND:
 	default:
 		GNIX_WARN(FI_LOG_CQ, "wait type: %d unsupported.\n",
 			  attr->wait_obj);
 		return -FI_EINVAL;
-	}
-
-	return ret;
-}
-
-static int gnix_cntr_set_wait(struct gnix_fid_cntr *cntr)
-{
-	int ret = FI_SUCCESS;
-
-	GNIX_TRACE(FI_LOG_EQ, "\n");
-
-	struct fi_wait_attr requested = {
-		.wait_obj = cntr->attr.wait_obj,
-		.flags = 0
-	};
-
-	switch (cntr->attr.wait_obj) {
-	case FI_WAIT_UNSPEC:
-		ret = gnix_wait_open(&cntr->domain->fabric->fab_fid,
-				&requested, &cntr->wait);
-		break;
-	case FI_WAIT_SET:
-		ret = _gnix_wait_set_add(cntr->attr.wait_set,
-					 &cntr->cntr_fid.fid);
-
-		if (!ret)
-			cntr->wait = cntr->attr.wait_set;
-		break;
-	default:
+		ret = -FI_ENOSYS;
 		break;
 	}
 
@@ -121,7 +94,22 @@ static int gnix_cntr_set_wait(struct gnix_fid_cntr *cntr)
 
 static int __gnix_cntr_progress(struct gnix_fid_cntr *cntr)
 {
-	return _gnix_prog_progress(&cntr->pset);
+	struct gnix_cq_poll_nic *pnic, *tmp;
+	int rc = FI_SUCCESS;
+
+	rwlock_rdlock(&cntr->nic_lock);
+
+	dlist_for_each_safe(&cntr->poll_nics, pnic, tmp, list) {
+		rc = _gnix_nic_progress(pnic->nic);
+		if (rc) {
+			GNIX_WARN(FI_LOG_CQ,
+				  "_gnix_nic_progress failed: %d\n", rc);
+		}
+	}
+
+	rwlock_unlock(&cntr->nic_lock);
+
+	return rc;
 }
 
 /*******************************************************************************
@@ -133,13 +121,10 @@ int _gnix_cntr_inc(struct gnix_fid_cntr *cntr)
 	if (cntr == NULL)
 		return -FI_EINVAL;
 
-	ofi_atomic_inc32(&cntr->cnt);
+	atomic_inc(&cntr->cnt);
 
 	if (cntr->wait)
 		_gnix_signal_wait_obj(cntr->wait);
-
-	if (_gnix_trigger_pending(cntr))
-		_gnix_trigger_check_cntr(cntr);
 
 	return FI_SUCCESS;
 }
@@ -149,7 +134,7 @@ int _gnix_cntr_inc_err(struct gnix_fid_cntr *cntr)
 	if (cntr == NULL)
 		return -FI_EINVAL;
 
-	ofi_atomic_inc32(&cntr->cnt_err);
+	atomic_inc(&cntr->cnt_err);
 
 	if (cntr->wait)
 		_gnix_signal_wait_obj(cntr->wait);
@@ -157,46 +142,106 @@ int _gnix_cntr_inc_err(struct gnix_fid_cntr *cntr)
 	return FI_SUCCESS;
 }
 
-int _gnix_cntr_poll_obj_add(struct gnix_fid_cntr *cntr, void *obj,
-			    int (*prog_fn)(void *data))
+int _gnix_cntr_poll_nic_add(struct gnix_fid_cntr *cntr, struct gnix_nic *nic)
 {
-	return _gnix_prog_obj_add(&cntr->pset, obj, prog_fn);
+	struct gnix_cntr_poll_nic *pnic, *tmp;
+
+	rwlock_wrlock(&cntr->nic_lock);
+
+	dlist_for_each_safe(&cntr->poll_nics, pnic, tmp, list) {
+		if (pnic->nic == nic) {
+			pnic->ref_cnt++;
+			rwlock_unlock(&cntr->nic_lock);
+			return FI_SUCCESS;
+		}
+	}
+
+	pnic = malloc(sizeof(struct gnix_cntr_poll_nic));
+	if (!pnic) {
+		GNIX_WARN(FI_LOG_CQ, "Failed to add NIC to CNTR poll list.\n");
+		rwlock_unlock(&cntr->nic_lock);
+		return -FI_ENOMEM;
+	}
+
+	/* EP holds a ref count on the NIC */
+	pnic->nic = nic;
+	pnic->ref_cnt = 1;
+	dlist_init(&pnic->list);
+	dlist_insert_tail(&pnic->list, &cntr->poll_nics);
+
+	rwlock_unlock(&cntr->nic_lock);
+
+	GNIX_INFO(FI_LOG_CQ, "Added NIC(%p) to CNTR(%p) poll list\n",
+		  nic, cntr);
+
+	return FI_SUCCESS;
 }
 
-int _gnix_cntr_poll_obj_rem(struct gnix_fid_cntr *cntr, void *obj,
-			    int (*prog_fn)(void *data))
+int _gnix_cntr_poll_nic_rem(struct gnix_fid_cntr *cntr, struct gnix_nic *nic)
 {
-	return _gnix_prog_obj_rem(&cntr->pset, obj, prog_fn);
+	struct gnix_cntr_poll_nic *pnic, *tmp;
+
+	rwlock_wrlock(&cntr->nic_lock);
+
+	dlist_for_each_safe(&cntr->poll_nics, pnic, tmp, list) {
+		if (pnic->nic == nic) {
+			if (!--pnic->ref_cnt) {
+				dlist_remove(&pnic->list);
+				free(pnic);
+				GNIX_INFO(FI_LOG_CQ,
+					  "Removed NIC(%p) from CNTR(%p) poll list\n",
+					  nic, cntr);
+			}
+			rwlock_unlock(&cntr->nic_lock);
+			return FI_SUCCESS;
+		}
+	}
+
+	rwlock_unlock(&cntr->nic_lock);
+
+	GNIX_WARN(FI_LOG_CQ, "NIC not found on CNTR poll list.\n");
+	return -FI_EINVAL;
 }
 
 /*******************************************************************************
  * API functions.
  ******************************************************************************/
 
-static int gnix_cntr_wait_sleep(struct gnix_fid_cntr *cntr_priv,
-				uint64_t threshold, int timeout)
+DIRECT_FN STATIC int gnix_cntr_wait(struct fid_cntr *cntr, uint64_t threshold,
+				    int timeout)
 {
-	int ret = FI_SUCCESS;
+	struct gnix_fid_cntr *cntr_priv;
 	struct timespec ts0, ts;
 	int msec_passed = 0;
+	int ret = 0;
+
+	cntr_priv = container_of(cntr, struct gnix_fid_cntr, cntr_fid);
 
 	clock_gettime(CLOCK_REALTIME, &ts0);
-	while (ofi_atomic_get32(&cntr_priv->cnt) < threshold &&
-	       ofi_atomic_get32(&cntr_priv->cnt_err) == 0) {
 
-		ret = gnix_wait_wait((struct fid_wait *)cntr_priv->wait,
-					timeout - msec_passed);
-		if (ret == -FI_ETIMEDOUT)
-			break;
-
-		if (ret) {
-			GNIX_WARN(FI_LOG_CQ,
-				" fi_wait returned %d.\n",
-				  ret);
-			break;
+	while (atomic_get(&cntr_priv->cnt) < threshold) {
+		if (cntr_priv->wait) {
+			ret = gnix_wait_wait((struct fid_wait *)cntr_priv->wait,
+					     timeout - msec_passed);
+			if (ret == -FI_ETIMEDOUT)
+				break;
+			if (ret) {
+				GNIX_WARN(FI_LOG_CQ,
+					" gnix_wait_wait returned %d.\n",
+					  ret);
+				break;
+			}
+		} else {
+			ret = __gnix_cntr_progress(cntr_priv);
+			if (ret != FI_SUCCESS) {
+				GNIX_WARN(FI_LOG_CQ,
+					" __gnix_cntr_progress returned %d.\n",
+					  ret);
+				break;
+			}
 		}
 
-		if (ofi_atomic_get32(&cntr_priv->cnt) >= threshold)
+		if (atomic_get(&cntr_priv->cnt) >= threshold)
 			break;
 
 		if (timeout < 0)
@@ -204,7 +249,7 @@ static int gnix_cntr_wait_sleep(struct gnix_fid_cntr *cntr_priv,
 
 		clock_gettime(CLOCK_REALTIME, &ts);
 		msec_passed = (ts.tv_sec - ts0.tv_sec) * 1000 +
-			      (ts.tv_nsec - ts0.tv_nsec) / 100000;
+			      (ts.tv_nsec - ts0.tv_nsec) / 1000000;
 
 		if (msec_passed >= timeout) {
 			ret = -FI_ETIMEDOUT;
@@ -212,57 +257,7 @@ static int gnix_cntr_wait_sleep(struct gnix_fid_cntr *cntr_priv,
 		}
 	}
 
-	return (ofi_atomic_get32(&cntr_priv->cnt_err)) ? -FI_EAVAIL : ret;
-}
-
-
-DIRECT_FN STATIC int gnix_cntr_wait(struct fid_cntr *cntr, uint64_t threshold,
-				    int timeout)
-{
-	struct gnix_fid_cntr *cntr_priv;
-
-	cntr_priv = container_of(cntr, struct gnix_fid_cntr, cntr_fid);
-	if (!cntr_priv->wait)
-		return -FI_EINVAL;
-
-	if (cntr_priv->attr.wait_obj == FI_WAIT_SET ||
-	    cntr_priv->attr.wait_obj == FI_WAIT_NONE)
-		return -FI_EINVAL;
-
-	return gnix_cntr_wait_sleep(cntr_priv, threshold, timeout);
-}
-
-DIRECT_FN STATIC int gnix_cntr_adderr(struct fid_cntr *cntr, uint64_t value)
-{
-	struct gnix_fid_cntr *cntr_priv;
-
-	cntr_priv = container_of(cntr, struct gnix_fid_cntr, cntr_fid);
-	if (FI_VERSION_LT(cntr_priv->domain->fabric->fab_fid.api_version, FI_VERSION(1, 5)))
-		return -FI_EOPNOTSUPP;
-
-	ofi_atomic_add32(&cntr_priv->cnt_err, (int)value);
-
-	if (cntr_priv->wait)
-		_gnix_signal_wait_obj(cntr_priv->wait);
-
-	return FI_SUCCESS;
-}
-
-DIRECT_FN STATIC int gnix_cntr_seterr(struct fid_cntr *cntr, uint64_t value)
-{
-	struct gnix_fid_cntr *cntr_priv;
-
-	cntr_priv = container_of(cntr, struct gnix_fid_cntr, cntr_fid);
-
-	if (FI_VERSION_LT(cntr_priv->domain->fabric->fab_fid.api_version, FI_VERSION(1, 5)))
-		return -FI_EOPNOTSUPP;
-
-	ofi_atomic_set32(&cntr_priv->cnt_err, (int)value);
-
-	if (cntr_priv->wait)
-		_gnix_signal_wait_obj(cntr_priv->wait);
-
-	return FI_SUCCESS;
+	return ret;
 }
 
 static void __cntr_destruct(void *obj)
@@ -288,8 +283,6 @@ static void __cntr_destruct(void *obj)
 			  cntr->attr.wait_obj);
 		break;
 	}
-
-	_gnix_prog_fini(&cntr->pset);
 
 	free(cntr);
 }
@@ -323,7 +316,7 @@ DIRECT_FN STATIC uint64_t gnix_cntr_readerr(struct fid_cntr *cntr)
 		return -FI_EINVAL;
 
 	cntr_priv = container_of(cntr, struct gnix_fid_cntr, cntr_fid);
-	v = ofi_atomic_get32(&cntr_priv->cnt_err);
+	v = atomic_get(&cntr_priv->cnt_err);
 
 	ret = __gnix_cntr_progress(cntr_priv);
 	if (ret != FI_SUCCESS)
@@ -342,16 +335,12 @@ DIRECT_FN STATIC uint64_t gnix_cntr_read(struct fid_cntr *cntr)
 		return -FI_EINVAL;
 
 	cntr_priv = container_of(cntr, struct gnix_fid_cntr, cntr_fid);
-
-	if (cntr_priv->wait)
-		gnix_wait_wait((struct fid_wait *)cntr_priv->wait, 0);
+	v = atomic_get(&cntr_priv->cnt);
 
 	ret = __gnix_cntr_progress(cntr_priv);
 	if (ret != FI_SUCCESS)
 		GNIX_WARN(FI_LOG_CQ, " __gnix_cntr_progress returned %d.\n",
 			  ret);
-
-	v = ofi_atomic_get32(&cntr_priv->cnt);
 
 	return (uint64_t)v;
 }
@@ -364,12 +353,10 @@ DIRECT_FN STATIC int gnix_cntr_add(struct fid_cntr *cntr, uint64_t value)
 		return -FI_EINVAL;
 
 	cntr_priv = container_of(cntr, struct gnix_fid_cntr, cntr_fid);
-	ofi_atomic_add32(&cntr_priv->cnt, (int)value);
+	atomic_add(&cntr_priv->cnt, (int)value);
 
 	if (cntr_priv->wait)
 		_gnix_signal_wait_obj(cntr_priv->wait);
-
-	_gnix_trigger_check_cntr(cntr_priv);
 
 	return FI_SUCCESS;
 }
@@ -382,12 +369,10 @@ DIRECT_FN STATIC int gnix_cntr_set(struct fid_cntr *cntr, uint64_t value)
 		return -FI_EINVAL;
 
 	cntr_priv = container_of(cntr, struct gnix_fid_cntr, cntr_fid);
-	ofi_atomic_set32(&cntr_priv->cnt, (int)value);
+	atomic_set(&cntr_priv->cnt, (int)value);
 
 	if (cntr_priv->wait)
 		_gnix_signal_wait_obj(cntr_priv->wait);
-
-	_gnix_trigger_check_cntr(cntr_priv);
 
 	return FI_SUCCESS;
 }
@@ -448,28 +433,18 @@ DIRECT_FN int gnix_cntr_open(struct fid_domain *domain,
 		goto err;
 	}
 
-	cntr_priv->requires_lock = (domain_priv->thread_model !=
-			FI_THREAD_COMPLETION);
-
 	cntr_priv->domain = domain_priv;
 	cntr_priv->attr = *attr;
 	/* ref count is initialized to one to show that the counter exists */
 	_gnix_ref_init(&cntr_priv->ref_cnt, 1, __cntr_destruct);
 
 	/* initialize atomics */
-	ofi_atomic_initialize32(&cntr_priv->cnt, 0);
-	ofi_atomic_initialize32(&cntr_priv->cnt_err, 0);
+	atomic_initialize(&cntr_priv->cnt, 0);
+	atomic_initialize(&cntr_priv->cnt_err, 0);
 
 	_gnix_ref_get(cntr_priv->domain);
-
-	_gnix_prog_init(&cntr_priv->pset);
-
-	dlist_init(&cntr_priv->trigger_list);
-	fastlock_init(&cntr_priv->trigger_lock);
-
-	ret = gnix_cntr_set_wait(cntr_priv);
-	if (ret)
-		goto err_wait;
+	dlist_init(&cntr_priv->poll_nics);
+	rwlock_init(&cntr_priv->nic_lock);
 
 	cntr_priv->cntr_fid.fid.fclass = FI_CLASS_CNTR;
 	cntr_priv->cntr_fid.fid.context = context;
@@ -477,11 +452,7 @@ DIRECT_FN int gnix_cntr_open(struct fid_domain *domain,
 	cntr_priv->cntr_fid.ops = &gnix_cntr_ops;
 
 	*cntr = &cntr_priv->cntr_fid;
-	return ret;
 
-err_wait:
-	_gnix_ref_put(cntr_priv->domain);
-	free(cntr_priv);
 err:
 	return ret;
 }
@@ -505,6 +476,4 @@ static struct fi_ops_cntr gnix_cntr_ops = {
 	.add = gnix_cntr_add,
 	.set = gnix_cntr_set,
 	.wait = gnix_cntr_wait,
-	.adderr = gnix_cntr_adderr,
-	.seterr = gnix_cntr_seterr
 };

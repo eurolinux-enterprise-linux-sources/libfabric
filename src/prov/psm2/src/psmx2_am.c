@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2018 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -31,135 +31,96 @@
  */
 
 #include "psmx2.h"
-#include "psmx2_trigger.h"
 
-#if !HAVE_PSM2_AM_REGISTER_HANDLERS_2
+struct psm2_am_parameters psmx2_am_param;
 
-/* Macros to repeat operation 'x' for 1000 times */
+static psm2_am_handler_fn_t psmx2_am_handlers[2] = {
+	psmx2_am_rma_handler,
+	psmx2_am_atomic_handler,
+};
 
-#define R10(p,x)  x(p##0) x(p##1) x(p##2) x(p##3) x(p##4) x(p##5) x(p##6) \
-		  x(p##7) x(p##8) x(p##9)
-#define R100(p,x) R10(p##0,x) R10(p##1,x) R10(p##2,x) R10(p##3,x) R10(p##4,x) \
-		  R10(p##5,x) R10(p##6,x) R10(p##7,x) R10(p##8,x) R10(p##9,x)
-#define R100A(x)  R10(,x) R10(1,x) R10(2,x) R10(3,x) R10(4,x) \
-                  R10(5,x) R10(6,x) R10(7,x) R10(8,x) R10(9,x)
-#define R1000(x)  R100A(x) R100(1,x) R100(2,x) R100(3,x) R100(4,x) R100(5,x) \
-		  R100(6,x) R100(7,x) R100(8,x) R100(9,x)
+static int psmx2_am_handlers_idx[2];
+static int psmx2_am_handlers_initialized = 0;
 
-#define DEFINE_AM_HANDLER(i) \
-	static int psmx2_am_handler_##i(psm2_am_token_t token, \
-					psm2_amarg_t *args, int nargs, \
-					void *src, uint32_t len) \
-	{ \
-		return psmx2_am_handlers_2[i](token, args, nargs, src, len, \
-					      psmx2_am_handler_ctxts[i]); \
-	}
-
-#define GET_AM_HANDLER(i) psmx2_am_handler_##i,
-
-R1000(DEFINE_AM_HANDLER)
-
-psm2_am_handler_fn_t psmx2_am_handlers[PSMX2_MAX_AM_HANDLERS] = {
-				R1000(GET_AM_HANDLER)
-		     };
-psm2_am_handler_2_fn_t psmx2_am_handlers_2[PSMX2_MAX_AM_HANDLERS];
-void *psmx2_am_handler_ctxts[PSMX2_MAX_AM_HANDLERS];
-int psmx2_am_handler_count = 0;
-
-#endif /* !HAVE_AM_REGISTER_HANDLERS_2 */
-
-int psmx2_am_progress(struct psmx2_trx_ctxt *trx_ctxt)
+int psmx2_am_progress(struct psmx2_fid_domain *domain)
 {
 	struct slist_entry *item;
+	struct psmx2_am_request *req;
 	struct psmx2_trigger *trigger;
 
-#if !HAVE_PSM2_MQ_FP_MSG
-	struct psmx2_am_request *req;
 	if (psmx2_env.tagged_rma) {
-		trx_ctxt->domain->rma_queue_lock_fn(&trx_ctxt->rma_queue.lock, 2);
-		while (!slist_empty(&trx_ctxt->rma_queue.list)) {
-			item = slist_remove_head(&trx_ctxt->rma_queue.list);
+		fastlock_acquire(&domain->rma_queue.lock);
+		while (!slist_empty(&domain->rma_queue.list)) {
+			item = slist_remove_head(&domain->rma_queue.list);
 			req = container_of(item, struct psmx2_am_request, list_entry);
-			trx_ctxt->domain->rma_queue_unlock_fn(&trx_ctxt->rma_queue.lock, 2);
-			psmx2_am_process_rma(trx_ctxt, req);
-			trx_ctxt->domain->rma_queue_lock_fn(&trx_ctxt->rma_queue.lock, 2);
+			fastlock_release(&domain->rma_queue.lock);
+			psmx2_am_process_rma(domain, req);
+			fastlock_acquire(&domain->rma_queue.lock);
 		}
-		trx_ctxt->domain->rma_queue_unlock_fn(&trx_ctxt->rma_queue.lock, 2);
+		fastlock_release(&domain->rma_queue.lock);
 	}
-#endif
 
-	trx_ctxt->domain->trigger_queue_lock_fn(&trx_ctxt->trigger_queue.lock, 2);
-	while (!slist_empty(&trx_ctxt->trigger_queue.list)) {
-		item = slist_remove_head(&trx_ctxt->trigger_queue.list);
+	fastlock_acquire(&domain->trigger_queue.lock);
+	while (!slist_empty(&domain->trigger_queue.list)) {
+		item = slist_remove_head(&domain->trigger_queue.list);
 		trigger = container_of(item, struct psmx2_trigger, list_entry);
-		trx_ctxt->domain->trigger_queue_unlock_fn(&trx_ctxt->trigger_queue.lock, 2);
-		psmx2_process_trigger(trx_ctxt, trigger);
-		trx_ctxt->domain->trigger_queue_lock_fn(&trx_ctxt->trigger_queue.lock, 2);
+		fastlock_release(&domain->trigger_queue.lock);
+		psmx2_process_trigger(domain, trigger);
+		fastlock_acquire(&domain->trigger_queue.lock);
 	}
-	trx_ctxt->domain->trigger_queue_unlock_fn(&trx_ctxt->trigger_queue.lock, 2);
+	fastlock_release(&domain->trigger_queue.lock);
 
 	return 0;
 }
 
-int psmx2_am_init(struct psmx2_trx_ctxt *trx_ctxt)
+int psmx2_am_init(struct psmx2_fid_domain *domain)
 {
-	psm2_am_handler_2_fn_t psmx2_am_handlers[4];
-	struct psmx2_trx_ctxt *hctx[4];
-	int psmx2_am_handlers_idx[4];
-	int num_handlers = 4;
-
-	psm2_ep_t psm2_ep = trx_ctxt->psm2_ep;
+	psm2_ep_t psm2_ep = domain->psm2_ep;
 	size_t size;
 	int err = 0;
-	uint32_t max_atomic_size;
 
-	FI_INFO(&psmx2_prov, FI_LOG_CORE, "epid %016lx\n", trx_ctxt->psm2_epid);
+	FI_INFO(&psmx2_prov, FI_LOG_CORE, "\n");
 
-	if (!trx_ctxt->am_initialized) {
-		err = psm2_am_get_parameters(psm2_ep, &trx_ctxt->psm2_am_param,
-					     sizeof(struct psm2_am_parameters),
-					     &size);
+	psmx2_atomic_init();
+
+	if (!psmx2_am_handlers_initialized) {
+		err = psm2_am_get_parameters(psm2_ep, &psmx2_am_param,
+					     sizeof(psmx2_am_param), &size);
 		if (err)
 			return psmx2_errno(err);
 
-		max_atomic_size = trx_ctxt->psm2_am_param.max_request_short;
-		if (trx_ctxt->domain->max_atomic_size > max_atomic_size)
-			trx_ctxt->domain->max_atomic_size = max_atomic_size;
-
-		psmx2_am_handlers[0] = psmx2_am_rma_handler;
-		hctx[0] = trx_ctxt;
-		psmx2_am_handlers[1] = psmx2_am_atomic_handler;
-		hctx[1] = trx_ctxt;
-		psmx2_am_handlers[2] = psmx2_am_sep_handler;
-		hctx[2] = trx_ctxt;
-		psmx2_am_handlers[3] = psmx2_am_trx_ctxt_handler;
-		hctx[3] = trx_ctxt;
-
-		err = psm2_am_register_handlers_2(psm2_ep, psmx2_am_handlers,
-						num_handlers, (void **)hctx, psmx2_am_handlers_idx);
+		err = psm2_am_register_handlers(psm2_ep, psmx2_am_handlers, 2,
+						psmx2_am_handlers_idx);
 		if (err)
 			return psmx2_errno(err);
 
 		if ((psmx2_am_handlers_idx[0] != PSMX2_AM_RMA_HANDLER) ||
-		    (psmx2_am_handlers_idx[1] != PSMX2_AM_ATOMIC_HANDLER) ||
-		    (psmx2_am_handlers_idx[2] != PSMX2_AM_SEP_HANDLER) ||
-		    (psmx2_am_handlers_idx[3] != PSMX2_AM_TRX_CTXT_HANDLER)) {
+		    (psmx2_am_handlers_idx[1] != PSMX2_AM_ATOMIC_HANDLER)) {
 			FI_WARN(&psmx2_prov, FI_LOG_CORE,
 				"failed to register one or more AM handlers "
-				"at indecies %d, %d, %d, %d\n", PSMX2_AM_RMA_HANDLER,
-				PSMX2_AM_ATOMIC_HANDLER, PSMX2_AM_SEP_HANDLER,
-				PSMX2_AM_TRX_CTXT_HANDLER);
+				"at indecies %d, %d\n", PSMX2_AM_RMA_HANDLER,
+				PSMX2_AM_ATOMIC_HANDLER);
 			return -FI_EBUSY;
 		}
 
-		trx_ctxt->am_initialized = 1;
+		psmx2_am_handlers_initialized = 1;
 	}
+
+	slist_init(&domain->rma_queue.list);
+	slist_init(&domain->trigger_queue.list);
+	fastlock_init(&domain->rma_queue.lock);
+	fastlock_init(&domain->trigger_queue.lock);
 
 	return err;
 }
 
-void psmx2_am_fini(struct psmx2_trx_ctxt *trx_ctxt)
+int psmx2_am_fini(struct psmx2_fid_domain *domain)
 {
-	/* there is no way to unregister AM handlers */
+	fastlock_destroy(&domain->rma_queue.lock);
+	fastlock_destroy(&domain->trigger_queue.lock);
+
+	psmx2_atomic_fini();
+
+	return 0;
 }
 

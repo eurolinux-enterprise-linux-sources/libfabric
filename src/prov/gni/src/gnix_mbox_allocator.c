@@ -1,7 +1,6 @@
 /*
- * Copyright (c) 2015-2016 Los Alamos National Security, LLC.
- *                         All rights reserved.
- * Copyright (c) 2015,2017-2018 Cray Inc.  All rights reserved.
+ * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
+ * Copyright (c) 2015 Cray Inc.  All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -35,11 +34,9 @@
 #include <stdio.h>
 #include <sys/statfs.h>
 #include <sys/mman.h>
-#include <mntent.h>
 
 #include "gnix_mbox_allocator.h"
 #include "gnix_nic.h"
-#include "fi_ext_gni.h"
 
 /**
  * Will attempt to find a directory in the hugetlbfs with the given page size.
@@ -54,46 +51,74 @@
  * @return -FI_EINVAL	if an invalid parameter was given
  * @return -FI_EIO	if an error occurred while opening the /proc/mounts
  * file.
+ * @return -FI_ENOMEM	if an error occurred while allocating space for the text
+ * from the file.
  */
 static int __find_huge_page(size_t page_size, char **directory)
 {
-	int rc = -FI_EINVAL;
+	int bytes_read = -FI_EINVAL;
 	struct statfs pg_size;
-	struct mntent *mntent;
+	size_t size = 1024;
+	char error_buf[256];
+	char *line, *field;
+	char *saveptr;
+	char *error;
 	FILE *fd;
 
 	if (!directory || !page_size) {
 		GNIX_WARN(FI_LOG_EP_CTRL,
 			  "Invalid page_size or directory provided.\n");
-		return -FI_EINVAL;
+		bytes_read = -FI_EINVAL;
+		goto err_fopen;
 	}
 
-	fd = setmntent ("/proc/mounts", "r");
-	if (fd == NULL) {
-		GNIX_WARN(FI_LOG_EP_CTRL,
-			  "Unable to open /proc/mounts - %s.\n",
-			  strerror(errno));
-		return -FI_EIO;
+	*directory = NULL;
+
+	fd = fopen("/proc/mounts", "r");
+	if (!fd) {
+		error = strerror_r(errno, error_buf, sizeof(error_buf));
+		GNIX_WARN(FI_LOG_EP_CTRL, "Error opening /proc/mounts: %s\n",
+			  error);
+		bytes_read = -FI_EIO;
+		goto err_fopen;
 	}
 
-	while ((mntent = getmntent(fd)) != NULL) {
+	line = malloc(size);
+	if (!line) {
 
-		if (strcmp (mntent->mnt_type, "hugetlbfs") != 0) {
-			continue;
-		}
+		error = strerror_r(errno, error_buf, sizeof(error_buf));
+		GNIX_WARN(FI_LOG_EP_CTRL, "Error allocating line: %s\n",
+			  error);
+		bytes_read = -FI_ENOMEM;
+		goto err_malloc;
+	}
 
-		if (statfs(mntent->mnt_dir, &pg_size) == 0) {
-			if (pg_size.f_bsize == page_size) {
-				*directory = strdup(mntent->mnt_dir);
-				rc = FI_SUCCESS;
-				break;
+	/*
+	 * Look for entries with substring hugetlbfs in /proc/mounts.
+	 */
+	while (getline(&line, &size, fd) != -1) {
+		if (strstr(line, "hugetlbfs")) {
+			field = strtok_r(line, " ", &saveptr);
+			field = strtok_r(NULL, " ", &saveptr);
+
+			/*
+			 * Check if page is the correct size.
+			 */
+			if (statfs(field, &pg_size) == 0) {
+				if (pg_size.f_bsize == page_size) {
+					*directory = strdup(field);
+					bytes_read = FI_SUCCESS;
+					break;
+				}
 			}
 		}
 	}
 
-	endmntent(fd);
-
-	return rc;
+	free(line);
+err_malloc:
+	fclose(fd);
+err_fopen:
+	return bytes_read;
 }
 
 /**
@@ -130,14 +155,13 @@ static int __generate_file_name(size_t page_size, char **filename)
 	}
 
 	ret = __find_huge_page(page_size, &huge_page);
-	if (ret != FI_SUCCESS) {
+	if (ret < 0) {
 		GNIX_WARN(FI_LOG_EP_CTRL,
-			  "Find huge page returned error %s\n",
-			  fi_strerror(-ret));
+			  "Find huge page returned negative condition.\n");
 		goto err_invalid;
 	}
 
-	my_file_id = ofi_atomic_inc32(&file_id_counter);
+	my_file_id = atomic_inc(&file_id_counter);
 	size = snprintf(NULL, 0, "%s/%s.%d.%d", huge_page, basename, getpid(),
 			my_file_id);
 	if (size < 0) {
@@ -297,10 +321,6 @@ static int __create_slab(struct gnix_mbox_alloc_handle *handle)
 	char *error;
 	size_t total_size;
 	int ret;
-	int vmdh_index = -1;
-	int flags = GNI_MEM_READWRITE;
-	struct gnix_auth_key *info;
-	struct fi_gni_auth_key key;
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
@@ -337,50 +357,19 @@ static int __create_slab(struct gnix_mbox_alloc_handle *handle)
 		goto err_mmap;
 	}
 
-	ret = _gnix_alloc_bitmap(slab->used, __mbox_count(handle), NULL);
+	ret = _gnix_alloc_bitmap(slab->used, __mbox_count(handle));
 	if (ret) {
 		GNIX_WARN(FI_LOG_EP_CTRL, "Error allocating bitmap.\n");
 		goto err_alloc_bitmap;
 	}
 
-	COND_ACQUIRE(handle->nic_handle->requires_lock, &handle->nic_handle->lock);
-	if (handle->nic_handle->using_vmdh) {
-		key.type = GNIX_AKT_RAW;
-		key.raw.protection_key = handle->nic_handle->cookie;
-
-		info = _gnix_auth_key_lookup((uint8_t *) &key, sizeof(key));
-		assert(info);
-
-		if (!handle->nic_handle->mdd_resources_set) {
-			/* check to see if the ptag registration limit was set
-			 * yet or not -- becomes read-only after success */
-			_gnix_auth_key_enable(info);
-
-			status = GNI_SetMddResources(
-				handle->nic_handle->gni_nic_hndl,
-				(info->attr.prov_key_limit +
-				 info->attr.user_key_limit));
-			assert(status == GNI_RC_SUCCESS);
-
-			handle->nic_handle->mdd_resources_set = 1;
-		}
-
-		vmdh_index = _gnix_get_next_reserved_key(info);
-		if (vmdh_index <= 0) {
-			GNIX_FATAL(FI_LOG_DOMAIN,
-				"failed to get reserved key for mbox "
-				"registration, rc=%d\n",
-				vmdh_index);
-		}
-		flags |= GNI_MEM_USE_VMDH;
-	}
-
+	fastlock_acquire(&handle->nic_handle->lock);
 	status = GNI_MemRegister(handle->nic_handle->gni_nic_hndl,
 				 (uint64_t) slab->base, total_size,
 				 handle->cq_handle,
-				 flags, vmdh_index,
+				 GNI_MEM_READWRITE, -1,
 				 &slab->memory_handle);
-	COND_RELEASE(handle->nic_handle->requires_lock, &handle->nic_handle->lock);
+	fastlock_release(&handle->nic_handle->lock);
 	if (status != GNI_RC_SUCCESS) {
 		GNIX_WARN(FI_LOG_EP_CTRL, "GNI_MemRegister failed: %s\n",
 			  gni_err_str[status]);
@@ -436,10 +425,10 @@ static int __destroy_slab(struct gnix_mbox_alloc_handle *handle,
 	_gnix_free_bitmap(slab->used);
 	free(slab->used);
 
-	COND_ACQUIRE(handle->nic_handle->requires_lock, &handle->nic_handle->lock);
+	fastlock_acquire(&handle->nic_handle->lock);
 	GNI_MemDeregister(handle->nic_handle->gni_nic_hndl,
 			  &slab->memory_handle);
-	COND_RELEASE(handle->nic_handle->requires_lock, &handle->nic_handle->lock);
+	fastlock_release(&handle->nic_handle->lock);
 
 	munmap(slab->base, total_size);
 
@@ -557,11 +546,6 @@ static int __fill_mbox(struct gnix_mbox_alloc_handle *handle,
 		ret = -FI_EINVAL;
 		goto err_invalid;
 	}
-
-	/* On some systems, the page may not be zero'd from first use.
-		Memset it here */
-	memset((void *) ((uint64_t) out->base + out->offset),
-		0x0, handle->mbox_size);
 
 	ret = _gnix_test_and_set_bit(slab->used, position);
 	if (ret != 0) {

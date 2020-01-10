@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014-2016, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -50,10 +50,11 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
+#include <rdma/fi_prov.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-#include "ofi.h"
+#include "fi.h"
 
 #include "usd.h"
 #include "usd_post.h"
@@ -128,25 +129,22 @@ usdf_rdm_rdc_ready(struct usdf_rdm_connection *rdc, struct usdf_tx *tx)
 }
 
 static inline uint16_t
-usdf_rdm_rdc_hash_helper(uint32_t ipaddr, uint16_t port)
+usdf_rdm_rdc_hash_helper(uint16_t *ipaddr, uint16_t port)
 {
 	uint16_t hash_index;
 
-	uint16_t lower = (ipaddr & 0xFFFF);
-	uint16_t upper = (ipaddr >> 16);
-
-	hash_index = lower;
-	hash_index ^= upper;
+	hash_index = ipaddr[0];
+	hash_index ^= ipaddr[1];
 	hash_index ^= port;
 
 	return hash_index & USDF_RDM_HASH_MASK;
 }
 
-
 static inline uint16_t
 usdf_rdm_rdc_hash_hdr(struct usd_udp_hdr *hdr)
 {
-	return usdf_rdm_rdc_hash_helper(hdr->uh_ip.saddr, hdr->uh_udp.source);
+	return usdf_rdm_rdc_hash_helper((uint16_t *)&hdr->uh_ip.saddr,
+			hdr->uh_udp.source);
 }
 
 static inline int
@@ -157,18 +155,18 @@ usdf_rdm_rdc_hdr_match(struct usdf_rdm_connection *rdc, struct usd_udp_hdr *hdr)
 }
 
 static inline int
-usdf_rdm_rdc_addr_match(struct usdf_rdm_connection *rdc, uint32_t ipaddr,
+usdf_rdm_rdc_addr_match(struct usdf_rdm_connection *rdc, uint16_t *ipaddr,
 		 uint16_t port)
 {
-	return ipaddr == rdc->dc_hdr.uh_ip.daddr &&
-	       port == rdc->dc_hdr.uh_udp.dest;
+	return *(uint32_t *)ipaddr == rdc->dc_hdr.uh_ip.daddr &&
+	    port == rdc->dc_hdr.uh_udp.dest;
 }
 
 /*
  * Find a matching RDM connection on this domain
  */
 static inline struct usdf_rdm_connection *
-usdf_rdm_rdc_addr_lookup(struct usdf_domain *udp, uint32_t ipaddr,
+usdf_rdm_rdc_addr_lookup(struct usdf_domain *udp, uint16_t *ipaddr,
 		uint16_t port)
 {
 	uint16_t hash_index;
@@ -219,7 +217,8 @@ usdf_rdm_rdc_insert(struct usdf_domain *udp, struct usdf_rdm_connection *rdc)
 {
 	uint16_t hash_index;
 
-	hash_index = usdf_rdm_rdc_hash_helper(rdc->dc_hdr.uh_ip.daddr,
+	hash_index = usdf_rdm_rdc_hash_helper(
+		(uint16_t *)&rdc->dc_hdr.uh_ip.daddr,
 		rdc->dc_hdr.uh_udp.dest);
 	USDF_DBG_SYS(EP_DATA, "insert rdc %p at %u\n", rdc, hash_index);
 
@@ -233,7 +232,8 @@ usdf_rdm_rdc_remove(struct usdf_domain *udp, struct usdf_rdm_connection *rdc)
 	uint16_t hash_index;
 	struct usdf_rdm_connection *prev;
 
-	hash_index = usdf_rdm_rdc_hash_helper(rdc->dc_hdr.uh_ip.daddr,
+	hash_index = usdf_rdm_rdc_hash_helper(
+		(uint16_t *)&rdc->dc_hdr.uh_ip.daddr,
 		rdc->dc_hdr.uh_udp.dest);
 	USDF_DBG_SYS(EP_DATA, "remove rdc %p from %u\n", rdc, hash_index);
 
@@ -261,7 +261,7 @@ usdf_rdc_alloc(struct usdf_domain *udp)
 	} else {
 		rdc = SLIST_FIRST(&udp->dom_rdc_free);
 		SLIST_REMOVE_HEAD(&udp->dom_rdc_free, dc_addr_link);
-		ofi_atomic_dec32(&udp->dom_rdc_free_cnt);
+		atomic_dec(&udp->dom_rdc_free_cnt);
 	}
 	return rdc;
 }
@@ -293,7 +293,7 @@ usdf_rdm_rdc_tx_get(struct usdf_dest *dest, struct usdf_ep *ep)
 
 	udp = tx->tx_domain;
 	rdc = usdf_rdm_rdc_addr_lookup(udp,
-		dest->ds_dest.ds_dest.ds_udp.u_hdr.uh_ip.daddr,
+		(uint16_t *)&dest->ds_dest.ds_dest.ds_udp.u_hdr.uh_ip.daddr,
 		dest->ds_dest.ds_dest.ds_udp.u_hdr.uh_udp.dest);
 
 	if (rdc == NULL) {
@@ -404,7 +404,7 @@ usdf_rdm_rewind_qe(struct usdf_rdm_qe *qe, size_t rewind, size_t mtu)
 	}
 
 	qe->rd_cur_iov = cur_iov;
-	qe->rd_cur_ptr = ((uint8_t *)qe->rd_iov[cur_iov].iov_base) +
+	qe->rd_cur_ptr = qe->rd_iov[cur_iov].iov_base +
 		qe->rd_iov[cur_iov].iov_len - cur_resid;
 	qe->rd_iov_resid = cur_resid;
 }
@@ -534,7 +534,7 @@ static inline ssize_t _usdf_rdm_recv_vector(struct fid_ep *fep,
 	rqe->rd_last_iov = count - 1;
 	rqe->rd_cur_ptr = iov[0].iov_base;
 	rqe->rd_resid = tot_len;
-	rqe->rd_length = 0;
+	rqe->rd_length = tot_len;
 
 	rqe->rd_signal_comp = ep->ep_rx_dflt_signal_comp ||
 		(flags & FI_COMPLETION) ? 1 : 0;
@@ -596,7 +596,7 @@ usdf_rdm_send(struct fid_ep *fep, const void *buf, size_t len, void *desc,
 
 	wqe->rd_context = context;
 
-	msg_id = ofi_atomic_inc32(&tx->t.rdm.tx_next_msg_id);
+	msg_id = atomic_inc(&tx->t.rdm.tx_next_msg_id);
 	wqe->rd_msg_id_be = htonl(msg_id);
 
 	wqe->rd_iov[0].iov_base = (void *)buf;
@@ -709,7 +709,7 @@ static inline ssize_t _usdf_rdm_send_vector(struct fid_ep *fep,
 		wqe->rd_last_iov = count - 1;
 	}
 
-	msg_id = ofi_atomic_inc32(&tx->t.rdm.tx_next_msg_id);
+	msg_id = atomic_inc(&tx->t.rdm.tx_next_msg_id);
 
 	wqe->rd_msg_id_be = htonl(msg_id);
 	wqe->rd_context = context;
@@ -787,7 +787,7 @@ usdf_rdm_inject(struct fid_ep *fep, const void *buf, size_t len,
 
 	wqe = usdf_rdm_get_tx_wqe(tx);
 	wqe->rd_context = NULL;
-	msg_id = ofi_atomic_inc32(&tx->t.rdm.tx_next_msg_id);
+	msg_id = atomic_inc(&tx->t.rdm.tx_next_msg_id);
 	wqe->rd_msg_id_be = htonl(msg_id);
 
 	memcpy(wqe->rd_inject_buf, buf, len);
@@ -1145,8 +1145,7 @@ static inline void usdf_rdm_recv_complete(struct usdf_rx *rx,
 	USDF_DBG_SYS(EP_DATA, "RECV complete ID=%u len=%lu with status %d\n",
 		     rdc->dc_rx_msg_id, rqe->rd_length, status);
 	hcq = rx->r.rdm.rx_hcq;
-	hcq->cqh_post(hcq, rqe->rd_context, rqe->rd_length, status,
-		      FI_MSG | FI_RECV);
+	hcq->cqh_post(hcq, rqe->rd_context, rqe->rd_length, status);
 
 	usdf_rdm_put_rx_rqe(rx, rqe);
 
@@ -1320,9 +1319,7 @@ usdf_rdm_process_ack(struct usdf_rdm_connection *rdc,
 				USDF_DBG_SYS(EP_DATA, "send ID=%u complete\n", msg_id);
 				if (wqe->rd_signal_comp)
 					hcq->cqh_post(hcq, wqe->rd_context,
-						      wqe->rd_length,
-						      FI_SUCCESS,
-						      FI_MSG | FI_SEND);
+							wqe->rd_length, FI_SUCCESS);
 
 				usdf_rdm_put_tx_wqe(tx, wqe);
 
@@ -1437,7 +1434,7 @@ usdf_rdm_rdc_timeout(void *vrdc)
 		usdf_rdm_rdc_remove(udp, rdc);
 
 		SLIST_INSERT_HEAD(&udp->dom_rdc_free, rdc, dc_addr_link);
-		ofi_atomic_inc32(&udp->dom_rdc_free_cnt);
+		atomic_inc(&udp->dom_rdc_free_cnt);
 
 	} else {
 		usdf_timer_set(udp->dom_fabric, rdc->dc_timer,
@@ -1616,9 +1613,8 @@ ssize_t usdf_rdm_rx_size_left(struct fid_ep *fep)
 
 	ep = ep_ftou(fep);
 	rx = ep->ep_rx;
-
-	if (!(ep->flags & USDF_EP_ENABLED))
-		return -FI_EOPBADSTATE;
+	if (rx == NULL)
+		return -FI_EOPBADSTATE; /* EP not enabled */
 
 	return rx->r.rdm.rx_num_free_rqe;
 }
@@ -1632,9 +1628,8 @@ ssize_t usdf_rdm_tx_size_left(struct fid_ep *fep)
 
 	ep = ep_ftou(fep);
 	tx = ep->ep_tx;
-
-	if (!(ep->flags & USDF_EP_ENABLED))
-		return -FI_EOPBADSTATE;
+	if (tx == NULL)
+		return -FI_EOPBADSTATE; /* EP not enabled */
 
 	return tx->t.rdm.tx_num_free_wqe;
 }

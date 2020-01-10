@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -168,7 +168,7 @@ void psmx_cntr_check_trigger(struct psmx_fid_cntr *cntr)
 
 	trigger = cntr->trigger;
 	while (trigger) {
-		if (ofi_atomic_get64(&cntr->counter) < trigger->threshold)
+		if (cntr->counter < trigger->threshold)
 			break;
 
 		cntr->trigger = trigger->next;
@@ -210,15 +210,22 @@ void psmx_cntr_add_trigger(struct psmx_fid_cntr *cntr, struct psmx_trigger *trig
 	psmx_cntr_check_trigger(cntr);
 }
 
+#define PSMX_CNTR_POLL_THRESHOLD 100
 static uint64_t psmx_cntr_read(struct fid_cntr *cntr)
 {
 	struct psmx_fid_cntr *cntr_priv;
+	static int poll_cnt = 0;
 
 	cntr_priv = container_of(cntr, struct psmx_fid_cntr, cntr);
 
-	psmx_progress(cntr_priv->domain);
+	if (poll_cnt++ == PSMX_CNTR_POLL_THRESHOLD) {
+		psmx_progress(cntr_priv->domain);
+		poll_cnt = 0;
+	}
 
-	return ofi_atomic_get64(&cntr_priv->counter);
+	cntr_priv->counter_last_read = cntr_priv->counter;
+
+	return cntr_priv->counter_last_read;
 }
 
 static uint64_t psmx_cntr_readerr(struct fid_cntr *cntr)
@@ -227,7 +234,9 @@ static uint64_t psmx_cntr_readerr(struct fid_cntr *cntr)
 
 	cntr_priv = container_of(cntr, struct psmx_fid_cntr, cntr);
 
-	return ofi_atomic_get64(&cntr_priv->error_counter);
+	cntr_priv->error_counter_last_read = cntr_priv->error_counter;
+
+	return cntr_priv->error_counter_last_read;
 }
 
 static int psmx_cntr_add(struct fid_cntr *cntr, uint64_t value)
@@ -235,12 +244,12 @@ static int psmx_cntr_add(struct fid_cntr *cntr, uint64_t value)
 	struct psmx_fid_cntr *cntr_priv;
 
 	cntr_priv = container_of(cntr, struct psmx_fid_cntr, cntr);
-	ofi_atomic_add64(&cntr_priv->counter, value);
+	cntr_priv->counter += value;
 
 	psmx_cntr_check_trigger(cntr_priv);
 
 	if (cntr_priv->wait)
-		cntr_priv->wait->signal(cntr_priv->wait);
+		psmx_wait_signal((struct fid_wait *)cntr_priv->wait);
 
 	return 0;
 }
@@ -250,42 +259,12 @@ static int psmx_cntr_set(struct fid_cntr *cntr, uint64_t value)
 	struct psmx_fid_cntr *cntr_priv;
 
 	cntr_priv = container_of(cntr, struct psmx_fid_cntr, cntr);
-	ofi_atomic_set64(&cntr_priv->counter, value);
+	cntr_priv->counter = value;
 
 	psmx_cntr_check_trigger(cntr_priv);
 
 	if (cntr_priv->wait)
-		cntr_priv->wait->signal(cntr_priv->wait);
-
-	return 0;
-}
-
-static int psmx_cntr_adderr(struct fid_cntr *cntr, uint64_t value)
-{
-	struct psmx_fid_cntr *cntr_priv;
-
-	cntr_priv = container_of(cntr, struct psmx_fid_cntr, cntr);
-	ofi_atomic_add64(&cntr_priv->error_counter, value);
-
-	psmx_cntr_check_trigger(cntr_priv);
-
-	if (cntr_priv->wait)
-		cntr_priv->wait->signal(cntr_priv->wait);
-
-	return 0;
-}
-
-static int psmx_cntr_seterr(struct fid_cntr *cntr, uint64_t value)
-{
-	struct psmx_fid_cntr *cntr_priv;
-
-	cntr_priv = container_of(cntr, struct psmx_fid_cntr, cntr);
-	ofi_atomic_set64(&cntr_priv->error_counter, value);
-
-	psmx_cntr_check_trigger(cntr_priv);
-
-	if (cntr_priv->wait)
-		cntr_priv->wait->signal(cntr_priv->wait);
+		psmx_wait_signal((struct fid_wait *)cntr_priv->wait);
 
 	return 0;
 }
@@ -301,17 +280,17 @@ static int psmx_cntr_wait(struct fid_cntr *cntr, uint64_t threshold, int timeout
 
 	clock_gettime(CLOCK_REALTIME, &ts0);
 
-	while (ofi_atomic_get64(&cntr_priv->counter) < threshold) {
+	while (cntr_priv->counter < threshold) {
 		if (cntr_priv->wait) {
-			ret = fi_wait((struct fid_wait *)cntr_priv->wait,
-				      timeout - msec_passed);
+			ret = psmx_wait_wait((struct fid_wait *)cntr_priv->wait,
+					     timeout - msec_passed);
 			if (ret == -FI_ETIMEDOUT)
 				break;
 		} else {
 			psmx_progress(cntr_priv->domain);
 		}
 
-		if (ofi_atomic_get64(&cntr_priv->counter) >= threshold)
+		if (cntr_priv->counter >= threshold)
 			break;
 
 		if (timeout < 0)
@@ -336,14 +315,12 @@ static int psmx_cntr_close(fid_t fid)
 
 	cntr = container_of(fid, struct psmx_fid_cntr, cntr.fid);
 
-	if (cntr->wait) {
-		fi_poll_del(&cntr->wait->pollset->poll_fid, &cntr->cntr.fid, 0);
-		if (cntr->wait_is_local)
-			fi_close((fid_t)cntr->wait);
-	}
+	psmx_domain_release(cntr->domain);
+
+	if (cntr->wait && cntr->wait_is_local)
+		fi_close((fid_t)cntr->wait);
 
 	pthread_mutex_destroy(&cntr->trigger_lock);
-	psmx_domain_release(cntr->domain);
 	free(cntr);
 
 	return 0;
@@ -368,12 +345,10 @@ static int psmx_cntr_control(fid_t fid, int command, void *arg)
 		break;
 
 	case FI_GETWAIT:
-		if (cntr->wait)
-			ret = fi_control(&cntr->wait->wait_fid.fid, FI_GETWAIT, arg);
-		else
-			return -FI_EINVAL;
+		/*
+		ret = psmx_wait_get_obj(cntr->wait, arg);
 		break;
-
+		*/
 	default:
 		return -FI_ENOSYS;
 	}
@@ -396,8 +371,6 @@ static struct fi_ops_cntr psmx_cntr_ops = {
 	.add = psmx_cntr_add,
 	.set = psmx_cntr_set,
 	.wait = psmx_cntr_wait,
-	.adderr = psmx_cntr_adderr,
-	.seterr = psmx_cntr_seterr,
 };
 
 int psmx_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
@@ -405,7 +378,7 @@ int psmx_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
 {
 	struct psmx_fid_domain *domain_priv;
 	struct psmx_fid_cntr *cntr_priv;
-	struct fid_wait *wait = NULL;
+	struct psmx_fid_wait *wait = NULL;
 	struct fi_wait_attr wait_attr;
 	int wait_is_local = 0;
 	int events;
@@ -414,8 +387,7 @@ int psmx_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
 
 	events = FI_CNTR_EVENTS_COMP;
 	flags = 0;
-	domain_priv = container_of(domain, struct psmx_fid_domain,
-				   util_domain.domain_fid);
+	domain_priv = container_of(domain, struct psmx_fid_domain, domain);
 
 	switch (attr->events) {
 	case FI_CNTR_EVENTS_COMP:
@@ -440,15 +412,15 @@ int psmx_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
 				"FI_WAIT_SET is specified but attr->wait_set is NULL\n");
 			return -FI_EINVAL;
 		}
-		wait = attr->wait_set;
+		wait = (struct psmx_fid_wait *)attr->wait_set;
 		break;
 
 	case FI_WAIT_FD:
 	case FI_WAIT_MUTEX_COND:
 		wait_attr.wait_obj = attr->wait_obj;
 		wait_attr.flags = 0;
-		err = fi_wait_open(&domain_priv->fabric->util_fabric.fabric_fid,
-				   &wait_attr, (struct fid_wait **)&wait);
+		err = psmx_wait_open(&domain_priv->fabric->fabric,
+				     &wait_attr, (struct fid_wait **)&wait);
 		if (err)
 			return err;
 		wait_is_local = 1;
@@ -467,31 +439,25 @@ int psmx_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
 		goto fail;
 	}
 
+	psmx_domain_acquire(domain_priv);
+
 	cntr_priv->domain = domain_priv;
 	cntr_priv->events = events;
-	if (wait)
-		cntr_priv->wait = container_of(wait, struct util_wait, wait_fid);
+	cntr_priv->wait = wait;
 	cntr_priv->wait_is_local = wait_is_local;
 	cntr_priv->flags = flags;
 	cntr_priv->cntr.fid.fclass = FI_CLASS_CNTR;
 	cntr_priv->cntr.fid.context = context;
 	cntr_priv->cntr.fid.ops = &psmx_fi_ops;
 	cntr_priv->cntr.ops = &psmx_cntr_ops;
-	ofi_atomic_initialize64(&cntr_priv->counter, 0);
-	ofi_atomic_initialize64(&cntr_priv->error_counter, 0);
 
 	pthread_mutex_init(&cntr_priv->trigger_lock, NULL);
 
-	if (wait)
-		fi_poll_add(&cntr_priv->wait->pollset->poll_fid,
-			    &cntr_priv->cntr.fid, 0);
-
-	psmx_domain_acquire(domain_priv);
 	*cntr = &cntr_priv->cntr;
 	return 0;
 fail:
 	if (wait && wait_is_local)
-		fi_close(&wait->fid);
+		fi_close(&wait->wait.fid);
 	return err;
 }
 

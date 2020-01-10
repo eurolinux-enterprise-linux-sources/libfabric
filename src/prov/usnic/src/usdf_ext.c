@@ -30,7 +30,7 @@
  * SOFTWARE.
  */
 
-#include "ofi.h"
+#include "fi.h"
 
 #include "usdf.h"
 #include "usnic_direct.h"

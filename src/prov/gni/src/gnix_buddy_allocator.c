@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2015-2016 Los Alamos National Security, LLC. All
  * rights reserved.
- * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
+ * Copyright (c) 2015-2016 Cray Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -131,7 +131,7 @@ static inline int __gnix_buddy_create_lists(gnix_buddy_alloc_handle_t
 	alloc_handle->lists = calloc(1, sizeof(struct dlist_entry) *
 				     alloc_handle->nlists);
 
-	if (OFI_UNLIKELY(!alloc_handle->lists)) {
+	if (unlikely(!alloc_handle->lists)) {
 		GNIX_WARN(FI_LOG_EP_CTRL,
 			  "Could not create buddy allocator lists.\n");
 		return -FI_ENOMEM;
@@ -143,8 +143,7 @@ static inline int __gnix_buddy_create_lists(gnix_buddy_alloc_handle_t
 
 	/* Insert free blocks of size max in sorted order into last list */
 	for (i = 0; i < alloc_handle->len / alloc_handle->max; i++) {
-		dlist_insert_tail((void *) ((uint8_t *) alloc_handle->base +
-					    offset),
+		dlist_insert_tail(alloc_handle->base + offset,
 				  alloc_handle->lists +
 				  alloc_handle->nlists - 1);
 		offset += alloc_handle->max;
@@ -172,8 +171,7 @@ static inline void __gnix_buddy_split(gnix_buddy_alloc_handle_t *alloc_handle,
 							alloc_handle->len,
 							MIN_BLOCK_SIZE));
 
-		dlist_insert_tail((void *) ((uint8_t *) tmp +
-					    OFFSET(MIN_BLOCK_SIZE, j - 1)),
+		dlist_insert_tail(tmp + OFFSET(MIN_BLOCK_SIZE, j - 1),
 				  alloc_handle->lists + j - 1);
 	}
 
@@ -245,14 +243,13 @@ int _gnix_buddy_allocator_create(void *base, uint32_t len, uint32_t max,
 {
 	char err_buf[256] = {0}, *error = NULL;
 	int fi_errno;
-	uint32_t size_check = len / MIN_BLOCK_SIZE * 2;
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
 	/* Ensure parameters are valid */
-	if (OFI_UNLIKELY(!base || !len || !max || max > len || !alloc_handle ||
-			 IS_NOT_POW_TWO(max) || (len % max) ||
-			 !size_check)) {
+	if (unlikely(!base || !len || !max || max > len || !alloc_handle ||
+		     IS_NOT_POW_TWO(max) || (len % max) ||
+		     !(len / MIN_BLOCK_SIZE * 2))) {
 
 		GNIX_WARN(FI_LOG_EP_CTRL,
 			  "Invalid parameter to _gnix_buddy_allocator_create."
@@ -262,7 +259,7 @@ int _gnix_buddy_allocator_create(void *base, uint32_t len, uint32_t max,
 
 	*alloc_handle = calloc(1, sizeof(gnix_buddy_alloc_handle_t));
 
-	if (OFI_UNLIKELY(!alloc_handle)) {
+	if (unlikely(!alloc_handle)) {
 		error = strerror_r(errno, err_buf, sizeof(err_buf));
 		GNIX_WARN(FI_LOG_EP_CTRL,
 			  "Could not create buddy allocator handle.\n",
@@ -285,7 +282,7 @@ int _gnix_buddy_allocator_create(void *base, uint32_t len, uint32_t max,
 	 * base. block.  The maximum number of bits used would be if max = len.
 	 */
 	if ((fi_errno = _gnix_alloc_bitmap(&alloc_handle[0]->bitmap,
-					   len / MIN_BLOCK_SIZE * 2, NULL))) {
+					   len / MIN_BLOCK_SIZE * 2))) {
 
 		free(&alloc_handle[0]->lists);
 		free(*alloc_handle);
@@ -298,7 +295,7 @@ int _gnix_buddy_allocator_destroy(gnix_buddy_alloc_handle_t *alloc_handle)
 {
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
-	if (OFI_UNLIKELY(!alloc_handle)) {
+	if (unlikely(!alloc_handle)) {
 		GNIX_WARN(FI_LOG_EP_CTRL,
 			  "Invalid parameter to _gnix_buddy_allocator_destroy."
 			  "\n");
@@ -330,8 +327,8 @@ int _gnix_buddy_alloc(gnix_buddy_alloc_handle_t *alloc_handle, void **ptr,
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
-	if (OFI_UNLIKELY(!alloc_handle || !ptr || !len ||
-			 len > alloc_handle->max)) {
+	if (unlikely(!alloc_handle || !ptr || !len ||
+		     len > alloc_handle->max)) {
 
 		GNIX_WARN(FI_LOG_EP_CTRL,
 			  "Invalid parameter to _gnix_buddy_alloc.\n");
@@ -368,9 +365,8 @@ int _gnix_buddy_free(gnix_buddy_alloc_handle_t *alloc_handle, void *ptr,
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
-	if (OFI_UNLIKELY(!alloc_handle || !len || len > alloc_handle->max ||
-			 ptr >= (void *) ((uint8_t *) alloc_handle->base +
-				      alloc_handle->len) ||
+	if (unlikely(!alloc_handle || !len || len > alloc_handle->max ||
+		     ptr >= alloc_handle->base + alloc_handle->len  ||
 		     ptr < alloc_handle->base)) {
 
 		GNIX_WARN(FI_LOG_EP_CTRL,

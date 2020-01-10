@@ -30,11 +30,13 @@
  * SOFTWARE.
  */
 
-#ifndef FI_ENDPOINT_H
-#define FI_ENDPOINT_H
+#ifndef _FI_ENDPOINT_H_
+#define _FI_ENDPOINT_H_
 
+#include <sys/socket.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
+#include <stddef.h>
 
 
 #ifdef __cplusplus
@@ -60,12 +62,6 @@ enum {
 enum {
 	FI_OPT_MIN_MULTI_RECV,		/* size_t */
 	FI_OPT_CM_DATA_SIZE,		/* size_t */
-	FI_OPT_BUFFERED_MIN,		/* size_t */
-	FI_OPT_BUFFERED_LIMIT,		/* size_t */
-	FI_OPT_SEND_BUF_SIZE,
-	FI_OPT_RECV_BUF_SIZE,
-	FI_OPT_TX_SIZE,
-	FI_OPT_RX_SIZE,
 };
 
 struct fi_ops_ep {
@@ -111,6 +107,7 @@ struct fi_ops_cm;
 struct fi_ops_rma;
 struct fi_ops_tagged;
 struct fi_ops_atomic;
+/* struct fi_ops_collectives; */
 
 /*
  * Calls which modify the properties of a endpoint (control, setopt, bind, ...)
@@ -211,17 +208,6 @@ fi_getopt(fid_t fid, int level, int optname,
 	return ep->ops->getopt(fid, level, optname, optval, optlen);
 }
 
-static inline int fi_ep_alias(struct fid_ep *ep, struct fid_ep **alias_ep,
-			      uint64_t flags)
-{
-	int ret;
-	struct fid *fid;
-	ret = fi_alias(&ep->fid, &fid, flags);
-	if (!ret)
-		*alias_ep = container_of(fid, struct fid_ep, fid);
-	return ret;
-}
-
 static inline int
 fi_tx_context(struct fid_ep *ep, int index, struct fi_tx_attr *attr,
 	      struct fid_ep **tx_ep, void *context)
@@ -236,13 +222,13 @@ fi_rx_context(struct fid_ep *ep, int index, struct fi_rx_attr *attr,
 	return ep->ops->rx_ctx(ep, index, attr, rx_ep, context);
 }
 
-static inline FI_DEPRECATED_FUNC ssize_t
+static inline ssize_t
 fi_rx_size_left(struct fid_ep *ep)
 {
 	return ep->ops->rx_size_left(ep);
 }
 
-static inline FI_DEPRECATED_FUNC ssize_t
+static inline ssize_t
 fi_tx_size_left(struct fid_ep *ep)
 {
 	return ep->ops->tx_size_left(ep);
@@ -328,4 +314,4 @@ fi_injectdata(struct fid_ep *ep, const void *buf, size_t len,
 }
 #endif
 
-#endif /* FI_ENDPOINT_H */
+#endif /* _FI_ENDPOINT_H_ */

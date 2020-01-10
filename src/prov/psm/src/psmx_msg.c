@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -114,8 +114,6 @@ ssize_t _psmx_recv(struct fid_ep *ep, void *buf, size_t len,
 			req->context = fi_context; 
 			PSMX_CTXT_TYPE(fi_context) = PSMX_MULTI_RECV_CONTEXT;
 			PSMX_CTXT_USER(fi_context) = req;
-			if (len > PSMX_MAX_MSG_SIZE)
-				len = PSMX_MAX_MSG_SIZE;
 		} else {
 			PSMX_CTXT_TYPE(fi_context) = PSMX_RECV_CONTEXT;
 			PSMX_CTXT_USER(fi_context) = buf;
@@ -142,7 +140,7 @@ static ssize_t psmx_recv(struct fid_ep *ep, void *buf, size_t len, void *desc,
 
 	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
 
-	return _psmx_recv(ep, buf, len, desc, src_addr, context, ep_priv->rx_flags);
+	return _psmx_recv(ep, buf, len, desc, src_addr, context, ep_priv->flags);
 }
 
 static ssize_t psmx_recvmsg(struct fid_ep *ep, const struct fi_msg *msg, uint64_t flags)
@@ -154,7 +152,7 @@ static ssize_t psmx_recvmsg(struct fid_ep *ep, const struct fi_msg *msg, uint64_
 		return -FI_EINVAL;
 
 	if (msg->iov_count > 1) {
-		return -FI_ENOSYS;
+		return -FI_EINVAL;
 	} else if (msg->iov_count) {
 		buf = msg->msg_iov[0].iov_base;
 		len = msg->msg_iov[0].iov_len;
@@ -178,7 +176,7 @@ static ssize_t psmx_recvv(struct fid_ep *ep, const struct iovec *iov, void **des
 		return -FI_EINVAL;
 
 	if (count > 1) {
-		return -FI_ENOSYS;
+		return -FI_EINVAL;
 	} else if (count) {
 		buf = iov[0].iov_base;
 		len = iov[0].iov_len;
@@ -310,7 +308,7 @@ static ssize_t psmx_send(struct fid_ep *ep, const void *buf, size_t len,
 
 	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
 
-	return _psmx_send(ep, buf, len, desc, dest_addr, context, ep_priv->tx_flags);
+	return _psmx_send(ep, buf, len, desc, dest_addr, context, ep_priv->flags);
 }
 
 static ssize_t psmx_sendmsg(struct fid_ep *ep, const struct fi_msg *msg, uint64_t flags)
@@ -322,7 +320,7 @@ static ssize_t psmx_sendmsg(struct fid_ep *ep, const struct fi_msg *msg, uint64_
 		return -FI_EINVAL;
 
 	if (msg->iov_count > 1) {
-		return -FI_ENOSYS;
+		return -FI_EINVAL;
 	} else if (msg->iov_count) {
 		buf = msg->msg_iov[0].iov_base;
 		len = msg->msg_iov[0].iov_len;
@@ -346,7 +344,7 @@ static ssize_t psmx_sendv(struct fid_ep *ep, const struct iovec *iov, void **des
 		return -FI_EINVAL;
 
 	if (count > 1) {
-		return -FI_ENOSYS;
+		return -FI_EINVAL;
 	} else if (count) {
 		buf = iov[0].iov_base;
 		len = iov[0].iov_len;
@@ -366,7 +364,7 @@ static ssize_t psmx_inject(struct fid_ep *ep, const void *buf, size_t len,
 	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
 
 	return _psmx_send(ep, buf, len, NULL, dest_addr, NULL,
-			  ep_priv->tx_flags | FI_INJECT | PSMX_NO_COMPLETION);
+			  ep_priv->flags | FI_INJECT | PSMX_NO_COMPLETION);
 }
 
 struct fi_ops_msg psmx_msg_ops = {

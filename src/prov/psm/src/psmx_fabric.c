@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -34,31 +34,52 @@
 
 struct psmx_fid_fabric *psmx_active_fabric = NULL;
 
-static int psmx_fabric_close(fid_t fid)
+void psmx_fabric_release(struct psmx_fid_fabric *fabric)
 {
-	struct psmx_fid_fabric *fabric;
+	void *exit_code;
+	int ret;
 
-	fabric = container_of(fid, struct psmx_fid_fabric,
-			      util_fabric.fabric_fid.fid);
+	FI_INFO(&psmx_prov, FI_LOG_CORE, "refcnt=%d\n", fabric->refcnt);
 
-	FI_INFO(&psmx_prov, FI_LOG_CORE, "refcnt=%d\n",
-		ofi_atomic_get32(&fabric->util_fabric.ref));
+	if (--fabric->refcnt)
+		return;
 
-	if (psmx_env.name_server)
-		ofi_ns_stop_server(&fabric->name_server);
-
-	psmx_fabric_release(fabric);
-
-	if (ofi_fabric_close(&fabric->util_fabric))
-		return 0;
-
+	if (psmx_env.name_server &&
+	    !pthread_equal(fabric->name_server_thread, pthread_self())) {
+		ret = pthread_cancel(fabric->name_server_thread);
+		if (ret) {
+			FI_INFO(&psmx_prov, FI_LOG_CORE,
+				"pthread_cancel returns %d\n", ret);
+		}
+		ret = pthread_join(fabric->name_server_thread, &exit_code);
+		if (ret) {
+			FI_INFO(&psmx_prov, FI_LOG_CORE,
+				"pthread_join returns %d\n", ret);
+		} else {
+			FI_INFO(&psmx_prov, FI_LOG_CORE,
+				"name server thread exited with code %ld (%s)\n",
+				(uintptr_t)exit_code,
+				(exit_code == PTHREAD_CANCELED) ? "PTHREAD_CANCELED" : "?");
+		}
+	}
 	if (fabric->active_domain) {
 		FI_WARN(&psmx_prov, FI_LOG_CORE, "forced closing of active_domain\n");
-		fi_close(&fabric->active_domain->util_domain.domain_fid.fid);
+		fi_close(&fabric->active_domain->domain.fid);
 	}
 	assert(fabric == psmx_active_fabric);
 	psmx_active_fabric = NULL;
 	free(fabric);
+}
+
+static int psmx_fabric_close(fid_t fid)
+{
+	struct psmx_fid_fabric *fabric;
+
+	FI_INFO(&psmx_prov, FI_LOG_CORE, "\n");
+
+	fabric = container_of(fid, struct psmx_fid_fabric, fabric.fid);
+
+	psmx_fabric_release(fabric);
 
 	return 0;
 }
@@ -72,14 +93,9 @@ static struct fi_ops_fabric psmx_fabric_ops = {
 	.size = sizeof(struct fi_ops_fabric),
 	.domain = psmx_domain_open,
 	.passive_ep = fi_no_passive_ep,
-	.eq_open = ofi_eq_create,
+	.eq_open = psmx_eq_open,
 	.wait_open = psmx_wait_open,
-	.trywait = psmx_wait_trywait,
-};
-
-static struct fi_fabric_attr psmx_fabric_attr = {
-	.name = PSMX_FABRIC_NAME,
-	.prov_version = PSMX_VERSION,
+	.trywait = fi_no_trywait
 };
 
 int psmx_fabric(struct fi_fabric_attr *attr,
@@ -95,7 +111,7 @@ int psmx_fabric(struct fi_fabric_attr *attr,
 
 	if (psmx_active_fabric) {
 		psmx_fabric_acquire(psmx_active_fabric);
-		*fabric = &psmx_active_fabric->util_fabric.fabric_fid;
+		*fabric = &psmx_active_fabric->fabric;
 		return 0;
 	}
 
@@ -103,38 +119,27 @@ int psmx_fabric(struct fi_fabric_attr *attr,
 	if (!fabric_priv)
 		return -FI_ENOMEM;
 
+	fabric_priv->fabric.fid.fclass = FI_CLASS_FABRIC;
+	fabric_priv->fabric.fid.context = context;
+	fabric_priv->fabric.fid.ops = &psmx_fabric_fi_ops;
+	fabric_priv->fabric.ops = &psmx_fabric_ops;
+
 	psmx_get_uuid(fabric_priv->uuid);
+
 	if (psmx_env.name_server) {
-		fabric_priv->name_server.port = psmx_uuid_to_port(fabric_priv->uuid);
-		fabric_priv->name_server.name_len = sizeof(psm_epid_t);
-		fabric_priv->name_server.service_len = sizeof(int);
-		fabric_priv->name_server.service_cmp = psmx_ns_service_cmp;
-		fabric_priv->name_server.is_service_wildcard = psmx_ns_is_service_wildcard;
-
-		ofi_ns_init(&fabric_priv->name_server);
-		ofi_ns_start_server(&fabric_priv->name_server);
+		ret = pthread_create(&fabric_priv->name_server_thread, NULL,
+				     psmx_name_server, (void *)fabric_priv);
+		if (ret) {
+			FI_INFO(&psmx_prov, FI_LOG_CORE, "pthread_create returns %d\n", ret);
+			/* use the main thread's ID as invalid value for the new thread */
+			fabric_priv->name_server_thread = pthread_self();
+		}
 	}
-
-	ret = ofi_fabric_init(&psmx_prov, &psmx_fabric_attr, attr,
-			      &fabric_priv->util_fabric, context);
-	if (ret) {
-		FI_INFO(&psmx_prov, FI_LOG_CORE, "ofi_fabric_init returns %d\n", ret);
-		if (psmx_env.name_server)
-			ofi_ns_stop_server(&fabric_priv->name_server);
-		free(fabric_priv);
-		return ret;
-	}
-
-	/* fclass & context initialzied in ofi_fabric_init */
-	fabric_priv->util_fabric.fabric_fid.fid.ops = &psmx_fabric_fi_ops;
-	fabric_priv->util_fabric.fabric_fid.ops = &psmx_fabric_ops;
 
 	psmx_query_mpi();
 
-	/* take the reference to count for multiple fabric open calls */
-	psmx_fabric_acquire(fabric_priv);
-
-	*fabric = &fabric_priv->util_fabric.fabric_fid;
+	fabric_priv->refcnt = 1;
+	*fabric = &fabric_priv->fabric;
 	psmx_active_fabric = fabric_priv;
 
 	return 0;

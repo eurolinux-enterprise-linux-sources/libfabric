@@ -1,7 +1,6 @@
 /*
  * Copyright (c) 2015-2016 Los Alamos National Security, LLC.
  *                         All rights reserved.
- * Copyright (c) 2016 Cray Inc.  All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -59,7 +58,7 @@ typedef enum gnix_vec_lock {
 	GNIX_VEC_LOCKED,
 } gnix_vec_lock_e;
 
-typedef uint32_t gnix_vec_index_t;
+typedef uint64_t gnix_vec_index_t;
 typedef void * gnix_vec_entry_t;
 
 /**
@@ -72,11 +71,11 @@ typedef void * gnix_vec_entry_t;
  * @var creator			fn required to properly alloc the vector element
  */
 typedef struct gnix_vec_attr {
-	uint32_t vec_initial_size;
-	uint32_t cur_size;
-	uint32_t vec_maximum_size;
+	uint64_t vec_initial_size;
+	uint64_t cur_size;
+	uint64_t vec_maximum_size;
 
-	uint32_t vec_increase_step;
+	uint64_t vec_increase_step;
 
 	gnix_vec_increase_e vec_increase_type;
 
@@ -85,49 +84,35 @@ typedef struct gnix_vec_attr {
 
 struct gnix_vector;
 
-struct gnix_vector_iter {
-	struct gnix_vector *vec;
-	uint32_t cur_idx;
-};
-
-#define GNIX_VECTOR_ITERATOR(_vec, _iter)	\
-	struct gnix_vector_iter _iter = {	\
-		.vec = (_vec),			\
-		.cur_idx = 0,			\
-	}
-
-/* Returns the current index of the iterator */
-#define GNIX_VECTOR_ITERATOR_IDX(_iter)	((_iter).cur_idx - 1)
-
 /**
  * Vector operations
  *
+ * @var insert_first	Insert an entry into first index of the vector.
  * @var insert_last	Insert an entry into the last index of the vector.
  * @var insert_at	Insert an entry into the vector at the given index.
  *
+ * @var remove_first	Removes the first element from the vector.
  * @var remove_last	Removes the last element from the vector.
  * @var remove_at	Removes the element at index from the vector.
  *
+ * @var first		Return the first element of the vector.
  * @var last		Return the last element of the vector.
  * @var at		Return the element at the specified index.
- *
- * @var iter_next	Return the element at the current index and move them
- *			index to the next element.
  */
 typedef struct gnix_vector_ops {
-	int (*resize)(struct gnix_vector *, uint32_t);
-
+	int (*insert_first)(struct gnix_vector *, gnix_vec_entry_t *);
 	int (*insert_last)(struct gnix_vector *, gnix_vec_entry_t *);
 	int (*insert_at)(struct gnix_vector *, gnix_vec_entry_t *,
 			 gnix_vec_index_t);
 
+	int (*remove_first)(struct gnix_vector *);
 	int (*remove_last)(struct gnix_vector *);
 	int (*remove_at)(struct gnix_vector *, gnix_vec_index_t);
 
+	int (*first)(struct gnix_vector *, void **);
 	int (*last)(struct gnix_vector *, void **);
 	int (*at)(struct gnix_vector *, void **, gnix_vec_index_t);
-
-	gnix_vec_entry_t *(*iter_next)(struct gnix_vector_iter *);
+	/* TODO: void *(*iter_next)(struct gnix_vector_iter *); */
 } gnix_vector_ops_t;
 
 /**
@@ -175,9 +160,6 @@ int _gnix_vec_init(struct gnix_vector *vec, gnix_vec_attr_t *attr);
  */
 int _gnix_vec_close(gnix_vector_t *vec);
 
-/*******************************************************************************
- * INLINE OPS FNS
- ******************************************************************************/
 /**
  * Resize the vector to size.
  *
@@ -190,19 +172,12 @@ int _gnix_vec_close(gnix_vector_t *vec);
  *			than the maximum vector size
  * @return -FI_ENOMEM	Upon running out of memory
  */
-static inline int _gnix_vec_resize(gnix_vector_t *vec, uint32_t size)
-{
-	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
+int _gnix_vec_resize(gnix_vector_t *vec, uint64_t size);
 
-	if (OFI_UNLIKELY(!vec)) {
-		GNIX_WARN(FI_LOG_EP_CTRL, "Invalid parameter to "
-			  "_gnix_vec_resize.\n");
-		return -FI_EINVAL;
-	} else {
-		return vec->ops->resize(vec, size);
-	}
-}
 
+/*******************************************************************************
+ * INLINE OPS FNS
+ ******************************************************************************/
 /**
  * Get the element at index in the vector.
  *
@@ -214,19 +189,7 @@ static inline int _gnix_vec_resize(gnix_vector_t *vec, uint32_t size)
  * @return -FI_EINVAL	Upon passing a NULL or dead vector
  * @return -FI_ECANCLED Upon attempting to get an empty element
  */
-static inline int _gnix_vec_at(gnix_vector_t *vec, void **element,
-			       gnix_vec_index_t index)
-{
-	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
-
-	if (OFI_UNLIKELY(!vec || !element)) {
-		GNIX_WARN(FI_LOG_EP_CTRL, "Invalid parameter to "
-			  "_gnix_vec_at\n");
-		return -FI_EINVAL;
-	} else {
-		return vec->ops->at(vec, element, index);
-	}
-}
+int _gnix_vec_at(gnix_vector_t *vec, void **element, gnix_vec_index_t index);
 
 /**
  * Get the first element in the vector.
@@ -238,18 +201,7 @@ static inline int _gnix_vec_at(gnix_vector_t *vec, void **element,
  * @return -FI_EINVAL	Upon passing a NULL or dead vector
  * @return -FI_ECANCLED Upon attempting to get an empty element
  */
-static inline int _gnix_vec_last(gnix_vector_t *vec, void **element)
-{
-	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
-
-	if (OFI_UNLIKELY(!vec || !element)) {
-		GNIX_WARN(FI_LOG_EP_CTRL, "Invalid parameter to "
-			  "_gnix_vec_last\n");
-		return -FI_EINVAL;
-	} else {
-		return vec->ops->last(vec, element);
-	}
-}
+int _gnix_vec_last(gnix_vector_t *vec, void **element);
 
 /**
  * Get the first element in the vector.
@@ -261,10 +213,7 @@ static inline int _gnix_vec_last(gnix_vector_t *vec, void **element)
  * @return -FI_EINVAL	Upon passing a NULL or dead vector
  * @return -FI_ECANCLED Upon attempting to get an empty element
  */
-static inline int _gnix_vec_first(gnix_vector_t *vec, void **element)
-{
-	return _gnix_vec_at(vec, element, 0);
-}
+int _gnix_vec_first(gnix_vector_t *vec, void **element);
 
 /**
  * Removes the element at index from the vector.  Note that
@@ -278,19 +227,7 @@ static inline int _gnix_vec_first(gnix_vector_t *vec, void **element)
  * @return -FI_EINVAL	 Upon passing a dead vector
  * @return -FI_ECANCELED Upon attempting to remove an empty entry
  */
-static inline int _gnix_vec_remove_at(gnix_vector_t *vec,
-				      gnix_vec_index_t index)
-{
-	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
-
-	if (OFI_UNLIKELY(!vec)) {
-		GNIX_WARN(FI_LOG_EP_CTRL, "Invalid parameter to "
-			  "_gnix_vec_remove_at\n");
-		return -FI_EINVAL;
-	} else {
-		return vec->ops->remove_at(vec, index);
-	}
-}
+int _gnix_vec_remove_at(gnix_vector_t *vec, gnix_vec_index_t index);
 
 /**
  * Removes the last element from the vector.  Note that
@@ -303,18 +240,7 @@ static inline int _gnix_vec_remove_at(gnix_vector_t *vec,
  * @return -FI_EINVAL	 Upon passing a dead entry
  * @return -FI_ECANCELED Upon attempting to remove an empty entry
  */
-static inline int _gnix_vec_remove_last(gnix_vector_t *vec)
-{
-	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
-
-	if (OFI_UNLIKELY(!vec)) {
-		GNIX_WARN(FI_LOG_EP_CTRL, "Invalid parameter to "
-			  "_gnix_vec_remove_at\n");
-		return -FI_EINVAL;
-	} else {
-		return vec->ops->remove_last(vec);
-	}
-}
+int _gnix_vec_remove_last(gnix_vector_t *vec);
 
 /**
  * Removes the first element from the vector.  Note that
@@ -327,10 +253,7 @@ static inline int _gnix_vec_remove_last(gnix_vector_t *vec)
  * @return -FI_EINVAL	 Upon passing a dead entry
  * @return -FI_ECANCELED Upon attempting to remove an empty entry
  */
-static inline int _gnix_vec_remove_first(gnix_vector_t *vec)
-{
-	return _gnix_vec_remove_at(vec, 0);
-}
+int _gnix_vec_remove_first(gnix_vector_t *vec);
 
 /**
  * Inserts an entry into the vector at the given index. If the current size
@@ -349,18 +272,8 @@ static inline int _gnix_vec_remove_first(gnix_vector_t *vec)
  * @return -FI_ECANCELED Upon an existing non-empty entry being found at index
  * 			 or reaching the maximum vector size.
  */
-static inline int _gnix_vec_insert_at(gnix_vector_t *vec,
-				      gnix_vec_entry_t *entry,
-				      gnix_vec_index_t index)
-{
-	if (OFI_UNLIKELY(!vec || !entry)) {
-		GNIX_WARN(FI_LOG_EP_CTRL, "Invalid parameter to "
-			  "_gnix_vec_insert_at\n");
-		return -FI_EINVAL;
-	} else {
-		return vec->ops->insert_at(vec, entry, index);
-	}
-}
+int _gnix_vec_insert_at(gnix_vector_t *vec, gnix_vec_entry_t *entry,
+				      gnix_vec_index_t index);
 
 /**
  * Inserts an entry into the last index of the vector. If the entry at the
@@ -375,17 +288,7 @@ static inline int _gnix_vec_insert_at(gnix_vector_t *vec,
  * @return -FI_ECANCELED Upon an existing non-empty entry being found at the
  *			 last index
  */
-static inline int _gnix_vec_insert_last(gnix_vector_t *vec,
-					gnix_vec_entry_t *entry)
-{
-	if (OFI_UNLIKELY(!vec || !entry)) {
-		GNIX_WARN(FI_LOG_EP_CTRL, "Invalid parameter to "
-			  "_gnix_vec_insert_last\n");
-		return -FI_EINVAL;
-	} else {
-		return vec->ops->insert_last(vec, entry);
-	}
-}
+int _gnix_vec_insert_last(gnix_vector_t *vec, gnix_vec_entry_t *entry);
 
 /**
  * Inserts an entry into the first index of the vector. If the entry at the
@@ -399,29 +302,6 @@ static inline int _gnix_vec_insert_last(gnix_vector_t *vec,
  * 			 entry
  * @return -FI_ECANCELED Upon an existing non-empty entry being found at index 0
  */
-static inline int _gnix_vec_insert_first(gnix_vector_t *vec,
-					 gnix_vec_entry_t *entry)
-{
-	return _gnix_vec_insert_at(vec, entry, 0);
-}
-
-/**
- * Return the current element in the vector iterator and move
- * the iterator to the next element.
- *
- * @param iter    pointer to the vector iterator
- * @return        pointer to current element in the vector
- */
-static inline
-gnix_vec_entry_t *_gnix_vec_iterator_next(struct gnix_vector_iter *iter)
-{
-	if (iter == NULL) {
-		GNIX_WARN(FI_LOG_EP_DATA, "Invalid parameter to"
-			  "_gnix_vec_iterator_next\n");
-		return NULL;
-	} else {
-		return iter->vec->ops->iter_next(iter);
-	}
-}
+int _gnix_vec_insert_first(gnix_vector_t *vec, gnix_vec_entry_t *entry);
 
 #endif /* GNIX_VECTOR_H_ */

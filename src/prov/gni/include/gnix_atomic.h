@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2016 Cray Inc.  All rights reserved.
+ * Copyright (c) 2015 Cray Inc.  All rights reserved.
  * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -34,9 +34,6 @@
 #ifndef _GNIX_ATOMIC_H_
 #define _GNIX_ATOMIC_H_
 
-#define GNIX_ATOMIC_WRITE_FLAGS_DEF	(FI_ATOMIC | FI_WRITE)
-#define GNIX_ATOMIC_READ_FLAGS_DEF	(FI_ATOMIC | FI_READ)
-
 int _gnix_atomic_cmd(enum fi_datatype dt, enum fi_op op,
 		     enum gnix_fab_req_type fr_type);
 ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
@@ -49,9 +46,6 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 		     void **result_desc,
 		     size_t result_count,
 		     uint64_t flags);
-
-/* SMSG callback for AMO remote counter control message. */
-int __smsg_amo_cntr(void *data, void *msg);
 
 #endif /* _GNIX_ATOMIC_H_ */
 

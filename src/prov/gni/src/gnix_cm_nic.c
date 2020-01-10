@@ -1,7 +1,6 @@
 /*
- * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
- *                         All rights reserved.
- * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
+ * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
+ * Copyright (c) 2015 Cray Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -42,16 +41,13 @@
 #include "gnix.h"
 #include "gnix_datagram.h"
 #include "gnix_cm_nic.h"
-#include "gnix_cm.h"
 #include "gnix_nic.h"
 #include "gnix_hashtable.h"
+#include "gnix_av.h"
 
 
 #define GNIX_CM_NIC_BND_TAG (100)
 #define GNIX_CM_NIC_WC_TAG (99)
-
-DLIST_HEAD(gnix_cm_nic_list);
-pthread_mutex_t gnix_cm_nic_list_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*******************************************************************************
  * Helper functions
@@ -159,12 +155,6 @@ static int __process_datagram(struct gnix_datagram *dgram,
 				fi_strerror(-ret));
 			goto err;
 		}
-
-		ret = _gnix_cm_nic_progress(cm_nic);
-		if (ret != FI_SUCCESS)
-			GNIX_WARN(FI_LOG_EP_CTRL,
-				  "_gnix_cm_nic_progress returned %s\n",
-				  fi_strerror(-ret));
 	}
 
 	/*
@@ -198,82 +188,43 @@ err:
 	return ret;
 }
 
-static bool __gnix_cm_nic_timeout_needed(void *data)
-{
-	struct gnix_cm_nic *cm_nic = (struct gnix_cm_nic *)data;
-	return _gnix_cm_nic_need_progress(cm_nic);
-}
-
-static void __gnix_cm_nic_timeout_progress(void *data)
-{
-	int ret;
-	struct gnix_cm_nic *cm_nic = (struct gnix_cm_nic *)data;
-	ret = _gnix_cm_nic_progress(cm_nic);
-	if (ret != FI_SUCCESS)
-		GNIX_WARN(FI_LOG_EP_CTRL,
-			"_gnix_cm_nic_progress returned %s\n",
-			fi_strerror(-ret));
-}
-
-
 /*******************************************************************************
  * Internal API functions
  ******************************************************************************/
 
-int _gnix_cm_nic_create_cdm_id(struct gnix_fid_domain *domain, uint32_t *id)
+int _gnix_cm_nic_create_cdm_id(struct gnix_fid_domain *domain, uint32_t seed,
+			       uint32_t *id)
 {
 	uint32_t cdm_id;
-	int v;
-
-	if (*id != GNIX_CREATE_CDM_ID) {
-		return FI_SUCCESS;
-	}
 
 	/*
-	 * generate a cdm_id, use the 16 LSB of base_id from domain
-	 * with 16 MSBs being obtained from atomic increment of
-	 * a local variable.
+	 * the format of the cdm_id here is governed
+	 * by the fact that currently the cdm_id_seed
+	 * is the pid of the process/thread that created
+	 * the domain.  So the most likely bits to be
+	 * unique using this method is the 16 LSBs
+	 * hence these are included, upper 16 MSBs are
+	 * masked off and overwritten by the supplied
+	 * seed value.
 	 */
-
-	v = ofi_atomic_inc32(&gnix_id_counter);
-
-	cdm_id = ((domain->cdm_id_seed & 0xFFF) << 12) | v;
+	cdm_id = (domain->cdm_id_seed & 0x0000FFFF) |
+			((uint32_t)seed << 16);
 	*id = cdm_id;
 	return FI_SUCCESS;
 }
 
-/**
- * This function will return a block of id's starting at id through nids
- *
- * @param domain  gnix domain
- * @param nids    number of id's
- * @param id      if -1 return an id based on the counter and seed
- */
-int _gnix_get_new_cdm_id_set(struct gnix_fid_domain *domain, int nids,
-			     uint32_t *id)
+int _gnix_cm_nic_get_cdm_seed_set(struct gnix_fid_domain *domain, int nseeds,
+				  uint32_t *seed)
 {
-	uint32_t cdm_id;
-	int v;
+	uint32_t seed_base;
 
-	if (*id == -1) {
-		v = ofi_atomic_add32(&gnix_id_counter, nids);
-		cdm_id = ((domain->cdm_id_seed & 0xFFF) << 12) | v;
-		*id = cdm_id;
-	} else {
-		/*
-		 * asking for a block starting at a chosen base
-		 * TODO: sanity check that requested base is reasonable
-		 */
-		if (*id <= ofi_atomic_get32(&gnix_id_counter))
-			return -FI_ENOSPC;
-		ofi_atomic_set32(&gnix_id_counter, (*(int *)id + nids));
-	}
+	seed_base = atomic_add(&gnix_id_counter, nseeds);
+	*seed = seed_base;
 	return FI_SUCCESS;
 }
 
-int _gnix_cm_nic_progress(void *arg)
+int _gnix_cm_nic_progress(struct gnix_cm_nic *cm_nic)
 {
-	struct gnix_cm_nic *cm_nic = (struct gnix_cm_nic *)arg;
 	int ret = FI_SUCCESS;
 	int complete;
 	struct gnix_work_req *p = NULL;
@@ -285,17 +236,13 @@ int _gnix_cm_nic_progress(void *arg)
 	 */
 
 	if (cm_nic->ctrl_progress == FI_PROGRESS_MANUAL) {
-		++cm_nic->poll_cnt;
-		if (((cm_nic->poll_cnt % 512) == 0)  ||
-			!dlist_empty(&cm_nic->cm_nic_wq)) {
-			ret = _gnix_dgram_poll(cm_nic->dgram_hndl,
-						  GNIX_DGRAM_NOBLOCK);
-			if (ret != FI_SUCCESS) {
-				GNIX_WARN(FI_LOG_EP_CTRL,
-					"_gnix_dgram_poll returned %s\n",
-					  fi_strerror(-ret));
-					goto err;
-			}
+		ret = _gnix_dgram_poll(cm_nic->dgram_hndl,
+					  GNIX_DGRAM_NOBLOCK);
+		if (ret != FI_SUCCESS) {
+			GNIX_WARN(FI_LOG_EP_CTRL,
+				"_gnix_dgram_poll returned %s\n",
+				  fi_strerror(-ret));
+				goto err;
 		}
 	}
 
@@ -345,8 +292,6 @@ check_again:
 					  fi_strerror(-ret));
 				goto err;
 			}
-		} else {
-			free(p);
 		}
 		goto check_again;
 	} else {
@@ -366,9 +311,8 @@ static void  __cm_nic_destruct(void *obj)
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
-	pthread_mutex_lock(&gnix_cm_nic_list_lock);
-	dlist_remove(&cm_nic->cm_nic_list);
-	pthread_mutex_unlock(&gnix_cm_nic_list_lock);
+	if (cm_nic->nic != NULL)
+		_gnix_ref_put(cm_nic->nic);
 
 	if (cm_nic->dgram_hndl != NULL) {
 		ret = _gnix_dgram_hndl_free(cm_nic->dgram_hndl);
@@ -388,34 +332,7 @@ static void  __cm_nic_destruct(void *obj)
 		cm_nic->addr_to_ep_ht = NULL;
 	}
 
-	if (cm_nic->nic != NULL) {
-		_gnix_ref_put(cm_nic->nic);
-		cm_nic->nic = NULL;
-	}
-
-	cm_nic->domain->cm_nic = NULL;
 	free(cm_nic);
-}
-
-static int __gnix_cm_nic_intra_progress_fn(void *data, int *complete_ptr)
-{
-	struct gnix_datagram *dgram;
-	struct gnix_cm_nic *cm_nic;
-	int ret;
-
-	GNIX_INFO(FI_LOG_EP_CTRL, "\n");
-
-	dgram = (struct gnix_datagram *)data;
-	cm_nic = (struct gnix_cm_nic *)dgram->cache;
-	ret = __process_datagram(dgram,
-				 cm_nic->my_name.gnix_addr,
-				 GNI_POST_COMPLETED);
-	if (ret == FI_SUCCESS) {
-		GNIX_INFO(FI_LOG_EP_CTRL, "Intra-CM NIC dgram completed\n");
-		*complete_ptr = 1;
-	}
-
-	return FI_SUCCESS;
 }
 
 int _gnix_cm_nic_send(struct gnix_cm_nic *cm_nic,
@@ -426,7 +343,6 @@ int _gnix_cm_nic_send(struct gnix_cm_nic *cm_nic,
 	struct gnix_datagram *dgram = NULL;
 	ssize_t  __attribute__((unused)) plen;
 	uint8_t tag;
-	struct gnix_work_req *work_req;
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
@@ -457,39 +373,10 @@ int _gnix_cm_nic_send(struct gnix_cm_nic *cm_nic,
 				   sbuf, len);
 	assert (plen == len);
 
-	/* If connecting with the same CM NIC, skip datagram exchange.  The
-	 * caller could be holding an endpoint lock, so schedule connection
-	 * completion for later. */
-	if (GNIX_ADDR_EQUAL(target_addr, cm_nic->my_name.gnix_addr)) {
-		char tmp_buf[GNIX_CM_NIC_MAX_MSG_SIZE];
-
-		/* Pack output buffer with input data. */
-		_gnix_dgram_unpack_buf(dgram, GNIX_DGRAM_IN_BUF, tmp_buf,
-				       GNIX_CM_NIC_MAX_MSG_SIZE);
-		_gnix_dgram_pack_buf(dgram, GNIX_DGRAM_OUT_BUF, tmp_buf,
-				       GNIX_CM_NIC_MAX_MSG_SIZE);
-
-		work_req = calloc(1, sizeof(*work_req));
-		if (work_req == NULL) {
-			_gnix_dgram_free(dgram);
-			return -FI_ENOMEM;
-		}
-
-		work_req->progress_fn = __gnix_cm_nic_intra_progress_fn;
-		work_req->data = dgram;
-		work_req->completer_fn = NULL;
-
-		fastlock_acquire(&cm_nic->wq_lock);
-		dlist_insert_before(&work_req->list, &cm_nic->cm_nic_wq);
-		fastlock_release(&cm_nic->wq_lock);
-
-		GNIX_INFO(FI_LOG_EP_CTRL, "Initiated intra-CM NIC connect\n");
-	} else {
-		ret = _gnix_dgram_bnd_post(dgram);
-		if (ret == -FI_EBUSY) {
-			ret = -FI_EAGAIN;
-			_gnix_dgram_free(dgram);
-		}
+	ret = _gnix_dgram_bnd_post(dgram);
+	if (ret == -FI_EBUSY) {
+		ret = -FI_EAGAIN;
+		_gnix_dgram_free(dgram);
 	}
 
 exit:
@@ -525,15 +412,8 @@ int _gnix_cm_nic_enable(struct gnix_cm_nic *cm_nic)
 	if (cm_nic == NULL)
 		return -FI_EINVAL;
 
-	if (cm_nic->domain == NULL) {
-		GNIX_FATAL(FI_LOG_EP_CTRL, "domain is NULL\n");
-	}
-
-	if (cm_nic->domain->fabric == NULL) {
-		GNIX_FATAL(FI_LOG_EP_CTRL, "fabric is NULL\n");
-	}
-
-	fabric = cm_nic->domain->fabric;
+	fabric = cm_nic->fabric;
+	assert(fabric != NULL);
 
 	assert(cm_nic->dgram_hndl != NULL);
 
@@ -593,18 +473,15 @@ int _gnix_cm_nic_free(struct gnix_cm_nic *cm_nic)
 
 int _gnix_cm_nic_alloc(struct gnix_fid_domain *domain,
 		       struct fi_info *info,
-		       uint32_t cdm_id,
-			   struct gnix_auth_key *auth_key,
 		       struct gnix_cm_nic **cm_nic_ptr)
 {
 	int ret = FI_SUCCESS;
 	struct gnix_cm_nic *cm_nic = NULL;
+	uint32_t cdm_id, seed;
 	gnix_hashtable_attr_t gnix_ht_attr = {0};
+	struct gnix_ep_name name;
 	uint32_t name_type = GNIX_EPN_TYPE_UNBOUND;
 	struct gnix_nic_attr nic_attr = {0};
-	struct gnix_ep_name ep_name;
-	struct gnix_dgram_hndl_attr dgram_hndl_attr = {0};
-	struct gnix_dgram_hndl_attr *dgram_hndl_attr_ptr = NULL;
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
@@ -618,14 +495,37 @@ int _gnix_cm_nic_alloc(struct gnix_fid_domain *domain,
 	 * and just use it.
 	 */
 
-	if (info->src_addr) {
-		/*TODO (optimization): strchr to name_type and strtol */
-		_gnix_get_ep_name(info->src_addr, 0, &ep_name, domain);
-		name_type = ep_name.name_type;
+	if (info->src_addr &&
+	    info->src_addrlen == GNIX_AV_MAX_STR_ADDR_LEN) {
+		gnix_av_straddr_to_ep_name(info->src_addr, &name);
+		if (name.name_type == GNIX_EPN_TYPE_BOUND) {
+			/* EP name includes user specified service/port */
+			cdm_id = name.gnix_addr.cdm_id;
+			name_type = name.name_type;
+		}
+	}
+
+	if (name_type == GNIX_EPN_TYPE_UNBOUND) {
+		ret = _gnix_cm_nic_get_cdm_seed_set(domain, 1,
+						    &seed);
+		if (ret != FI_SUCCESS) {
+			GNIX_WARN(FI_LOG_EP_CTRL,
+				"gnix_cm_nic_get_cdm_seed_set returned %s\n",
+				  fi_strerror(-ret));
+			goto err;
+		}
+		ret = _gnix_cm_nic_create_cdm_id(domain, seed,
+						 &cdm_id);
+		if (ret != FI_SUCCESS) {
+			GNIX_WARN(FI_LOG_EP_CTRL,
+				"gnix_cm_nic_create_cdm_id returned %s\n",
+				  fi_strerror(-ret));
+			goto err;
+		}
 	}
 
 	GNIX_INFO(FI_LOG_EP_CTRL, "creating cm_nic for %u/0x%x/%u\n",
-			auth_key->ptag, auth_key->cookie, cdm_id);
+		      domain->ptag, domain->cookie, cdm_id);
 
 	cm_nic = (struct gnix_cm_nic *)calloc(1, sizeof(*cm_nic));
 	if (cm_nic == NULL) {
@@ -633,14 +533,8 @@ int _gnix_cm_nic_alloc(struct gnix_fid_domain *domain,
 		goto err;
 	}
 
-	/*
-	 * we have to force allocation of a new nic since we want
-	 * an a particular cdm id
-	 */
-	nic_attr.must_alloc = true;
 	nic_attr.use_cdm_id = true;
 	nic_attr.cdm_id = cdm_id;
-	nic_attr.auth_key = auth_key;
 
 	ret = gnix_nic_alloc(domain, &nic_attr, &cm_nic->nic);
 	if (ret != FI_SUCCESS) {
@@ -651,30 +545,22 @@ int _gnix_cm_nic_alloc(struct gnix_fid_domain *domain,
 	}
 
 	cm_nic->my_name.gnix_addr.cdm_id = cdm_id;
-	cm_nic->ptag = auth_key->ptag;
-	cm_nic->my_name.cookie = auth_key->cookie;
-	cm_nic->my_name.gnix_addr.device_addr = cm_nic->nic->device_addr;
-	cm_nic->domain = domain;
+	cm_nic->ptag = domain->ptag;
+	cm_nic->my_name.cookie = domain->cookie;
+	cm_nic->my_name.gnix_addr.device_addr =
+	cm_nic->nic->device_addr;
+	cm_nic->fabric = domain->fabric;
 	cm_nic->ctrl_progress = domain->control_progress;
 	cm_nic->my_name.name_type = name_type;
-	cm_nic->poll_cnt = 0;
 	fastlock_init(&cm_nic->wq_lock);
 	dlist_init(&cm_nic->cm_nic_wq);
 
 	/*
 	 * prep the cm nic's dgram component
 	 */
-	if (domain->control_progress == FI_PROGRESS_AUTO) {
-		dgram_hndl_attr.timeout_needed = __gnix_cm_nic_timeout_needed;
-		dgram_hndl_attr.timeout_progress = __gnix_cm_nic_timeout_progress;
-		dgram_hndl_attr.timeout_data = (void *)cm_nic;
-		dgram_hndl_attr.timeout = domain->params.dgram_progress_timeout;
-		dgram_hndl_attr_ptr = &dgram_hndl_attr;
-	};
-
-	ret = _gnix_dgram_hndl_alloc(cm_nic,
+	ret = _gnix_dgram_hndl_alloc(domain->fabric,
+				     cm_nic,
 				     domain->control_progress,
-				     dgram_hndl_attr_ptr,
 				     &cm_nic->dgram_hndl);
 	if (ret != FI_SUCCESS)
 		goto err;
@@ -710,11 +596,6 @@ int _gnix_cm_nic_alloc(struct gnix_fid_domain *domain,
 	_gnix_ref_init(&cm_nic->ref_cnt, 1, __cm_nic_destruct);
 
 	*cm_nic_ptr = cm_nic;
-
-	pthread_mutex_lock(&gnix_cm_nic_list_lock);
-	dlist_insert_tail(&cm_nic->cm_nic_list, &gnix_cm_nic_list);
-	pthread_mutex_unlock(&gnix_cm_nic_list_lock);
-
 	return ret;
 
 err:

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015,2017 Cray Inc. All rights reserved.
+ * Copyright (c) 2015 Cray Inc. All rights reserved.
  *
  *  Created on: Apr 16, 2015
  *      Author: jswaro
@@ -189,7 +189,7 @@ void _gnix_fill_bitmap(gnix_bitmap_t *bitmap, uint64_t value)
 	}
 }
 
-int _gnix_alloc_bitmap(gnix_bitmap_t *bitmap, uint32_t nbits, void *addr)
+int _gnix_alloc_bitmap(gnix_bitmap_t *bitmap, uint32_t nbits)
 {
 	int i;
 
@@ -199,15 +199,8 @@ int _gnix_alloc_bitmap(gnix_bitmap_t *bitmap, uint32_t nbits, void *addr)
 	if (bitmap->length != 0 || nbits == 0)
 		return -FI_EINVAL;
 
-	if (!addr) {
-		bitmap->arr = calloc(GNIX_BITMAP_BLOCKS(nbits),
-				sizeof(gnix_bitmap_block_t));
-		bitmap->internal_buffer_allocation = 1;
-	} else {
-		bitmap->arr = addr;
-		bitmap->internal_buffer_allocation = 0;
-	}
-
+	bitmap->arr = calloc(GNIX_BITMAP_BLOCKS(nbits),
+			sizeof(gnix_bitmap_block_t));
 	if (!bitmap->arr)
 		return -FI_ENOMEM;
 
@@ -231,9 +224,6 @@ int _gnix_realloc_bitmap(gnix_bitmap_t *bitmap, uint32_t nbits)
 		return -FI_EINVAL;
 
 	if (nbits == 0 || bitmap->arr == NULL)
-		return -FI_EINVAL;
-
-	if (!bitmap->internal_buffer_allocation)
 		return -FI_EINVAL;
 
 	new_allocation = realloc(bitmap->arr,
@@ -266,7 +256,7 @@ int _gnix_free_bitmap(gnix_bitmap_t *bitmap)
 		return -FI_EINVAL;
 
 	bitmap->length = 0;
-	if (bitmap->arr && bitmap->internal_buffer_allocation) {
+	if (bitmap->arr) {
 		free(bitmap->arr);
 		bitmap->arr = NULL;
 	}

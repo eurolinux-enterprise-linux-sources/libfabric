@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -64,8 +64,8 @@ static void psmx_set_epaddr_context(struct psmx_fid_domain *domain,
 int psmx_epid_to_epaddr(struct psmx_fid_domain *domain,
 			psm_epid_t epid, psm_epaddr_t *epaddr)
 {
-	int err;
-	psm_error_t errors;
+        int err;
+        psm_error_t errors;
 	psm_epconn_t epconn;
 	struct psmx_epaddr_context *context;
 
@@ -78,13 +78,13 @@ int psmx_epid_to_epaddr(struct psmx_fid_domain *domain,
 		}
 	}
 
-	err = psm_ep_connect(domain->psm_ep, 1, &epid, NULL, &errors, epaddr, 30*1e9);
-	if (err != PSM_OK)
-		return psmx_errno(err);
+        err = psm_ep_connect(domain->psm_ep, 1, &epid, NULL, &errors, epaddr, 30*1e9);
+        if (err != PSM_OK)
+                return psmx_errno(err);
 
 	psmx_set_epaddr_context(domain,epid,*epaddr);
 
-	return 0;
+        return 0;
 }
 
 static int psmx_av_check_table_size(struct psmx_fid_av *av, size_t count)
@@ -115,29 +115,6 @@ static int psmx_av_check_table_size(struct psmx_fid_av *av, size_t count)
 	return 0;
 }
 
-static void psmx_av_post_completion(struct psmx_fid_av *av, void *context,
-				    uint64_t data, int prov_errno)
-{
-	if (prov_errno) {
-		struct fi_eq_err_entry entry;
-		entry.fid = &av->av.fid;
-		entry.context = context;
-		entry.data = data;
-		entry.err = -psmx_errno(prov_errno);
-		entry.prov_errno = prov_errno;
-		entry.err_data = NULL;
-		entry.err_data_size = 0;
-		fi_eq_write(av->eq, FI_AV_COMPLETE, &entry, sizeof(entry),
-			    UTIL_FLAG_ERROR);
-	} else {
-		struct fi_eq_entry entry;
-		entry.fid = &av->av.fid;
-		entry.context = context;
-		entry.data = data;
-		fi_eq_write(av->eq, FI_AV_COMPLETE, &entry, sizeof(entry), 0);
-	}
-}
-
 static int psmx_av_insert(struct fid_av *av, const void *addr, size_t count,
 			  fi_addr_t *fi_addr, uint64_t flags, void *context)
 {
@@ -145,15 +122,10 @@ static int psmx_av_insert(struct fid_av *av, const void *addr, size_t count,
 	psm_error_t *errors;
 	int error_count = 0;
 	int *mask;
-	int i, j, ret;
+	int i, j;
 	fi_addr_t *result = NULL;
 	struct psmx_epaddr_context *epaddr_context;
-
-	if (count && !addr) {
-		FI_INFO(&psmx_prov, FI_LOG_AV,
-			"the input address array is NULL.\n");
-		return -FI_EINVAL;
-	}
+	struct psmx_eq_event *event;
 
 	av_priv = container_of(av, struct psmx_fid_av, av);
 
@@ -204,16 +176,13 @@ static int psmx_av_insert(struct fid_av *av, const void *addr, size_t count,
 			(psm_epaddr_t *) fi_addr, 30*1e9);
 
 	for (i=0; i<count; i++){
-		if (!mask[i]) {
-			errors[i] = PSM_OK;
+		if (!mask[i])
 			continue;
-		}
 
 		if (errors[i] == PSM_OK || errors[i] == PSM_EPID_ALREADY_CONNECTED) {
 			psmx_set_epaddr_context(av_priv->domain,
 						((psm_epid_t *) addr)[i],
 						((psm_epaddr_t *) fi_addr)[i]);
-			errors[i] = PSM_OK;
 		} else {
 			psm_epconn_t epconn;
 
@@ -225,7 +194,6 @@ static int psmx_av_insert(struct fid_av *av, const void *addr, size_t count,
 				epaddr_context = psm_epaddr_getctxt(epconn.addr);
 				if (epaddr_context && epaddr_context->epid  == ((psm_epid_t *) addr)[i]) {
 					((psm_epaddr_t *) fi_addr)[i] = epconn.addr;
-					errors[i] = PSM_OK;
 					continue;
 				}
 			}
@@ -243,10 +211,28 @@ static int psmx_av_insert(struct fid_av *av, const void *addr, size_t count,
 			fi_addr[i] = FI_ADDR_NOTAVAIL;
 			error_count++;
 
-			if (av_priv->flags & FI_EVENT)
-				psmx_av_post_completion(av_priv, context, i, errors[i]);
+			if (av_priv->flags & FI_EVENT) {
+				event = psmx_eq_create_event(av_priv->eq,
+							     FI_AV_COMPLETE,		/* event */
+							     context,			/* context */
+							     i,				/* data: failed index */
+							     psmx_errno(errors[i]),	/* err */
+							     errors[i],			/* prov_errno */
+							     NULL,			/* err_data */
+							     0);			/* err_data_size */
+				if (!event) {
+					free(mask);
+					free(errors);
+					return -FI_ENOMEM;
+				}
+
+				psmx_eq_enqueue_event(av_priv->eq, event);
+			}
 		}
 	}
+
+	free(mask);
+	free(errors);
 
 	if (av_priv->type == FI_AV_TABLE) {
 		/* NOTE: unresolved addresses are left in the AV table */
@@ -262,21 +248,22 @@ static int psmx_av_insert(struct fid_av *av, const void *addr, size_t count,
 		av_priv->last += count;
 	}
 
-	if (av_priv->flags & FI_EVENT) {
-		psmx_av_post_completion(av_priv, context, count - error_count, 0);
-		ret = 0;
-	} else {
-		if (flags & FI_SYNC_ERR) {
-			int *fi_errors = context;
-			for (i=0; i<count; i++)
-				fi_errors[i] = psmx_errno(errors[i]);
-		}
-		ret = count - error_count;
-	}
+	if (!(av_priv->flags & FI_EVENT))
+		return count - error_count;
 
-	free(mask);
-	free(errors);
-	return ret;
+	event = psmx_eq_create_event(av_priv->eq,
+				     FI_AV_COMPLETE,		/* event */
+				     context,			/* context */
+				     count - error_count,	/* data: succ count */
+				     0,				/* err */
+				     0,				/* prov_errno */
+				     NULL,			/* err_data */
+				     0);			/* err_data_size */
+	if (!event)
+		return -FI_ENOMEM;
+
+	psmx_eq_enqueue_event(av_priv->eq, event);
+	return 0;
 }
 
 static int psmx_av_remove(struct fid_av *av, fi_addr_t *fi_addr, size_t count,
@@ -323,7 +310,17 @@ static int psmx_av_lookup(struct fid_av *av, fi_addr_t fi_addr, void *addr,
 static const char *psmx_av_straddr(struct fid_av *av, const void *addr,
 				   char *buf, size_t *len)
 {
-	return ofi_straddr(buf, len, FI_ADDR_PSMX, addr);
+	int n;
+
+	if (!buf || !len)
+		return NULL;
+
+	n = snprintf(buf, *len, "%lx", (uint64_t)(uintptr_t)addr);
+	if (n < 0)
+		return NULL;
+
+	*len = n + 1;
+	return buf;
 }
 
 static int psmx_av_close(fid_t fid)
@@ -343,6 +340,7 @@ static int psmx_av_close(fid_t fid)
 static int psmx_av_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 {
 	struct psmx_fid_av *av;
+	struct psmx_fid_eq *eq;
 
 	av = container_of(fid, struct psmx_fid_av, av.fid);
 
@@ -351,7 +349,8 @@ static int psmx_av_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 
 	switch (bfid->fclass) {
 	case FI_CLASS_EQ:
-		av->eq = (struct fid_eq *)bfid;
+		eq = container_of(bfid, struct psmx_fid_eq, eq.fid);
+		av->eq = eq;
 		break;
 
 	default:
@@ -388,14 +387,10 @@ int psmx_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 	size_t count = 64;
 	uint64_t flags = 0;
 
-	domain_priv = container_of(domain, struct psmx_fid_domain,
-				   util_domain.domain_fid);
+	domain_priv = container_of(domain, struct psmx_fid_domain, domain);
 
 	if (attr) {
 		switch (attr->type) {
-		case FI_AV_UNSPEC:
-			break;
-
 		case FI_AV_MAP:
 		case FI_AV_TABLE:
 			type = attr->type;
@@ -412,16 +407,9 @@ int psmx_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 
 		if (flags & (FI_READ | FI_SYMMETRIC)) {
 			FI_INFO(&psmx_prov, FI_LOG_AV,
-				"attr->flags=%"PRIu64", supported=%llu\n",
+				"attr->flags=%x, supported=%x\n",
 				attr->flags, FI_EVENT);
-			return -FI_ENOSYS;
-		}
-
-		if (attr->name) {
-			FI_INFO(&psmx_prov, FI_LOG_AV,
-				"attr->name=%s, named AV is not supported\n",
-				attr->name);
-			return -FI_ENOSYS;
+			return -FI_EINVAL;
 		}
 	}
 
@@ -443,9 +431,6 @@ int psmx_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 	av_priv->av.ops = &psmx_av_ops;
 
 	*av = &av_priv->av;
-	if (attr)
-		attr->type = type;
-
 	return 0;
 }
 

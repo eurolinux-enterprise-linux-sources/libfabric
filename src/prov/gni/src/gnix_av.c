@@ -1,7 +1,6 @@
 /*
- * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
- * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
- *                         All rights reserved.
+ * Copyright (c) 2015 Cray Inc. All rights reserved.
+ * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -37,13 +36,13 @@
 //
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <assert.h>
 
 #include "gnix.h"
 #include "gnix_util.h"
 #include "gnix_hashtable.h"
 #include "gnix_av.h"
-#include "gnix_cm.h"
 
 /*
  * local variables and structs
@@ -66,29 +65,149 @@ static struct fi_ops gnix_fi_av_ops;
 /*******************************************************************************
  * Helper functions.
  ******************************************************************************/
+/*
+ * TODO: Check for named AV creation and check RX CTX bits.
+ */
 static int gnix_verify_av_attr(struct fi_av_attr *attr)
 {
 	int ret = FI_SUCCESS;
 
-	if (attr->rx_ctx_bits > GNIX_RX_CTX_MAX_BITS) {
-		GNIX_WARN(FI_LOG_AV, "rx_ctx_bits too big\n");
-		return -FI_EINVAL;
-	}
-
 	switch (attr->type) {
 	case FI_AV_TABLE:
 	case FI_AV_MAP:
-	case FI_AV_UNSPEC:
 		break;
 	default:
 		ret = -FI_EINVAL;
 		break;
 	}
 
-	if (attr->name != NULL) {
-		ret = -FI_ENOSYS;
+	return ret;
+}
+
+/*
+ * Given a string that contains the string representation of gnix_ep_name.
+ * Parse this string and return the values in a gnix_ep_name structure.
+ */
+int gnix_av_straddr_to_ep_name(char *buf,
+			       struct gnix_ep_name *gnix_ep)
+{
+	uint32_t cdm_id;
+	uint32_t cm_nic_cdm_id;
+	uint32_t cookie;
+	uint32_t device_addr;
+	char *int_buf;
+	uint32_t name_type;
+	int ret = FI_SUCCESS;
+	char *save_ptr = NULL;
+	char temp_buf[GNIX_AV_MAX_STR_ADDR_LEN];
+	uint32_t version;
+
+	if ((buf == NULL) || (gnix_ep == NULL)) {
+		ret = -FI_EINVAL;
+		goto err;
 	}
 
+	memset(temp_buf, 0, GNIX_AV_MAX_STR_ADDR_LEN);
+	strncpy(temp_buf, buf, (GNIX_AV_MAX_STR_ADDR_LEN - 1));
+
+	errno = 0;
+	gnix_ep->gnix_addr.device_addr = 0;
+	gnix_ep->gnix_addr.cdm_id = 0;
+	gnix_ep->name_type = 0;
+	gnix_ep->cm_nic_cdm_id = 0;
+	gnix_ep->cookie = 0;
+
+	/* extract the version component */
+	int_buf = strtok_r(temp_buf, ":", &save_ptr);
+	if (int_buf == NULL) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	version = (uint32_t) strtol(int_buf, NULL, 10);
+	if (errno != 0) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	if ((version == 0) || (version > GNIX_AV_STR_ADDR_VERSION)) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	/* extract the device_addr component */
+	int_buf = strtok_r(NULL, ":", &save_ptr);
+	if (int_buf == NULL) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	device_addr = (uint32_t) strtol(int_buf, NULL, 16);
+	if (errno != 0) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	/* extract the cdm_id component */
+	int_buf = strtok_r(NULL, ":", &save_ptr);
+	if (int_buf == NULL) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	cdm_id = (uint32_t) strtol(int_buf, NULL, 16);
+	if (errno != 0) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	/* extract the name_type component */
+	int_buf = strtok_r(NULL, ":", &save_ptr);
+	if (int_buf == NULL) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	name_type = (uint32_t) strtol(int_buf, NULL, 10);
+	if (errno != 0) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	/* extract the cm_nic_cdm_id component */
+	int_buf = strtok_r(NULL, ":", &save_ptr);
+	if (int_buf == NULL) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	cm_nic_cdm_id = (uint32_t) strtol(int_buf, NULL, 16);
+	if (errno != 0) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	/* extract the cookie component */
+	int_buf = strtok_r(NULL, ":", &save_ptr);
+	if (int_buf == NULL) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	cookie = (uint32_t) strtol(int_buf, NULL, 16);
+	if (errno != 0) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	/* check to see if additional component are specified */
+	gnix_ep->gnix_addr.device_addr = device_addr;
+	gnix_ep->gnix_addr.cdm_id = cdm_id;
+	gnix_ep->name_type = name_type;
+	gnix_ep->cm_nic_cdm_id = cm_nic_cdm_id;
+	gnix_ep->cookie = cookie;
+
+err:
 	return ret;
 }
 
@@ -152,57 +271,53 @@ static int gnix_check_capacity(struct gnix_fid_av *av, size_t count)
 /*******************************************************************************
  * FI_AV_TABLE specific implementations.
  ******************************************************************************/
-static int table_insert(struct gnix_fid_av *av_priv, const void *addr,
+static int table_insert(struct gnix_fid_av *int_av, const void *addr,
 			size_t count, fi_addr_t *fi_addr, uint64_t flags,
 			void *context)
 {
-	struct gnix_ep_name ep_name;
+	struct gnix_ep_name temp;
+	char *temp_addr = (char *) addr;
 	int ret = count;
-	size_t index, i;
-	int *entry_err = context;
+	int rc;
+	size_t index;
+	size_t i;
 
-	if (gnix_check_capacity(av_priv, count)) {
-		return -FI_ENOMEM;
+	if (gnix_check_capacity(int_av, count)) {
+		ret = -FI_ENOMEM;
+		goto err;
 	}
 
-	assert(av_priv->table);
+	assert(int_av->table);
+	for (index = int_av->count, i = 0; i < count; index++, i++) {
+		temp.gnix_addr.device_addr = 0;
+		temp.gnix_addr.cdm_id = 0;
+		temp.name_type = 0;
+		temp.cm_nic_cdm_id = 0;
+		temp.cookie = 0;
 
-	for (index = av_priv->count, i = 0; i < count; index++, i++) {
-		_gnix_get_ep_name(addr, i, &ep_name, av_priv->domain);
-
-		/* check if this ep_name fits in the av context bits */
-		if (ep_name.name_type & GNIX_EPN_TYPE_SEP) {
-			if ((1 << av_priv->rx_ctx_bits) < ep_name.rx_ctx_cnt) {
-				if (flags & FI_SYNC_ERR) {
-					entry_err[i] = -FI_EINVAL;
-					fi_addr[i] = FI_ADDR_NOTAVAIL;
-					ret = -FI_EINVAL;
-					continue;
-				}
-				GNIX_DEBUG(FI_LOG_AV, "ep_name doesn't fit "
-					"into the av context bits\n");
-				return -FI_EINVAL;
-			}
+		rc = gnix_av_straddr_to_ep_name(temp_addr, &temp);
+		if (rc != FI_SUCCESS) {
+			GNIX_WARN(FI_LOG_AV,
+				  "table_insert: gnix_av_straddr_to_ep_name failed %d\n",
+				  ret);
+			return ret;
 		}
 
-		av_priv->table[index].gnix_addr = ep_name.gnix_addr;
-		av_priv->valid_entry_vec[index] = 1;
-		av_priv->table[index].name_type = ep_name.name_type;
-		av_priv->table[index].cookie = ep_name.cookie;
-		av_priv->table[index].rx_ctx_cnt = ep_name.rx_ctx_cnt;
-		av_priv->table[index].cm_nic_cdm_id =
-			ep_name.cm_nic_cdm_id;
-		av_priv->table[index].key_offset = ep_name.key_offset;
+		int_av->table[index].gnix_addr = temp.gnix_addr;
+		int_av->valid_entry_vec[index] = 1;
+		int_av->table[index].name_type = temp.name_type;
+		int_av->table[index].cookie = temp.cookie;
+		int_av->table[index].cm_nic_cdm_id =
+				temp.cm_nic_cdm_id;
 		if (fi_addr)
 			fi_addr[i] = index;
 
-		if (flags & FI_SYNC_ERR) {
-			entry_err[i] = FI_SUCCESS;
-		}
+		temp_addr += GNIX_AV_MAX_STR_ADDR_LEN;
 	}
 
-	av_priv->count += count;
+	int_av->count += count;
 
+err:
 	return ret;
 }
 
@@ -211,7 +326,7 @@ static int table_insert(struct gnix_fid_av *av_priv, const void *addr,
  * If any of the given address fail to be removed (are already marked removed)
  * then the return value will be -FI_EINVAL.
  */
-static int table_remove(struct gnix_fid_av *av_priv, fi_addr_t *fi_addr,
+static int table_remove(struct gnix_fid_av *int_av, fi_addr_t *fi_addr,
 			size_t count, uint64_t flags)
 {
 	int ret = FI_SUCCESS;
@@ -220,12 +335,12 @@ static int table_remove(struct gnix_fid_av *av_priv, fi_addr_t *fi_addr,
 
 	for (i = 0; i < count; i++) {
 		index = (size_t) fi_addr[i];
-		if (index < av_priv->count) {
-			if (av_priv->valid_entry_vec[index] == 0) {
+		if (index < int_av->count) {
+			if (int_av->valid_entry_vec[index] == 0) {
 				ret = -FI_EINVAL;
 				break;
 			} else {
-				av_priv->valid_entry_vec[index] = 0;
+				int_av->valid_entry_vec[index] = 0;
 			}
 		} else {
 			ret = -FI_EINVAL;
@@ -239,54 +354,40 @@ static int table_remove(struct gnix_fid_av *av_priv, fi_addr_t *fi_addr,
 /*
  * table_lookup(): Translate fi_addr_t to struct gnix_address.
  */
-static int table_lookup(struct gnix_fid_av *av_priv, fi_addr_t fi_addr,
-			struct gnix_av_addr_entry *entry_ptr)
+static int table_lookup(struct gnix_fid_av *int_av, fi_addr_t fi_addr,
+			struct gnix_av_addr_entry **entry_ptr)
 {
 	size_t index;
 	struct gnix_av_addr_entry *entry = NULL;
 
 	index = (size_t)fi_addr;
-	if (index >= av_priv->count)
+	if (index >= int_av->count)
 		return -FI_EINVAL;
 
-	assert(av_priv->table);
-	entry = &av_priv->table[index];
+	assert(int_av->table);
+	entry = &int_av->table[index];
 
 	if (entry == NULL)
 		return -FI_EINVAL;
 
-	if (av_priv->valid_entry_vec[index] == 0)
+	if (int_av->valid_entry_vec[index] == 0)
 		return -FI_EINVAL;
 
-	memcpy(entry_ptr, entry, sizeof(*entry));
+	*entry_ptr = entry;
 
 	return FI_SUCCESS;
 }
 
-static int table_reverse_lookup(struct gnix_fid_av *av_priv,
+static int table_reverse_lookup(struct gnix_fid_av *int_av,
 				struct gnix_address gnix_addr,
 				fi_addr_t *fi_addr)
 {
 	struct gnix_av_addr_entry *entry;
 	int i;
 
-	for (i = 0; i < av_priv->count; i++) {
-		entry = &av_priv->table[i];
-		/*
-		 * for SEP endpoint entry we may have a delta in the cdm_id
-		 * component of the address to process
-		 */
-		if ((entry->name_type & GNIX_EPN_TYPE_SEP) &&
-		    (entry->gnix_addr.device_addr == gnix_addr.device_addr)) {
-			int index = gnix_addr.cdm_id - entry->gnix_addr.cdm_id;
-
-			if ((index >= 0) && (index < entry->rx_ctx_cnt)) {
-				/* we have a match */
-				*fi_addr = fi_rx_addr(i, index,
-						      av_priv->rx_ctx_bits);
-				return FI_SUCCESS;
-			}
-		} else if (GNIX_ADDR_EQUAL(entry->gnix_addr, gnix_addr)) {
+	for (i = 0; i < int_av->count; i++) {
+		entry = &int_av->table[i];
+		if (GNIX_ADDR_EQUAL(entry->gnix_addr, gnix_addr)) {
 			*fi_addr = i;
 			return FI_SUCCESS;
 		}
@@ -299,20 +400,19 @@ static int table_reverse_lookup(struct gnix_fid_av *av_priv,
  * FI_AV_MAP specific implementations.
  ******************************************************************************/
 
-static int map_insert(struct gnix_fid_av *av_priv, const void *addr,
+static int map_insert(struct gnix_fid_av *int_av, const void *addr,
 		      size_t count, fi_addr_t *fi_addr, uint64_t flags,
 		      void *context)
 {
 	int ret;
-	struct gnix_ep_name ep_name;
+	struct gnix_ep_name temp;
+	char *temp_addr = (char *) addr;
 	struct gnix_av_addr_entry *the_entry;
 	gnix_ht_key_t key;
 	size_t i;
 	struct gnix_av_block *blk = NULL;
-	int ret_cnt = count;
-	int *entry_err = context;
 
-	assert(av_priv->map_ht != NULL);
+	assert(int_av->map_ht != NULL);
 
 	if (count == 0)
 		return 0;
@@ -327,62 +427,49 @@ static int map_insert(struct gnix_fid_av *av_priv, const void *addr,
 		return -FI_ENOMEM;
 	}
 
-	slist_insert_tail(&blk->slist, &av_priv->block_list);
+	slist_insert_tail(&blk->slist, &int_av->block_list);
 
 	for (i = 0; i < count; i++) {
-		_gnix_get_ep_name(addr, i, &ep_name, av_priv->domain);
+		temp.gnix_addr.device_addr = 0;
+		temp.gnix_addr.cdm_id = 0;
+		temp.name_type = 0;
+		temp.cm_nic_cdm_id = 0;
+		temp.cookie = 0;
 
-		/* check if this ep_name fits in the av context bits */
-		if (ep_name.name_type & GNIX_EPN_TYPE_SEP) {
-			if ((1 << av_priv->rx_ctx_bits) < ep_name.rx_ctx_cnt) {
-				if (flags & FI_SYNC_ERR) {
-					entry_err[i] = -FI_EINVAL;
-					fi_addr[i] = FI_ADDR_NOTAVAIL;
-					ret_cnt = -FI_EINVAL;
-					continue;
-				}
-				GNIX_DEBUG(FI_LOG_DEBUG, "ep_name doesn't fit "
-					"into the av context bits\n");
-				return -FI_EINVAL;
-			}
+		ret = gnix_av_straddr_to_ep_name(temp_addr, &temp);
+		if (ret != FI_SUCCESS) {
+			GNIX_WARN(FI_LOG_AV,
+				  "map_insert: gnix_av_straddr_to_ep_name failed %d\n",
+				  ret);
+			return ret;
 		}
 
-		((struct gnix_address *)fi_addr)[i] = ep_name.gnix_addr;
+		((struct gnix_address *)fi_addr)[i] = temp.gnix_addr;
 		the_entry =  &blk->base[i];
-		memcpy(&the_entry->gnix_addr, &ep_name.gnix_addr,
+		memcpy(&the_entry->gnix_addr, &temp.gnix_addr,
 		       sizeof(struct gnix_address));
-		the_entry->name_type = ep_name.name_type;
-		the_entry->cm_nic_cdm_id = ep_name.cm_nic_cdm_id;
-		the_entry->cookie = ep_name.cookie;
-		the_entry->rx_ctx_cnt = ep_name.rx_ctx_cnt;
-		memcpy(&key, &ep_name.gnix_addr, sizeof(gnix_ht_key_t));
-		ret = _gnix_ht_insert(av_priv->map_ht,
+		the_entry->name_type = temp.name_type;
+		the_entry->cm_nic_cdm_id = temp.cm_nic_cdm_id;
+		the_entry->cookie = temp.cookie;
+		memcpy(&key, &temp.gnix_addr, sizeof(gnix_ht_key_t));
+		ret = _gnix_ht_insert(int_av->map_ht,
 				      key,
 				      the_entry);
-
-		if (flags & FI_SYNC_ERR) {
-			entry_err[i] = FI_SUCCESS;
-		}
-
 		/*
 		 * we are okay with user trying to add more
 		 * entries with same key.
 		 */
 		if ((ret != FI_SUCCESS) && (ret != -FI_ENOSPC)) {
 			GNIX_WARN(FI_LOG_AV,
-				  "_gnix_ht_insert failed %d\n",
+				  "map_insert: _gnix_ht_insert failed %d\n",
 				  ret);
-			if (flags & FI_SYNC_ERR) {
-				entry_err[i] = ret;
-				fi_addr[i] = FI_ADDR_NOTAVAIL;
-				ret_cnt = ret;
-				continue;
-			}
 			return ret;
 		}
+
+		temp_addr += GNIX_AV_MAX_STR_ADDR_LEN;
 	}
 
-	return ret_cnt;
+	return count;
 }
 
 /*
@@ -390,7 +477,7 @@ static int map_insert(struct gnix_fid_av *av_priv, const void *addr,
  * or as an alternative, have a free list for slabs so they can be
  * reused if new fi_av_insert operations are performed.
  */
-static int map_remove(struct gnix_fid_av *av_priv, fi_addr_t *fi_addr,
+static int map_remove(struct gnix_fid_av *int_av, fi_addr_t *fi_addr,
 		      size_t count, uint64_t flags)
 {
 	int i,ret = FI_SUCCESS;
@@ -406,63 +493,43 @@ static int map_remove(struct gnix_fid_av *av_priv, fi_addr_t *fi_addr,
 		 * TODO: is there a race condition here for multi-threaded?
 		 */
 
-		the_entry = _gnix_ht_lookup(av_priv->map_ht, key);
+		the_entry = _gnix_ht_lookup(int_av->map_ht, key);
 		if (the_entry == NULL)
 			return -FI_ENOENT;
 
-		ret = _gnix_ht_remove(av_priv->map_ht, key);
+		ret = _gnix_ht_remove(int_av->map_ht, key);
 
 	}
 
 	return ret;
 }
 
-static int map_lookup(struct gnix_fid_av *av_priv, fi_addr_t fi_addr,
-		      struct gnix_av_addr_entry *entry_ptr)
+static int map_lookup(struct gnix_fid_av *int_av, fi_addr_t fi_addr,
+		      struct gnix_av_addr_entry **entry_ptr)
 {
 	gnix_ht_key_t *key = (gnix_ht_key_t *)&fi_addr;
 	struct gnix_av_addr_entry *entry;
 
-	entry = _gnix_ht_lookup(av_priv->map_ht, *key & av_priv->mask);
+	entry = _gnix_ht_lookup(int_av->map_ht, *key);
 	if (entry == NULL)
 		return -FI_ENOENT;
 
-	memcpy(entry_ptr, entry, sizeof(*entry));
+	*entry_ptr = entry;
 
 	return FI_SUCCESS;
 }
 
-static int map_reverse_lookup(struct gnix_fid_av *av_priv,
+static int map_reverse_lookup(struct gnix_fid_av *int_av,
 			      struct gnix_address gnix_addr,
 			      fi_addr_t *fi_addr)
 {
-	GNIX_HASHTABLE_ITERATOR(av_priv->map_ht, iter);
+	GNIX_HASHTABLE_ITERATOR(int_av->map_ht, iter);
 	struct gnix_av_addr_entry *entry;
-	fi_addr_t rx_addr;
 
 	while ((entry = _gnix_ht_iterator_next(&iter))) {
-		/*
-		 * for SEP endpoint entry we may have a delta in the cdm_id
-		 * component of the address to process
-		 */
-		if ((entry->name_type & GNIX_EPN_TYPE_SEP) &&
-		    (entry->gnix_addr.device_addr == gnix_addr.device_addr)) {
-			int index = gnix_addr.cdm_id - entry->gnix_addr.cdm_id;
-
-			if ((index >= 0) && (index < entry->rx_ctx_cnt)) {
-				/* we have a match */
-				memcpy(&rx_addr, &entry->gnix_addr,
-					sizeof(fi_addr_t));
-				*fi_addr = fi_rx_addr(rx_addr,
-						      index,
-						      av_priv->rx_ctx_bits);
-				return FI_SUCCESS;
-			}
-		} else {
-			if (GNIX_ADDR_EQUAL(entry->gnix_addr, gnix_addr)) {
-				*fi_addr = GNIX_HASHTABLE_ITERATOR_KEY(iter);
-				return FI_SUCCESS;
-			}
+		if (GNIX_ADDR_EQUAL(entry->gnix_addr, gnix_addr)) {
+			*fi_addr = GNIX_HASHTABLE_ITERATOR_KEY(iter);
+			return FI_SUCCESS;
 		}
 	}
 
@@ -472,25 +539,11 @@ static int map_reverse_lookup(struct gnix_fid_av *av_priv,
 /*******************************************************************************
  * FI_AV API implementations.
  ******************************************************************************/
-int _gnix_table_reverse_lookup(struct gnix_fid_av *av_priv,
-			       struct gnix_address gnix_addr,
-			       fi_addr_t *fi_addr)
-{
-	return table_reverse_lookup(av_priv, gnix_addr, fi_addr);
-}
-
-int _gnix_map_reverse_lookup(struct gnix_fid_av *av_priv,
-			     struct gnix_address gnix_addr,
-			     fi_addr_t *fi_addr)
-{
-	return map_reverse_lookup(av_priv, gnix_addr, fi_addr);
-}
 
 int _gnix_av_lookup(struct gnix_fid_av *gnix_av, fi_addr_t fi_addr,
-		    struct gnix_av_addr_entry *entry_ptr)
+		    struct gnix_av_addr_entry **entry_ptr)
 {
 	int ret = FI_SUCCESS;
-	fi_addr_t addr = fi_addr & gnix_av->mask;
 
 	GNIX_TRACE(FI_LOG_AV, "\n");
 
@@ -501,19 +554,14 @@ int _gnix_av_lookup(struct gnix_fid_av *gnix_av, fi_addr_t fi_addr,
 
 	switch (gnix_av->type) {
 	case FI_AV_TABLE:
-		ret = table_lookup(gnix_av, addr, entry_ptr);
+		ret = table_lookup(gnix_av, fi_addr, entry_ptr);
 		break;
 	case FI_AV_MAP:
-		ret = map_lookup(gnix_av, addr, entry_ptr);
+		ret = map_lookup(gnix_av, fi_addr, entry_ptr);
 		break;
 	default:
 		ret = -FI_EINVAL;
 		break;
-	}
-
-	if (fi_addr & ~gnix_av->mask) {
-		entry_ptr->gnix_addr.cdm_id +=
-				fi_addr >> (64 - gnix_av->rx_ctx_bits);
 	}
 
 err:
@@ -559,7 +607,7 @@ DIRECT_FN STATIC int gnix_av_lookup(struct fid_av *av, fi_addr_t fi_addr,
 {
 	struct gnix_fid_av *gnix_av;
 	struct gnix_ep_name ep_name = { {0} };
-	struct gnix_av_addr_entry entry;
+	struct gnix_av_addr_entry *entry = NULL;
 	int rc;
 
 	GNIX_TRACE(FI_LOG_AV, "\n");
@@ -567,8 +615,8 @@ DIRECT_FN STATIC int gnix_av_lookup(struct fid_av *av, fi_addr_t fi_addr,
 	if (!av || !addrlen)
 		return -FI_EINVAL;
 
-	if (*addrlen < sizeof(ep_name)) {
-		*addrlen = sizeof(ep_name);
+	if (*addrlen < GNIX_AV_MAX_STR_ADDR_LEN) {
+		*addrlen = GNIX_AV_MAX_STR_ADDR_LEN;
 		return -FI_ETOOSMALL;
 	}
 
@@ -588,13 +636,13 @@ DIRECT_FN STATIC int gnix_av_lookup(struct fid_av *av, fi_addr_t fi_addr,
 		return rc;
 	}
 
-	ep_name.gnix_addr = entry.gnix_addr;
-	ep_name.name_type = entry.name_type;
-	ep_name.cm_nic_cdm_id = entry.cm_nic_cdm_id;
-	ep_name.cookie = entry.cookie;
+	memcpy(&ep_name.gnix_addr, &entry->gnix_addr,
+	       sizeof(struct gnix_address));
+	ep_name.name_type = entry->name_type;
+	ep_name.cm_nic_cdm_id = entry->cm_nic_cdm_id;
+	ep_name.cookie = entry->cookie;
 
-	memcpy(addr, (void *)&ep_name, MIN(*addrlen, sizeof(ep_name)));
-	*addrlen = sizeof(ep_name);
+	gnix_av_straddr(NULL, (void *) &ep_name, (char *) addr, addrlen);
 
 	return FI_SUCCESS;
 }
@@ -603,37 +651,37 @@ DIRECT_FN STATIC int gnix_av_insert(struct fid_av *av, const void *addr,
 				    size_t count, fi_addr_t *fi_addr,
 				    uint64_t flags, void *context)
 {
-	struct gnix_fid_av *av_priv = NULL;
+	struct gnix_fid_av *int_av = NULL;
 	int ret = FI_SUCCESS;
 
 	GNIX_TRACE(FI_LOG_AV, "\n");
 
-	if (!av)
-		return -FI_EINVAL;
-
-	av_priv = container_of(av, struct gnix_fid_av, av_fid);
-
-	if (!av_priv)
-		return -FI_EINVAL;
-
-	if ((flags & FI_SYNC_ERR) && (context == NULL)) {
-		GNIX_WARN(FI_LOG_AV, "FI_SYNC_ERR requires context\n");
-		return -FI_EINVAL;
+	if (!av) {
+		ret = -FI_EINVAL;
+		goto err;
 	}
 
-	switch (av_priv->type) {
+	int_av = container_of(av, struct gnix_fid_av, av_fid);
+
+	if (!int_av) {
+		ret = -FI_EINVAL;
+		goto err;
+	}
+
+	switch (int_av->type) {
 	case FI_AV_TABLE:
 		ret =
-		    table_insert(av_priv, addr, count, fi_addr, flags, context);
+		    table_insert(int_av, addr, count, fi_addr, flags, context);
 		break;
 	case FI_AV_MAP:
-		ret = map_insert(av_priv, addr, count, fi_addr, flags, context);
+		ret = map_insert(int_av, addr, count, fi_addr, flags, context);
 		break;
 	default:
 		ret = -FI_EINVAL;
 		break;
 	}
 
+err:
 	return ret;
 }
 
@@ -655,7 +703,7 @@ DIRECT_FN STATIC int gnix_av_insertsym(struct fid_av *av, const char *node,
 DIRECT_FN STATIC int gnix_av_remove(struct fid_av *av, fi_addr_t *fi_addr,
 				    size_t count, uint64_t flags)
 {
-	struct gnix_fid_av *av_priv = NULL;
+	struct gnix_fid_av *int_av = NULL;
 	int ret = FI_SUCCESS;
 
 	GNIX_TRACE(FI_LOG_AV, "\n");
@@ -665,19 +713,19 @@ DIRECT_FN STATIC int gnix_av_remove(struct fid_av *av, fi_addr_t *fi_addr,
 		goto err;
 	}
 
-	av_priv = container_of(av, struct gnix_fid_av, av_fid);
+	int_av = container_of(av, struct gnix_fid_av, av_fid);
 
-	if (!av_priv) {
+	if (!int_av) {
 		ret = -FI_EINVAL;
 		goto err;
 	}
 
-	switch (av_priv->type) {
+	switch (int_av->type) {
 	case FI_AV_TABLE:
-		ret = table_remove(av_priv, fi_addr, count, flags);
+		ret = table_remove(int_av, fi_addr, count, flags);
 		break;
 	case FI_AV_MAP:
-		ret = map_remove(av_priv, fi_addr, count, flags);
+		ret = map_remove(int_av, fi_addr, count, flags);
 		break;
 	default:
 		ret = -FI_EINVAL;
@@ -695,25 +743,13 @@ err:
  * hexadecimal. And name_type is represented as an integer.
  */
 DIRECT_FN const char *gnix_av_straddr(struct fid_av *av,
-		const void *addr, char *buf,
-		size_t *len)
+				      const void *addr, char *buf,
+				      size_t *len)
 {
 	char int_buf[GNIX_AV_MAX_STR_ADDR_LEN];
 	int size;
-	struct gnix_ep_name ep_name;
-	struct gnix_fid_av *av_priv;
 
-	if (!av || !addr || !buf || !len) {
-		GNIX_DEBUG(FI_LOG_DEBUG, "NULL parameter in gnix_av_straddr\n");
-		return NULL;
-	}
-
-	av_priv = container_of(av, struct gnix_fid_av, av_fid);
-
-	if (av_priv->domain->addr_format == FI_ADDR_STR)
-		_gnix_resolve_str_ep_name(addr, 0, &ep_name);
-	else
-		ep_name = ((struct gnix_ep_name *) addr)[0];
+	const struct gnix_ep_name *gnix_ep = addr;
 
 	/*
 	 * if additional information is added to this string, then
@@ -721,15 +757,15 @@ DIRECT_FN const char *gnix_av_straddr(struct fid_av *av,
 	 *   GNIX_AV_STR_ADDR_VERSION, increment this value
 	 *   GNIX_AV_MAX_STR_ADDR_LEN, to be the number of characters printed
 	 */
-	size = snprintf(int_buf, sizeof(int_buf), "%04i:0x%08" PRIx32 ":0x%08"
-			PRIx32 ":%02i:0x%06" PRIx32 ":0x%08" PRIx32
-			":%02i", GNIX_AV_STR_ADDR_VERSION,
-			ep_name.gnix_addr.device_addr,
-			ep_name.gnix_addr.cdm_id,
-			ep_name.name_type,
-			ep_name.cm_nic_cdm_id,
-			ep_name.cookie,
-			ep_name.rx_ctx_cnt);
+	size =
+	    snprintf(int_buf, sizeof(int_buf), "%04i:0x%08" PRIx32 ":0x%08"
+		     PRIx32 ":%02i:0x%06" PRIx32 ":0x%08" PRIx32,
+		     GNIX_AV_STR_ADDR_VERSION,
+		     gnix_ep->gnix_addr.device_addr,
+		     gnix_ep->gnix_addr.cdm_id,
+		     gnix_ep->name_type,
+		     gnix_ep->cm_nic_cdm_id,
+		     gnix_ep->cookie);
 
 	/*
 	 * snprintf returns the number of character written
@@ -827,12 +863,11 @@ DIRECT_FN int gnix_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 			   struct fid_av **av, void *context)
 {
 	struct gnix_fid_domain *int_dom = NULL;
-	struct gnix_fid_av *av_priv = NULL;
+	struct gnix_fid_av *int_av = NULL;
 	struct gnix_hashtable_attr ht_attr;
 
 	enum fi_av_type type = FI_AV_TABLE;
 	size_t count = 128;
-	int rx_ctx_bits = 0;
 	int ret = FI_SUCCESS;
 
 	GNIX_TRACE(FI_LOG_AV, "\n");
@@ -848,56 +883,50 @@ DIRECT_FN int gnix_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 		goto err;
 	}
 
-	av_priv = calloc(1, sizeof(*av_priv));
-	if (!av_priv) {
+	int_av = calloc(1, sizeof(*int_av));
+	if (!int_av) {
 		ret = -FI_ENOMEM;
 		goto err;
 	}
 
 	if (attr) {
-		ret = gnix_verify_av_attr(attr);
-		if (ret) {
+		if (gnix_verify_av_attr(attr)) {
+			ret = -FI_EINVAL;
 			goto cleanup;
 		}
 
-		if (attr->type != FI_AV_UNSPEC) {
-			type = attr->type;
-		}
+		type = attr->type;
 		count = attr->count;
-		rx_ctx_bits = attr->rx_ctx_bits;
 	}
 
-	av_priv->domain = int_dom;
-	av_priv->type = type;
-	av_priv->addrlen = sizeof(struct gnix_address);
-	av_priv->rx_ctx_bits = rx_ctx_bits;
-	av_priv->mask = rx_ctx_bits ?
-			((uint64_t)1 << (64 - attr->rx_ctx_bits)) - 1 : ~0;
+	int_av->domain = int_dom;
+	int_av->type = type;
+	int_av->addrlen = sizeof(struct gnix_address);
 
-	av_priv->capacity = count;
+	int_av->capacity = count;
 	if (type == FI_AV_TABLE) {
-		av_priv->table = calloc(count,
+		int_av->table = calloc(count,
 				       sizeof(struct gnix_av_addr_entry));
-		if (!av_priv->table) {
+		if (!int_av->table) {
 			ret = -FI_ENOMEM;
 			goto cleanup;
 		}
 	}
 
-	av_priv->valid_entry_vec = calloc(count, sizeof(int));
-	if (!av_priv->valid_entry_vec) {
+	int_av->valid_entry_vec = calloc(count, sizeof(int));
+	if (!int_av->valid_entry_vec) {
 		ret = -FI_ENOMEM;
 		goto cleanup;
 	}
 
-	av_priv->av_fid.fid.fclass = FI_CLASS_AV;
-	av_priv->av_fid.fid.context = context;
-	av_priv->av_fid.fid.ops = &gnix_fi_av_ops;
-	av_priv->av_fid.ops = &gnix_av_ops;
+	int_av->av_fid.fid.fclass = FI_CLASS_AV;
+	int_av->av_fid.fid.context = context;
+	int_av->av_fid.fid.ops = &gnix_fi_av_ops;
+	int_av->av_fid.ops = &gnix_av_ops;
 
 	if (type == FI_AV_MAP) {
-		av_priv->map_ht = calloc(1, sizeof(struct gnix_hashtable));
-		if (av_priv->map_ht == NULL)
+		int_av->map_ht = calloc(1, sizeof(struct gnix_hashtable));
+		if (int_av->map_ht == NULL)
 			goto cleanup;
 
 		/*
@@ -913,22 +942,22 @@ DIRECT_FN int gnix_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 		ht_attr.ht_internal_locking = 1;
 		ht_attr.destructor = NULL;
 
-		ret = _gnix_ht_init(av_priv->map_ht,
+		ret = _gnix_ht_init(int_av->map_ht,
 				    &ht_attr);
-		slist_init(&av_priv->block_list);
+		slist_init(&int_av->block_list);
 	}
-	_gnix_ref_init(&av_priv->ref_cnt, 1, __av_destruct);
+	_gnix_ref_init(&int_av->ref_cnt, 1, __av_destruct);
 
-	*av = &av_priv->av_fid;
+	*av = &int_av->av_fid;
 
 	return ret;
 
 cleanup:
-	if (av_priv->table != NULL)
-		free(av_priv->table);
-	if (av_priv->valid_entry_vec != NULL)
-		free(av_priv->valid_entry_vec);
-	free(av_priv);
+	if (int_av->table != NULL)
+		free(int_av->table);
+	if (int_av->valid_entry_vec != NULL)
+		free(int_av->valid_entry_vec);
+	free(int_av);
 err:
 	return ret;
 }

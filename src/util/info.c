@@ -19,7 +19,7 @@
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
  * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AWV
  * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
  * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
  * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
@@ -34,8 +34,6 @@
 #include <string.h>
 #include <getopt.h>
 
-#include <ofi_osd.h>
-
 #include <rdma/fabric.h>
 #include <rdma/fi_errno.h>
 
@@ -48,16 +46,13 @@ static int verbose = 0, env = 0;
 /* options and matching help strings need to be kept in sync */
 
 static const struct option longopts[] = {
-	{"help", no_argument, NULL, 'h'},
 	{"node", required_argument, NULL, 'n'},
-	{"port", required_argument, NULL, 'P'},
+	{"port", required_argument, NULL, 'p'},
 	{"caps", required_argument, NULL, 'c'},
 	{"mode", required_argument, NULL, 'm'},
 	{"ep_type", required_argument, NULL, 't'},
-	{"domain", required_argument, NULL, 'd'},
-	{"fabric", required_argument, NULL, 'f'},
 	{"addr_format", required_argument, NULL, 'a'},
-	{"provider", required_argument, NULL, 'p'},
+	{"provider", required_argument, NULL, 'f'},
 	{"env", no_argument, NULL, 'e'},
 	{"list", no_argument, NULL, 'l'},
 	{"verbose", no_argument, NULL, 'v'},
@@ -66,14 +61,11 @@ static const struct option longopts[] = {
 };
 
 static const char *help_strings[][2] = {
-	{"", "\t\tdisplay this help and exit"},
 	{"NAME", "\t\tnode name or address"},
 	{"PNUM", "\t\tport number"},
 	{"CAP1|CAP2..", "\tone or more capabilities: FI_MSG|FI_RMA..."},
 	{"MOD1|MOD2..", "\tone or more modes, default all modes"},
 	{"EPTYPE", "\t\tspecify single endpoint type: FI_EP_MSG, FI_EP_DGRAM..."},
-	{"DOMAIN", "\t\tspecify the domain name"},
-	{"FABRIC", "\t\tspecify the fabric name"},
 	{"FMT", "\t\tspecify accepted address format: FI_FORMAT_UNSPEC, FI_SOCKADDR..."},
 	{"PROV", "\t\tspecify provider explicitly"},
 	{"", "\t\tprint libfabric environment variables"},
@@ -100,21 +92,15 @@ static void usage(void)
 				help_strings[i][1]);
 }
 
-#define ORCASE(SYM)                                                            \
-	do {                                                                   \
-		if (strcasecmp(#SYM, inputstr) == 0) {                         \
-			*value = SYM;                                          \
-			return 0;                                              \
-		}                                                              \
-	} while (0)
+#define ORCASE(SYM) \
+	do { if (strcmp(#SYM, inputstr) == 0) return SYM; } while (0);
 
-static int str2cap(char *inputstr, uint64_t *value)
+static uint64_t str2cap(char *inputstr)
 {
 	ORCASE(FI_MSG);
 	ORCASE(FI_RMA);
 	ORCASE(FI_TAGGED);
 	ORCASE(FI_ATOMIC);
-	ORCASE(FI_MULTICAST);
 
 	ORCASE(FI_READ);
 	ORCASE(FI_WRITE);
@@ -130,51 +116,43 @@ static int str2cap(char *inputstr, uint64_t *value)
 	ORCASE(FI_TRIGGER);
 	ORCASE(FI_FENCE);
 
-	ORCASE(FI_SOURCE_ERR);
-	ORCASE(FI_LOCAL_COMM);
-	ORCASE(FI_REMOTE_COMM);
-	ORCASE(FI_SHARED_AV);
+	ORCASE(FI_EVENT);
+	ORCASE(FI_INJECT);
+	ORCASE(FI_INJECT_COMPLETE);
+	ORCASE(FI_TRANSMIT_COMPLETE);
+	ORCASE(FI_DELIVERY_COMPLETE);
+
 	ORCASE(FI_RMA_EVENT);
-	ORCASE(FI_SOURCE);
 	ORCASE(FI_NAMED_RX_CTX);
+	ORCASE(FI_SOURCE);
 	ORCASE(FI_DIRECTED_RECV);
 
-	fprintf(stderr, "error: Unrecognized capability: %s\n", inputstr);
-
-	return -EINVAL;
+	return 0;
 }
 
-static int str2mode(char *inputstr, uint64_t *value)
+static uint64_t str2mode(char *inputstr)
 {
 	ORCASE(FI_CONTEXT);
+	ORCASE(FI_LOCAL_MR);
 	ORCASE(FI_MSG_PREFIX);
 	ORCASE(FI_ASYNC_IOV);
 	ORCASE(FI_RX_CQ_DATA);
-	ORCASE(FI_LOCAL_MR);
-	ORCASE(FI_NOTIFY_FLAGS_ONLY);
-	ORCASE(FI_RESTRICTED_COMP);
-	ORCASE(FI_CONTEXT2);
 
-	fprintf(stderr, "error: Unrecognized mode: %s\n", inputstr);
-
-	return -EINVAL;
+	return 0;
 }
 
-static int str2ep_type(char *inputstr, enum fi_ep_type *value)
+static enum fi_ep_type str2ep_type(char *inputstr)
 {
 	ORCASE(FI_EP_UNSPEC);
 	ORCASE(FI_EP_MSG);
 	ORCASE(FI_EP_DGRAM);
 	ORCASE(FI_EP_RDM);
-	ORCASE(FI_EP_SOCK_STREAM);
-	ORCASE(FI_EP_SOCK_DGRAM);
 
-	fprintf(stderr, "error: Unrecognized endpoint type: %s\n", inputstr);
-
-	return -EINVAL;
+	/* probably not the right thing to do? */
+	return FI_EP_UNSPEC;
 }
 
-static int str2addr_format(char *inputstr, uint32_t *value)
+static uint32_t str2addr_format(char *inputstr)
 {
 	ORCASE(FI_FORMAT_UNSPEC);
 	ORCASE(FI_SOCKADDR);
@@ -182,34 +160,19 @@ static int str2addr_format(char *inputstr, uint32_t *value)
 	ORCASE(FI_SOCKADDR_IN6);
 	ORCASE(FI_SOCKADDR_IB);
 	ORCASE(FI_ADDR_PSMX);
-	ORCASE(FI_ADDR_GNI);
-	ORCASE(FI_ADDR_BGQ);
-	ORCASE(FI_ADDR_MLX);
-	ORCASE(FI_ADDR_STR);
-	ORCASE(FI_ADDR_PSMX2);
 
-	fprintf(stderr, "error: Unrecognized address format: %s\n", inputstr);
-
-	return -EINVAL;
+	return FI_FORMAT_UNSPEC;
 }
 
-static int tokparse(char *caps,
-		    int (*str2flag)(char *, uint64_t *),
-		    uint64_t *flags)
+static uint64_t tokparse(char *caps, uint64_t (*str2flag) (char *inputstr))
 {
-	uint64_t value;
+	uint64_t flags = 0;
 	char *tok;
-	int ret;
 
-	for (tok = strtok(caps, "|"); tok != NULL; tok = strtok(NULL, "|")) {
-		ret = str2flag(tok, &value);
-		if (ret)
-			return ret;
+	for (tok = strtok(caps, "|"); tok != NULL; tok = strtok(NULL, "|"))
+		flags |= str2flag(tok);
 
-		*flags |= value;
-	}
-
-	return 0;
+	return flags;
 }
 
 static const char *param_type(enum fi_param_type type)
@@ -219,8 +182,6 @@ static const char *param_type(enum fi_param_type type)
 		return "String";
 	case FI_PARAM_INT:
 		return "Integer";
-	case FI_PARAM_SIZE_T:
-		return "size_t";
 	case FI_PARAM_BOOL:
 		return "Boolean (0/1, on/off, true/false, yes/no)";
 	default:
@@ -230,7 +191,7 @@ static const char *param_type(enum fi_param_type type)
 
 static int print_vars(void)
 {
-	int ret, count, i;
+	int ret, count;
 	struct fi_param *params;
 	char delim;
 
@@ -238,7 +199,7 @@ static int print_vars(void)
 	if (ret)
 		return ret;
 
-	for (i = 0; i < count; ++i) {
+	for (int i = 0; i < count; ++i) {
 		printf("# %s: %s\n", params[i].name, param_type(params[i].type));
 		printf("# %s\n", params[i].help_string);
 
@@ -257,8 +218,7 @@ static int print_vars(void)
 
 static int print_providers(struct fi_info *info)
 {
-	struct fi_info *cur;
-	for (cur = info; cur; cur = cur->next) {
+	for (struct fi_info *cur = info; cur; cur = cur->next) {
 		printf("%s:\n", cur->fabric_attr->prov_name);
 		printf("    version: %d.%d\n",
 			FI_MAJOR(cur->fabric_attr->prov_version),
@@ -269,11 +229,8 @@ static int print_providers(struct fi_info *info)
 
 static int print_short_info(struct fi_info *info)
 {
-	struct fi_info *cur;
-	for (cur = info; cur; cur = cur->next) {
-		printf("provider: %s\n", cur->fabric_attr->prov_name);
-		printf("    fabric: %s\n", cur->fabric_attr->name),
-		printf("    domain: %s\n", cur->domain_attr->name),
+	for (struct fi_info *cur = info; cur; cur = cur->next) {
+		printf("%s: %s\n", cur->fabric_attr->prov_name, cur->fabric_attr->name);
 		printf("    version: %d.%d\n", FI_MAJOR(cur->fabric_attr->prov_version),
 			FI_MINOR(cur->fabric_attr->prov_version));
 		if (!list_providers) {
@@ -286,8 +243,7 @@ static int print_short_info(struct fi_info *info)
 
 static int print_long_info(struct fi_info *info)
 {
-	struct fi_info *cur;
-	for (cur = info; cur; cur = cur->next) {
+	for (struct fi_info *cur = info; cur; cur = cur->next) {
 		printf("---\n");
 		printf("%s", fi_tostr(cur, FI_TYPE_INFO));
 	}
@@ -329,68 +285,38 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 
 	hints->mode = ~0;
-	hints->domain_attr->mode = ~0;
-	hints->domain_attr->mr_mode = ~(FI_MR_BASIC | FI_MR_SCALABLE);
 
-	while ((op = getopt_long(argc, argv, "n:P:c:m:t:a:p:d:f:elhv", longopts,
-				 &option_index)) != -1) {
+	while ((op = getopt_long(argc, argv, "n:p:c:m:t:a:f:elhv", longopts, &option_index)) != -1) {
 		switch (op) {
 		case 0:
-			/* there is no short variant only for --version */
-			if (ver) {
-				printf("%s: %s\n", argv[0], PACKAGE_VERSION);
-				printf("libfabric: %s\n", fi_tostr("1", FI_TYPE_VERSION));
-				printf("libfabric api: %d.%d\n",
-				       FI_MAJOR_VERSION, FI_MINOR_VERSION);
-				return EXIT_SUCCESS;
-			}
-			goto print_help;
+			/* If --verbose set a flag, do nothing. */
+			if (longopts[option_index].flag != 0)
+				break;
 		case 'n':
 			node = optarg;
 			break;
-		case 'P':
+		case 'p':
 			port = optarg;
 			break;
 		case 'c':
-			ret = tokparse(optarg, str2cap, &hints->caps);
-			if (ret)
-				goto out;
-
+			hints->caps = tokparse(optarg, str2cap);
 			use_hints = 1;
 			break;
 		case 'm':
-			hints->mode = 0;
-			ret = tokparse(optarg, str2mode, &hints->mode);
-			if (ret)
-				goto out;
-
+			hints->mode = tokparse(optarg, str2mode);
 			use_hints = 1;
 			break;
 		case 't':
-			ret = str2ep_type(optarg, &hints->ep_attr->type);
-			if (ret)
-				goto out;
-
+			hints->ep_attr->type = str2ep_type(optarg);
 			use_hints = 1;
 			break;
 		case 'a':
-			ret = str2addr_format(optarg, &hints->addr_format);
-			if (ret)
-				goto out;
-
-			use_hints = 1;
-			break;
-		case 'p':
-			free(hints->fabric_attr->prov_name);
-			hints->fabric_attr->prov_name = strdup(optarg);
-			use_hints = 1;
-			break;
-		case 'd':
-			hints->domain_attr->name = strdup(optarg);
+			hints->addr_format = str2addr_format(optarg);
 			use_hints = 1;
 			break;
 		case 'f':
-			hints->fabric_attr->name = strdup(optarg);
+			free(hints->fabric_attr->prov_name);
+			hints->fabric_attr->prov_name = strdup(optarg);
 			use_hints = 1;
 			break;
 		case 'e':
@@ -404,11 +330,17 @@ int main(int argc, char **argv)
 			break;
 		case 'h':
 		default:
-print_help:
 			printf("Usage: %s\n", argv[0]);
 			usage();
 			return EXIT_FAILURE;
 		}
+	}
+
+	if (ver) {
+		printf("%s: %s\n", argv[0], PACKAGE_VERSION);
+		printf("libfabric: %s\n", fi_tostr("1", FI_TYPE_VERSION));
+		printf("libfabric api: %d.%d\n", FI_MAJOR_VERSION, FI_MINOR_VERSION);
+		return EXIT_SUCCESS;
 	}
 
 	if (env) {

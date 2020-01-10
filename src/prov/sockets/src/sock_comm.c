@@ -49,17 +49,12 @@ static ssize_t sock_comm_send_socket(struct sock_conn *conn,
 {
 	ssize_t ret;
 
-	ret = ofi_send_socket(conn->sock_fd, buf, len, MSG_NOSIGNAL);
+	ret = write(conn->sock_fd, buf, len);
 	if (ret < 0) {
-		if (OFI_SOCK_TRY_SND_RCV_AGAIN(ofi_sockerr())) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			ret = 0;
-		} else if (ofi_sockerr() == EPIPE) {
-			conn->connected = 0;
-			SOCK_LOG_DBG("Disconnected port: %d\n",
-				     ofi_addr_get_port(&conn->addr.sa));
 		} else {
-			SOCK_LOG_DBG("write error: %s\n",
-				     strerror(ofi_sockerr()));
+			SOCK_LOG_DBG("write %s\n", strerror(errno));
 		}
 	}
 	if (ret > 0)
@@ -72,19 +67,19 @@ ssize_t sock_comm_flush(struct sock_pe_entry *pe_entry)
 	ssize_t ret1, ret2 = 0;
 	size_t endlen, len, xfer_len;
 
-	len = ofi_rbused(&pe_entry->comm_buf);
+	len = rbused(&pe_entry->comm_buf);
 	endlen = pe_entry->comm_buf.size -
 		(pe_entry->comm_buf.rcnt & pe_entry->comm_buf.size_mask);
 
 	xfer_len = MIN(len, endlen);
-	ret1 = sock_comm_send_socket(pe_entry->conn, (char*)pe_entry->comm_buf.buf +
+	ret1 = sock_comm_send_socket(pe_entry->conn, pe_entry->comm_buf.buf +
 				     (pe_entry->comm_buf.rcnt & pe_entry->comm_buf.size_mask),
 				     xfer_len);
 	if (ret1 > 0)
 		pe_entry->comm_buf.rcnt += ret1;
 
 	if (ret1 == xfer_len && xfer_len < len) {
-		ret2 = sock_comm_send_socket(pe_entry->conn, (char*)pe_entry->comm_buf.buf +
+		ret2 = sock_comm_send_socket(pe_entry->conn, pe_entry->comm_buf.buf +
 					     (pe_entry->comm_buf.rcnt & pe_entry->comm_buf.size_mask),
 					     len - xfer_len);
 		if (ret2 > 0)
@@ -102,7 +97,7 @@ ssize_t sock_comm_send(struct sock_pe_entry *pe_entry,
 	ssize_t ret, used;
 
 	if (len > pe_entry->cache_sz) {
-		used = ofi_rbused(&pe_entry->comm_buf);
+		used = rbused(&pe_entry->comm_buf);
 		if (used == sock_comm_flush(pe_entry)) {
 			return sock_comm_send_socket(pe_entry->conn, buf, len);
 		} else {
@@ -110,38 +105,39 @@ ssize_t sock_comm_send(struct sock_pe_entry *pe_entry,
 		}
 	}
 
-	if (ofi_rbavail(&pe_entry->comm_buf) < len) {
+	if (rbavail(&pe_entry->comm_buf) < len) {
 		ret = sock_comm_flush(pe_entry);
 		if (ret <= 0)
 			return 0;
 	}
 
-	ret = MIN(ofi_rbavail(&pe_entry->comm_buf), len);
-	ofi_rbwrite(&pe_entry->comm_buf, buf, ret);
-	ofi_rbcommit(&pe_entry->comm_buf);
+	ret = MIN(rbavail(&pe_entry->comm_buf), len);
+	rbwrite(&pe_entry->comm_buf, buf, ret);
+	rbcommit(&pe_entry->comm_buf);
 	SOCK_LOG_DBG("buffered %lu\n", ret);
 	return ret;
 }
 
 int sock_comm_tx_done(struct sock_pe_entry *pe_entry)
 {
-	return ofi_rbempty(&pe_entry->comm_buf);
+	return rbempty(&pe_entry->comm_buf);
 }
 
 static ssize_t sock_comm_recv_socket(struct sock_conn *conn,
 			      void *buf, size_t len)
 {
 	ssize_t ret;
-	ret = ofi_recv_socket(conn->sock_fd, buf, len, 0);
+	ret = recv(conn->sock_fd, buf, len, 0);
 	if (ret == 0) {
-		conn->connected = 0;
-		SOCK_LOG_DBG("Disconnected: port %d\n",
-			     ofi_addr_get_port(&conn->addr.sa));
+		conn->disconnected = 1;
+		SOCK_LOG_DBG("Disconnected: %s:%d\n", inet_ntoa(conn->addr.sin_addr),
+                               ntohs(conn->addr.sin_port));
+
 		return ret;
 	}
 
 	if (ret < 0) {
-		SOCK_LOG_DBG("read %s\n", strerror(ofi_sockerr()));
+		SOCK_LOG_DBG("read %s\n", strerror(errno));
 		ret = 0;
 	}
 
@@ -155,10 +151,10 @@ static void sock_comm_recv_buffer(struct sock_pe_entry *pe_entry)
 	int ret;
 	size_t max_read, avail;
 
-	avail = ofi_rbavail(&pe_entry->comm_buf);
+	avail = rbavail(&pe_entry->comm_buf);
 	assert(avail == pe_entry->comm_buf.size);
-	pe_entry->comm_buf.rcnt =
-		pe_entry->comm_buf.wcnt =
+	pe_entry->comm_buf.rcnt = 
+		pe_entry->comm_buf.wcnt = 
 		pe_entry->comm_buf.wpos = 0;
 
 	max_read = pe_entry->rem ? pe_entry->rem :
@@ -166,13 +162,13 @@ static void sock_comm_recv_buffer(struct sock_pe_entry *pe_entry)
 	ret = sock_comm_recv_socket(pe_entry->conn, (char *) pe_entry->comm_buf.buf,
 				    MIN(max_read, avail));
 	pe_entry->comm_buf.wpos += ret;
-	ofi_rbcommit(&pe_entry->comm_buf);
+	rbcommit(&pe_entry->comm_buf);
 }
 
 ssize_t sock_comm_recv(struct sock_pe_entry *pe_entry, void *buf, size_t len)
 {
 	ssize_t read_len;
-	if (ofi_rbempty(&pe_entry->comm_buf)) {
+	if (rbempty(&pe_entry->comm_buf)) {
 		if (len <= pe_entry->cache_sz) {
 			sock_comm_recv_buffer(pe_entry);
 		} else {
@@ -180,8 +176,8 @@ ssize_t sock_comm_recv(struct sock_pe_entry *pe_entry, void *buf, size_t len)
 		}
 	}
 
-	read_len = MIN(len, ofi_rbused(&pe_entry->comm_buf));
-	ofi_rbread(&pe_entry->comm_buf, buf, read_len);
+	read_len = MIN(len, rbused(&pe_entry->comm_buf));
+	rbread(&pe_entry->comm_buf, buf, read_len);
 	SOCK_LOG_DBG("read from buffer: %lu\n", read_len);
 	return read_len;
 }
@@ -189,15 +185,15 @@ ssize_t sock_comm_recv(struct sock_pe_entry *pe_entry, void *buf, size_t len)
 ssize_t sock_comm_peek(struct sock_conn *conn, void *buf, size_t len)
 {
 	ssize_t ret;
-	ret = ofi_recv_socket(conn->sock_fd, buf, len, MSG_PEEK);
+	ret = recv(conn->sock_fd, buf, len, MSG_PEEK);
 	if (ret == 0) {
-		conn->connected = 0;
+		conn->disconnected = 1;
 		SOCK_LOG_DBG("Disconnected\n");
 		return ret;
 	}
 
 	if (ret < 0) {
-		SOCK_LOG_DBG("peek %s\n", strerror(ofi_sockerr()));
+		SOCK_LOG_DBG("peek %s\n", strerror(errno));
 		ret = 0;
 	}
 
@@ -218,14 +214,4 @@ ssize_t sock_comm_discard(struct sock_pe_entry *pe_entry, size_t len)
 	ret = sock_comm_recv(pe_entry, buf, len);
 	free(buf);
 	return ret;
-}
-
-int sock_comm_is_disconnected(struct sock_pe_entry *pe_entry)
-{
-	/* If the PE entry is TX, there is no need to check that the ring buffer is
-	 * empty */
-	if (pe_entry->type == SOCK_PE_TX)
-		return (!pe_entry->conn->connected);
-	else
-		return (ofi_rbempty(&pe_entry->comm_buf) && !pe_entry->conn->connected);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -75,7 +75,7 @@ int psmx_am_rma_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 			psm_amarg_t *args, int nargs, void *src, uint32_t len)
 {
 	psm_amarg_t rep_args[8];
-	uint8_t *rma_addr;
+	void *rma_addr;
 	ssize_t rma_len;
 	uint64_t key;
 	int err = 0;
@@ -93,7 +93,7 @@ int psmx_am_rma_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 	switch (cmd) {
 	case PSMX_AM_REQ_WRITE:
 		rma_len = args[0].u32w1;
-		rma_addr = (uint8_t *)(uintptr_t)args[2].u64;
+		rma_addr = (void *)(uintptr_t)args[2].u64;
 		key = args[3].u64;
 		mr = psmx_mr_get(psmx_active_fabric->active_domain, key);
 		op_error = mr ?
@@ -122,13 +122,11 @@ int psmx_am_rma_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 						err = -FI_ENOMEM;
 				}
 
-				if (mr->domain->rma_ep->caps & FI_RMA_EVENT) {
-					if (mr->domain->rma_ep->remote_write_cntr)
-						psmx_cntr_inc(mr->domain->rma_ep->remote_write_cntr);
+				if (mr->domain->rma_ep->remote_write_cntr)
+					psmx_cntr_inc(mr->domain->rma_ep->remote_write_cntr);
 
-					if (mr->cntr && mr->cntr != mr->domain->rma_ep->remote_write_cntr)
-						psmx_cntr_inc(mr->cntr);
-				}
+				if (mr->cntr && mr->cntr != mr->domain->rma_ep->remote_write_cntr)
+					psmx_cntr_inc(mr->cntr);
 			}
 		}
 		if (eom || op_error) {
@@ -143,7 +141,7 @@ int psmx_am_rma_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 
 	case PSMX_AM_REQ_WRITE_LONG:
 		rma_len = args[0].u32w1;
-		rma_addr = (uint8_t *)(uintptr_t)args[2].u64;
+		rma_addr = (void *)(uintptr_t)args[2].u64;
 		key = args[3].u64;
 		mr = psmx_mr_get(psmx_active_fabric->active_domain, key);
 		op_error = mr ?
@@ -182,7 +180,7 @@ int psmx_am_rma_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 
 	case PSMX_AM_REQ_READ:
 		rma_len = args[0].u32w1;
-		rma_addr = (uint8_t *)(uintptr_t)args[2].u64;
+		rma_addr = (void *)(uintptr_t)args[2].u64;
 		key = args[3].u64;
 		offset = args[4].u64;
 		mr = psmx_mr_get(psmx_active_fabric->active_domain, key);
@@ -205,16 +203,14 @@ int psmx_am_rma_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 				NULL, NULL );
 
 		if (eom && !op_error) {
-			if (mr->domain->rma_ep->caps & FI_RMA_EVENT) {
-				if (mr->domain->rma_ep->remote_read_cntr)
-					psmx_cntr_inc(mr->domain->rma_ep->remote_read_cntr);
-			}
+			if (mr->domain->rma_ep->remote_read_cntr)
+				psmx_cntr_inc(mr->domain->rma_ep->remote_read_cntr);
 		}
 		break;
 
 	case PSMX_AM_REQ_READ_LONG:
 		rma_len = args[0].u32w1;
-		rma_addr = (uint8_t *)(uintptr_t)args[2].u64;
+		rma_addr = (void *)(uintptr_t)args[2].u64;
 		key = args[3].u64;
 		mr = psmx_mr_get(psmx_active_fabric->active_domain, key);
 		op_error = mr ?
@@ -256,7 +252,7 @@ int psmx_am_rma_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 		if (!req->error)
 			req->error = op_error;
 		if (eom) {
-			if (req->ep->send_cq && (!req->no_event || req->error)) {
+			if (req->ep->send_cq && !req->no_event) {
 				event = psmx_cq_create_event(
 						req->ep->send_cq,
 						req->write.context,
@@ -292,7 +288,7 @@ int psmx_am_rma_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 			req->read.len_read += len;
 		}
 		if (eom) {
-			if (req->ep->send_cq && (!req->no_event || req->error)) {
+			if (req->ep->send_cq && !req->no_event) {
 				event = psmx_cq_create_event(
 						req->ep->send_cq,
 						req->read.context,
@@ -392,19 +388,17 @@ static ssize_t psmx_rma_self(int am_cmd,
 				err = -FI_ENOMEM;
 		}
 
-		if (mr->domain->rma_ep->caps & FI_RMA_EVENT) {
-			if (cntr)
-				psmx_cntr_inc(cntr);
+		if (cntr)
+			psmx_cntr_inc(cntr);
 
-			if (mr_cntr)
-				psmx_cntr_inc(mr_cntr);
-		}
+		if (mr_cntr)
+			psmx_cntr_inc(mr_cntr);
 	}
 
 	no_event = (flags & PSMX_NO_COMPLETION) ||
 		   (ep->send_selective_completion && !(flags & FI_COMPLETION));
 
-	if (ep->send_cq && (!no_event || op_error)) {
+	if (ep->send_cq && !no_event) {
 		event = psmx_cq_create_event(
 				ep->send_cq,
 				context,
@@ -610,7 +604,7 @@ static ssize_t psmx_read(struct fid_ep *ep, void *buf, size_t len,
 	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
 
 	return _psmx_read(ep, buf, len, desc, src_addr, addr,
-			  key, context, ep_priv->tx_flags);
+			  key, context, ep_priv->flags);
 }
 
 static ssize_t psmx_readmsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
@@ -716,9 +710,9 @@ ssize_t _psmx_write(struct fid_ep *ep, const void *buf, size_t len,
 		if (!req)
 			return -FI_ENOMEM;
 
-		memset(req, 0, sizeof(*req));
-		memcpy((uint8_t *)req + sizeof(*req), (void *)buf, len);
-		buf = (uint8_t *)req + sizeof(*req);
+		memset((void *)req, 0, sizeof(*req));
+		memcpy((void *)req + sizeof(*req), (void *)buf, len);
+		buf = (void *)req + sizeof(*req);
 	} else {
 		req = calloc(1, sizeof(*req));
 		if (!req)
@@ -796,7 +790,7 @@ ssize_t _psmx_write(struct fid_ep *ep, const void *buf, size_t len,
 					PSMX_AM_RMA_HANDLER, args, nargs,
 					(void *)buf, chunk_size,
 					am_flags, NULL, NULL);
-		buf = (const uint8_t *)buf + chunk_size;
+		buf += chunk_size;
 		addr += chunk_size;
 		len -= chunk_size;
 	}
@@ -827,7 +821,7 @@ static ssize_t psmx_write(struct fid_ep *ep, const void *buf, size_t len,
 	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
 
 	return _psmx_write(ep, buf, len, desc, dest_addr, addr, key, context,
-			   ep_priv->tx_flags, 0);
+			   ep_priv->flags, 0);
 }
 
 static ssize_t psmx_writemsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
@@ -862,7 +856,7 @@ static ssize_t psmx_inject(struct fid_ep *ep, const void *buf, size_t len,
 	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
 
 	return _psmx_write(ep, buf, len, NULL, dest_addr, addr, key,
-			   NULL, ep_priv->tx_flags | FI_INJECT | PSMX_NO_COMPLETION, 0);
+			   NULL, ep_priv->flags | FI_INJECT | PSMX_NO_COMPLETION, 0);
 }
 
 static ssize_t psmx_writedata(struct fid_ep *ep, const void *buf, size_t len, void *desc,
@@ -874,7 +868,7 @@ static ssize_t psmx_writedata(struct fid_ep *ep, const void *buf, size_t len, vo
 	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
 
 	return _psmx_write(ep, buf, len, desc, dest_addr, addr, key, context,
-			   ep_priv->tx_flags | FI_REMOTE_CQ_DATA, data);
+			   ep_priv->flags | FI_REMOTE_CQ_DATA, data);
 }
 
 static ssize_t psmx_injectdata(struct fid_ep *ep, const void *buf, size_t len,
@@ -886,7 +880,7 @@ static ssize_t psmx_injectdata(struct fid_ep *ep, const void *buf, size_t len,
 	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
 
 	return _psmx_write(ep, buf, len, NULL, dest_addr, addr, key,
-			   NULL, ep_priv->tx_flags | FI_INJECT | PSMX_NO_COMPLETION,
+			   NULL, ep_priv->flags | FI_INJECT | PSMX_NO_COMPLETION,
 			   data);
 }
 

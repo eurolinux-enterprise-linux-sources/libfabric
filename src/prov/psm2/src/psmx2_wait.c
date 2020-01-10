@@ -1,9 +1,9 @@
 /*
- * Copyright (c) 2013-2018 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
- * This software is available to you under a choice of one of two
+ * This software is waitailable to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
+ * General Public License (GPL) Version 2, waitailable from the file
  * COPYING in the main directory of this source tree, or the
  * BSD license below:
  *
@@ -47,9 +47,7 @@ static volatile int	psmx2_wait_thread_busy = 0;
 
 static void *psmx2_wait_progress(void *args)
 {
-	struct psmx2_fid_fabric *fabric = args;
-	struct psmx2_fid_domain *domain;
-	struct dlist_entry *item;
+	struct psmx2_fid_domain *domain = args;
 
 	psmx2_wait_thread_ready = 1;
 	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
@@ -63,21 +61,8 @@ static void *psmx2_wait_progress(void *args)
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
 		psmx2_wait_thread_busy = 1;
-		while (psmx2_wait_thread_enabled) {
-			psmx2_lock(&fabric->domain_lock, 1);
-			dlist_foreach(&fabric->domain_list, item) {
-				domain = container_of(item, struct psmx2_fid_domain, entry);
-				if (domain->progress_thread_enabled &&
-				    domain->progress_thread != pthread_self())
-					continue;
-
-				psmx2_progress_all(domain);
-
-				if (!psmx2_wait_thread_enabled)
-					break;
-			}
-			psmx2_unlock(&fabric->domain_lock, 1);
-		}
+		while (psmx2_wait_thread_enabled)
+			psmx2_progress(domain);
 
 		psmx2_wait_thread_busy = 0;
 
@@ -87,27 +72,15 @@ static void *psmx2_wait_progress(void *args)
 	return NULL;
 }
 
-static void psmx2_wait_start_progress(struct psmx2_fid_fabric *fabric)
+static void psmx2_wait_start_progress(struct psmx2_fid_domain *domain)
 {
-	struct dlist_entry *item;
-	struct psmx2_fid_domain *domain;
-	int run_wait_thread = 0;
 	pthread_attr_t attr;
 	int err;
 
-	if (!fabric)
+	if (!domain)
 		return;
 
-	psmx2_lock(&fabric->domain_lock, 1);
-	dlist_foreach(&fabric->domain_list, item) {
-		domain = container_of(item, struct psmx2_fid_domain, entry);
-		if (!domain->progress_thread_enabled ||
-		    domain->progress_thread == pthread_self())
-			run_wait_thread = 1;
-	}
-	psmx2_unlock(&fabric->domain_lock, 1);
-
-	if (!run_wait_thread)
+	if (domain->progress_thread_enabled && domain->progress_thread != pthread_self())
 		return;
 
 	if (!psmx2_wait_thread) {
@@ -116,7 +89,7 @@ static void psmx2_wait_start_progress(struct psmx2_fid_fabric *fabric)
 		pthread_attr_init(&attr);
 		pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
 		err = pthread_create(&psmx2_wait_thread, &attr,
-				     psmx2_wait_progress, (void *)fabric);
+				     psmx2_wait_progress, (void *)domain);
 		if (err)
 			FI_WARN(&psmx2_prov, FI_LOG_EQ,
 				"cannot create wait progress thread\n");
@@ -140,8 +113,7 @@ static void psmx2_wait_stop_progress(void)
 static struct fi_ops_wait *psmx2_wait_ops_save;
 static struct fi_ops_wait psmx2_wait_ops;
 
-DIRECT_FN
-STATIC int psmx2_wait_wait(struct fid_wait *wait, int timeout)
+static int psmx2_wait_wait(struct fid_wait *wait, int timeout)
 {
 	struct util_wait *wait_priv;
 	struct psmx2_fid_fabric *fabric;
@@ -150,7 +122,7 @@ STATIC int psmx2_wait_wait(struct fid_wait *wait, int timeout)
 	wait_priv = container_of(wait, struct util_wait, wait_fid);
 	fabric = container_of(wait_priv->fabric, struct psmx2_fid_fabric, util_fabric);
 
-	psmx2_wait_start_progress(fabric);
+	psmx2_wait_start_progress(fabric->active_domain);
 
 	err = psmx2_wait_ops_save->wait(wait, timeout);
 
@@ -159,14 +131,13 @@ STATIC int psmx2_wait_wait(struct fid_wait *wait, int timeout)
 	return err;
 }
 
-DIRECT_FN
 int psmx2_wait_open(struct fid_fabric *fabric, struct fi_wait_attr *attr,
 		   struct fid_wait **waitset)
 {
 	struct fid_wait *wait;
 	int err;
 
-	err = ofi_wait_fd_open(fabric, attr, &wait);
+	err = fi_wait_fd_open(fabric, attr, &wait);
 	if (err)
 		return err;
 
@@ -176,40 +147,6 @@ int psmx2_wait_open(struct fid_fabric *fabric, struct fi_wait_attr *attr,
 	wait->ops = &psmx2_wait_ops;
 
 	*waitset = wait;
-	return 0;
-}
-
-DIRECT_FN
-int psmx2_wait_trywait(struct fid_fabric *fabric, struct fid **fids, int count)
-{
-	struct psmx2_fid_cq *cq_priv;
-	struct util_eq *eq;
-	struct util_wait *wait;
-	int i, ret;
-
-	for (i = 0; i < count; i++) {
-		switch (fids[i]->fclass) {
-			case FI_CLASS_CQ:
-				cq_priv = container_of(fids[i], struct psmx2_fid_cq, cq);
-				wait = cq_priv->wait;
-				break;
-			case FI_CLASS_EQ:
-				eq = container_of(fids[i], struct util_eq, eq_fid.fid);
-				wait = eq->wait;
-				break;
-			case FI_CLASS_CNTR:
-				return -FI_ENOSYS;
-			case FI_CLASS_WAIT:
-				wait = container_of(fids[i], struct util_wait, wait_fid.fid);
-				break;
-			default:
-				return -FI_EINVAL;
-		}
-
-		ret = wait->try(wait);
-		if (ret)
-			return ret;
-	}
 	return 0;
 }
 

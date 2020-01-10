@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2015-2016 Cray Inc.  All rights reserved.
- * Copyright (c) 2015-2017 Los Alamos National Security, LLC. All rights reserved.
+ * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -34,6 +34,10 @@
 #ifndef _GNIX_DATAGRAM_H_
 #define _GNIX_DATAGRAM_H_
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include "gnix.h"
 
 /*
@@ -64,29 +68,6 @@
  */
 
 /**
- * Set of attributes that can be used as an argument to gnix_dgram_hndl_alloc
- *
- * @var timeout_needed       pointer to a function which returns true
- *                           if a timeout is needed in the call to
- *                           GNI_EpPostdataWaitById to insure progress
- * @var timeout_progress     pointer to a function should be invoked
- *                           by the datagram engine to progress
- *                           the state of the consumer of the datagram
- *                           functionality.
- * @var timeout_data         pointer to data supplied as the argument to
- *                           the timeout_needed and timeout_progress methods
- * @var timeout              the timeout value in milliseconds to be
- *                           supplied to GNI_EpPostdataWaitById if
- *                           timeout_needed returns to true
- */
-struct gnix_dgram_hndl_attr {
-	bool (*timeout_needed)(void *);
-	void (*timeout_progress)(void *);
-	void *timeout_data;
-	uint32_t timeout;
-};
-
-/**
  * Datagram allocator struct
  *
  * @var cm_nic               pointer to a previously allocated cm_nic with
@@ -97,11 +78,6 @@ struct gnix_dgram_hndl_attr {
  * @var wc_dgram_active_list head of active list of wildcard datagrams
  * @var dgram_base           starting address of memory block from
  *                           which datagram structures are allocated
- * @var timeout_needed       In the case of FI_PROGRESS_AUTO, invoke this
- *                           method prior to call to GNI_EpPostDataWaitById
- *                           to check if we need to timeout in order to
- *                           progress datagrams which had been stalled
- *                           due to GNI_RC_ERROR_RESOURCE.
  * @var lock                 lock to protect dgram lists
  * @var progress_thread      pthread id of progress thread for this
  *                           datagram allocator
@@ -109,11 +85,6 @@ struct gnix_dgram_hndl_attr {
  *                           datagram allocator
  * @var n_wc_dgrams          number of wildcard datagrams managed by
  *                           the datagram allocator
- * @var timeout              time in milliseconds to wait for datagram to
- *                           complete. By default set to -1 (infinite timeout),
- *                           but can be set to handle cases where a timeout
- *                           is required when using FI_PROGRESS_AUTO for
- *                           control progress.
  */
 struct gnix_dgram_hndl {
 	struct gnix_cm_nic *cm_nic;
@@ -122,14 +93,10 @@ struct gnix_dgram_hndl {
 	struct dlist_entry wc_dgram_free_list;
 	struct dlist_entry wc_dgram_active_list;
 	struct gnix_datagram *dgram_base;
-	bool (*timeout_needed)(void *);
-	void (*timeout_progress)(void *);
-	void *timeout_data;
 	fastlock_t lock;
 	pthread_t progress_thread;
 	int n_dgrams;
 	int n_wc_dgrams;
-	uint32_t timeout;
 };
 
 enum gnix_dgram_type {
@@ -139,7 +106,9 @@ enum gnix_dgram_type {
 
 enum gnix_dgram_state {
 	GNIX_DGRAM_STATE_FREE,
-	GNIX_DGRAM_STATE_ACTIVE
+	GNIX_DGRAM_STATE_CONNECTING,
+	GNIX_DGRAM_STATE_LISTENING,
+	GNIX_DGRAM_STATE_CONNECTED
 };
 
 enum gnix_dgram_buf {
@@ -168,6 +137,14 @@ enum gnix_dgram_poll_type {
  * @var type                 datagram type (bound or wildcard)
  * @var d_hndl               pointer to datagram handle this datagram is
  *                           associated
+ * @var pre_test_clbk_fn     Call back function to be called prior to
+ *                           a call to GNI_EpPostDataTestById to retrieve
+ *                           the datagram from GNI.  This callback is invoked
+ *                           while the lock is held on the cm nic.
+ * @var post_test_clbk_fn    Call back function to be called following a
+ *                           call to GNI_EpPostDataTestById to retrieve
+ *                           the datagram from GNI.  This callback is invoked
+ *                           while the lock is held on the cm nic.
  * @var pre_post_clbk_fn     Call back function to be called prior to
  *                           to the call to GNI_EpPostDataWId. This callback
  *                           is invoked while the lock is held on the cm nic.
@@ -209,6 +186,10 @@ struct gnix_datagram {
 	enum gnix_dgram_state   state;
 	enum gnix_dgram_type    type;
 	struct gnix_dgram_hndl  *d_hndl;
+	int  (*pre_test_clbk_fn)(struct gnix_datagram *);
+	int  (*post_test_clbk_fn)(struct gnix_datagram *,
+				      struct gnix_address,
+				      gni_post_state_t);
 	int  (*pre_post_clbk_fn)(struct gnix_datagram *,
 				 int *);
 	int  (*post_post_clbk_fn)(struct gnix_datagram *,
@@ -232,9 +213,8 @@ struct gnix_datagram {
 /**
  * @brief Allocates a handle to a datagram allocator instance
  *
+ * @param[in]  fabric     pointer to previously allocated gnix_fid_fabric object
  * @param[in]  cm_nic     pointer to previously allocated gnix_cm_nic object
- * @param[in]  attr       optional pointer to a gnix_dgram_hndl_attr
- *                        structure
  * @param[in]  progress   progress model to be used for this cm_nic
  *                        (see fi_domain man page)
  * @param[out] handl_ptr  location in which the address of the allocated
@@ -245,10 +225,10 @@ struct gnix_datagram {
  * @return -FI_EAGAIN     In the case of FI_PROGRESS_AUTO, system lacked
  *                        resources to spawn a progress thread.
  */
-int _gnix_dgram_hndl_alloc(struct gnix_cm_nic *cm_nic,
-			   enum fi_progress progress,
-			   const struct gnix_dgram_hndl_attr *attr,
-			   struct gnix_dgram_hndl **hndl_ptr);
+int _gnix_dgram_hndl_alloc(const struct gnix_fid_fabric *fabric,
+				struct gnix_cm_nic *cm_nic,
+				enum fi_progress progress,
+				struct gnix_dgram_hndl **hndl_ptr);
 
 /**
  * @brief Frees a handle to a datagram allocator and associated internal
@@ -370,5 +350,9 @@ int _gnix_dgram_rewind_buf(struct gnix_datagram *d, enum gnix_dgram_buf);
 int _gnix_dgram_poll(struct gnix_dgram_hndl *hndl_ptr,
 			enum gnix_dgram_poll_type type);
 
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* _GNIX_DATAGRAM_H_ */

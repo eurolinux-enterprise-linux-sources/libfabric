@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2016, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2015, Cisco Systems, Inc. All rights reserved.
  * Copyright (c) 2015, Intel Corp., Inc.  All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -37,9 +37,9 @@
 #include <stdlib.h>
 
 #include <rdma/fi_errno.h>
+#include <rdma/fi_log.h>
 
-#include "ofi.h"
-
+#include "fi.h"
 
 static const char * const log_subsys[] = {
 	[FI_LOG_CORE] = "core",
@@ -51,7 +51,6 @@ static const char * const log_subsys[] = {
 	[FI_LOG_CQ] = "cq",
 	[FI_LOG_EQ] = "eq",
 	[FI_LOG_MR] = "mr",
-	[FI_LOG_CNTR] = "cntr",
 	[FI_LOG_SUBSYS_MAX] = NULL
 };
 
@@ -62,6 +61,8 @@ static const char * const log_levels[] = {
 	[FI_LOG_DEBUG] = "debug",
 	[FI_LOG_MAX] = NULL
 };
+
+extern struct fi_provider core_prov;
 
 enum {
 	FI_LOG_SUBSYS_OFFSET	= FI_LOG_MAX,
@@ -80,7 +81,6 @@ enum {
 
 uint64_t log_mask;
 struct fi_filter prov_log_filter;
-
 
 static int fi_convert_log_str(const char *value)
 {
@@ -112,28 +112,27 @@ void fi_log_init(void)
 	fi_param_define(NULL, "log_prov", FI_PARAM_STRING,
 			"Specify specific provider to log (default: all)");
 	fi_param_get_str(NULL, "log_prov", &provstr);
-	ofi_create_filter(&prov_log_filter, provstr);
+	fi_create_filter(&prov_log_filter, provstr);
 
 	fi_param_define(NULL, "log_subsys", FI_PARAM_STRING,
 			"Specify specific subsystem to log (default: all)");
 	fi_param_get_str(NULL, "log_subsys", &subsysstr);
-	ofi_create_filter(&subsys_filter, subsysstr);
+	fi_create_filter(&subsys_filter, subsysstr);
 	for (i = 0; i < FI_LOG_SUBSYS_MAX; i++) {
-		if (!ofi_apply_filter(&subsys_filter, log_subsys[i]))
-			log_mask |= (1ULL << (i + FI_LOG_SUBSYS_OFFSET));
+		if (!fi_apply_filter(&subsys_filter, log_subsys[i]))
+			log_mask |= (1 << (i + FI_LOG_SUBSYS_OFFSET));
 	}
-	ofi_free_filter(&subsys_filter);
+	fi_free_filter(&subsys_filter);
 }
 
 void fi_log_fini(void)
 {
-	ofi_free_filter(&prov_log_filter);
+	fi_free_filter(&prov_log_filter);
 }
 
-__attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
-int DEFAULT_SYMVER_PRE(fi_log_enabled)(const struct fi_provider *prov,
-		enum fi_log_level level,
-		enum fi_log_subsys subsys)
+__attribute__((visibility ("default")))
+int DEFAULT_SYMVER_PRE(fi_log_enabled)(const struct fi_provider *prov, enum fi_log_level level,
+		   enum fi_log_subsys subsys)
 {
 	struct fi_prov_context *ctx;
 
@@ -141,12 +140,12 @@ int DEFAULT_SYMVER_PRE(fi_log_enabled)(const struct fi_provider *prov,
 	return ((FI_LOG_TAG(ctx->disable_logging, level, subsys) & log_mask) ==
 		FI_LOG_TAG(ctx->disable_logging, level, subsys));
 }
-DEFAULT_SYMVER(fi_log_enabled_, fi_log_enabled, FABRIC_1.0);
+DEFAULT_SYMVER(fi_log_enabled_, fi_log_enabled);
 
-__attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
+__attribute__((visibility ("default")))
 void DEFAULT_SYMVER_PRE(fi_log)(const struct fi_provider *prov, enum fi_log_level level,
-		enum fi_log_subsys subsys, const char *func, int line,
-		const char *fmt, ...)
+	    enum fi_log_subsys subsys, const char *func, int line,
+	    const char *fmt, ...)
 {
 	char buf[1024];
 	int size;
@@ -163,4 +162,4 @@ void DEFAULT_SYMVER_PRE(fi_log)(const struct fi_provider *prov, enum fi_log_leve
 
 	fprintf(stderr, "%s", buf);
 }
-DEFAULT_SYMVER(fi_log_, fi_log, FABRIC_1.0);
+DEFAULT_SYMVER(fi_log_, fi_log);

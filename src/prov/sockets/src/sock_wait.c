@@ -35,7 +35,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
-#include <pthread.h>
 
 #include "sock.h"
 #include "sock_util.h"
@@ -48,7 +47,6 @@ enum {
 	WAIT_WRITE_FD,
 };
 
-#ifndef _WIN32 /* there is no support of wait objects on windows */
 int sock_wait_get_obj(struct fid_wait *fid, void *arg)
 {
 	struct fi_mutex_cond mut_cond;
@@ -65,9 +63,10 @@ int sock_wait_get_obj(struct fid_wait *fid, void *arg)
 
 	case FI_WAIT_MUTEX_COND:
 		mut_cond.mutex = &wait->wobj.mutex_cond.mutex;
-		mut_cond.cond  = &wait->wobj.mutex_cond.cond;
+		mut_cond.cond = &wait->wobj.mutex_cond.cond;
 		memcpy(arg, &mut_cond, sizeof(mut_cond));
 		break;
+
 	default:
 		SOCK_LOG_ERROR("Invalid wait obj type\n");
 		return -FI_EINVAL;
@@ -75,12 +74,6 @@ int sock_wait_get_obj(struct fid_wait *fid, void *arg)
 
 	return 0;
 }
-#else /* _WIN32 */
-int sock_wait_get_obj(struct fid_wait *fid, void *arg)
-{
-    return -FI_ENOSYS;
-}
-#endif
 
 static int sock_wait_init(struct sock_wait *wait, enum fi_wait_obj type)
 {
@@ -91,12 +84,12 @@ static int sock_wait_init(struct sock_wait *wait, enum fi_wait_obj type)
 	switch (type) {
 	case FI_WAIT_FD:
 		if (socketpair(AF_UNIX, SOCK_STREAM, 0, wait->wobj.fd))
-			return -ofi_sockerr();
+			return -errno;
 
 		ret = fd_set_nonblock(wait->wobj.fd[WAIT_READ_FD]);
 		if (ret) {
-			ofi_close_socket(wait->wobj.fd[WAIT_READ_FD]);
-			ofi_close_socket(wait->wobj.fd[WAIT_WRITE_FD]);
+			close(wait->wobj.fd[WAIT_READ_FD]);
+			close(wait->wobj.fd[WAIT_WRITE_FD]);
 			return ret;
 		}
 		break;
@@ -115,19 +108,22 @@ static int sock_wait_init(struct sock_wait *wait, enum fi_wait_obj type)
 
 static int sock_wait_wait(struct fid_wait *wait_fid, int timeout)
 {
+	int err = 0, ret;
 	struct sock_cq *cq;
 	struct sock_cntr *cntr;
+	struct timeval now;
 	struct sock_wait *wait;
-	uint64_t start_ms = 0, end_ms = 0;
+	double start_ms = 0.0, end_ms = 0.0;
 	struct dlist_entry *p, *head;
 	struct sock_fid_list *list_item;
-	int err = 0;
-	ssize_t ret;
 	char c;
 
 	wait = container_of(wait_fid, struct sock_wait, wait_fid);
-	if (timeout > 0)
-		start_ms = fi_gettime_ms();
+	if (timeout > 0) {
+		gettimeofday(&now, NULL);
+		start_ms = (double)now.tv_sec * 1000.0 +
+			(double)now.tv_usec / 1000.0;
+	}
 
 	head = &wait->fid_list;
 	for (p = head->next; p != head; p = p->next) {
@@ -137,7 +133,7 @@ static int sock_wait_wait(struct fid_wait *wait_fid, int timeout)
 			cq = container_of(list_item->fid,
 					  struct sock_cq, cq_fid);
 			sock_cq_progress(cq);
-			if (ofi_rbused(&cq->cqerr_rb))
+			if (rbused(&cq->cqerr_rb))
 				return 1;
 			break;
 
@@ -149,8 +145,10 @@ static int sock_wait_wait(struct fid_wait *wait_fid, int timeout)
 		}
 	}
 	if (timeout > 0) {
-		end_ms = fi_gettime_ms();
-		timeout -=  (int) (end_ms - start_ms);
+		gettimeofday(&now, NULL);
+		end_ms = (double)now.tv_sec * 1000.0 +
+			(double)now.tv_usec / 1000.0;
+		timeout -=  (end_ms - start_ms);
 		timeout = timeout < 0 ? 0 : timeout;
 	}
 
@@ -161,7 +159,7 @@ static int sock_wait_wait(struct fid_wait *wait_fid, int timeout)
 			err = -FI_ETIMEDOUT;
 		} else {
 			while (err > 0) {
-				ret = ofi_read_socket(wait->wobj.fd[WAIT_READ_FD], &c, 1);
+				ret = read(wait->wobj.fd[WAIT_READ_FD], &c, 1);
 				if (ret != 1) {
 					SOCK_LOG_ERROR("failed to read wait_fd\n");
 					err = 0;
@@ -188,13 +186,13 @@ void sock_wait_signal(struct fid_wait *wait_fid)
 {
 	struct sock_wait *wait;
 	static char c = 'a';
-	ssize_t ret;
+	int ret;
 
 	wait = container_of(wait_fid, struct sock_wait, wait_fid);
 
 	switch (wait->type) {
 	case FI_WAIT_FD:
-		ret = ofi_write_socket(wait->wobj.fd[WAIT_WRITE_FD], &c, 1);
+		ret = write(wait->wobj.fd[WAIT_WRITE_FD], &c, 1);
 		if (ret != 1)
 			SOCK_LOG_ERROR("failed to signal\n");
 		break;
@@ -246,11 +244,11 @@ int sock_wait_close(fid_t fid)
 	}
 
 	if (wait->type == FI_WAIT_FD) {
-		ofi_close_socket(wait->wobj.fd[WAIT_READ_FD]);
-		ofi_close_socket(wait->wobj.fd[WAIT_WRITE_FD]);
+		close(wait->wobj.fd[WAIT_READ_FD]);
+		close(wait->wobj.fd[WAIT_WRITE_FD]);
 	}
 
-	ofi_atomic_dec32(&wait->fab->ref);
+	atomic_dec(&wait->fab->ref);
 	free(wait);
 	return 0;
 }
@@ -313,7 +311,7 @@ int sock_wait_open(struct fid_fabric *fabric, struct fi_wait_attr *attr,
 	wait->wait_fid.ops = &sock_wait_ops;
 	wait->fab = fab;
 	wait->type = wait_obj_type;
-	ofi_atomic_inc32(&fab->ref);
+	atomic_inc(&fab->ref);
 	dlist_init(&wait->fid_list);
 
 	*waitset = &wait->wait_fid;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2018, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014-2016, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -46,19 +46,18 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
+#include <rdma/fi_prov.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-#include "ofi.h"
-#include "ofi_enosys.h"
-#include "ofi_util.h"
+#include "fi.h"
+#include "fi_enosys.h"
 
 #include "usnic_direct.h"
 #include "usdf.h"
 #include "usdf_rdm.h"
 #include "usdf_timer.h"
 #include "usdf_poll.h"
-#include "usdf_cm.h"
 
 static int
 usdf_domain_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
@@ -81,7 +80,7 @@ usdf_domain_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
                         return -FI_EINVAL;
                 }
                 udp->dom_eq = eq_fidtou(bfid);
-                ofi_atomic_inc32(&udp->dom_eq->eq_refcnt);
+                atomic_inc(&udp->dom_eq->eq_refcnt);
                 break;
         default:
                 return -FI_EINVAL;
@@ -110,7 +109,7 @@ usdf_dom_rdc_free_data(struct usdf_domain *udp)
 		pthread_spin_unlock(&udp->dom_progress_lock);
 
 		/* XXX probably want a timeout here... */
-		while (ofi_atomic_get32(&udp->dom_rdc_free_cnt) <
+		while (atomic_get(&udp->dom_rdc_free_cnt) <
 		       (int)udp->dom_rdc_total) {
 			pthread_yield();
 		}
@@ -140,7 +139,7 @@ usdf_dom_rdc_alloc_data(struct usdf_domain *udp)
 		return -FI_ENOMEM;
 	}
 	SLIST_INIT(&udp->dom_rdc_free);
-	ofi_atomic_initialize32(&udp->dom_rdc_free_cnt, 0);
+	atomic_initialize(&udp->dom_rdc_free_cnt, 0);
 	for (i = 0; i < USDF_RDM_FREE_BLOCK; ++i) {
 		rdc = calloc(1, sizeof(*rdc));
 		if (rdc == NULL) {
@@ -159,7 +158,7 @@ usdf_dom_rdc_alloc_data(struct usdf_domain *udp)
 		TAILQ_INIT(&rdc->dc_wqe_posted);
 		TAILQ_INIT(&rdc->dc_wqe_sent);
 		SLIST_INSERT_HEAD(&udp->dom_rdc_free, rdc, dc_addr_link);
-		ofi_atomic_inc32(&udp->dom_rdc_free_cnt);
+		atomic_inc(&udp->dom_rdc_free_cnt);
 	}
 	udp->dom_rdc_total = USDF_RDM_FREE_BLOCK;
 	return 0;
@@ -174,7 +173,7 @@ usdf_domain_close(fid_t fid)
 	USDF_TRACE_SYS(DOMAIN, "\n");
 
 	udp = container_of(fid, struct usdf_domain, dom_fid.fid);
-	if (ofi_atomic_get32(&udp->dom_refcnt) > 0) {
+	if (atomic_get(&udp->dom_refcnt) > 0) {
 		return -FI_EBUSY;
 	}
 
@@ -187,9 +186,9 @@ usdf_domain_close(fid_t fid)
 	usdf_dom_rdc_free_data(udp);
 
 	if (udp->dom_eq != NULL) {
-		ofi_atomic_dec32(&udp->dom_eq->eq_refcnt);
+		atomic_dec(&udp->dom_eq->eq_refcnt);
 	}
-	ofi_atomic_dec32(&udp->dom_fabric->fab_refcnt);
+	atomic_dec(&udp->dom_fabric->fab_refcnt);
 	LIST_REMOVE(udp, dom_link);
 	fi_freeinfo(udp->dom_info);
 	free(udp);
@@ -208,8 +207,8 @@ static struct fi_ops usdf_fid_ops = {
 static struct fi_ops_mr usdf_domain_mr_ops = {
 	.size = sizeof(struct fi_ops_mr),
 	.reg = usdf_reg_mr,
-	.regv = usdf_regv_mr,
-	.regattr = usdf_regattr,
+	.regv = fi_no_mr_regv,
+	.regattr = fi_no_mr_regattr,
 };
 
 static struct fi_ops_domain usdf_domain_ops = {
@@ -222,7 +221,6 @@ static struct fi_ops_domain usdf_domain_ops = {
 	.poll_open = usdf_poll_open,
 	.stx_ctx = fi_no_stx_context,
 	.srx_ctx = fi_no_srx_context,
-	.query_atomic = usdf_query_atomic,
 };
 
 int
@@ -239,24 +237,16 @@ usdf_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 #endif
 
 	USDF_TRACE_SYS(DOMAIN, "\n");
-	sin = NULL;
-
-	fp = fab_fidtou(fabric);
 
 	if (info->domain_attr != NULL) {
-		/* No versioning information available here. */
-		if (!usdf_domain_checkname(0, fp->fab_dev_attrs,
-					   info->domain_attr->name)) {
-			USDF_WARN_SYS(DOMAIN, "domain name mismatch\n");
-			return -FI_ENODATA;
-		}
-
-		if (ofi_check_mr_mode(
-			&usdf_ops, fabric->api_version,
-			FI_MR_BASIC | FI_MR_ALLOCATED | FI_MR_LOCAL, info)) {
+		switch (info->domain_attr->mr_mode) {
+		case FI_MR_UNSPEC:
+		case FI_MR_BASIC:
+			break;
+		default:
 			/* the caller ignored our fi_getinfo results */
 			USDF_WARN_SYS(DOMAIN, "MR mode (%d) not supported\n",
-				      info->domain_attr->mr_mode);
+				info->domain_attr->mr_mode);
 			return -FI_ENODATA;
 		}
 	}
@@ -268,6 +258,8 @@ usdf_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 		goto fail;
 	}
 
+	fp = fab_fidtou(fabric);
+
 	USDF_DBG("uda_devname=%s\n", fp->fab_dev_attrs->uda_devname);
 
 	/*
@@ -276,31 +268,16 @@ usdf_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 	switch (info->addr_format) {
 	case FI_SOCKADDR:
 		addrlen = sizeof(struct sockaddr);
-		sin = info->src_addr;
 		break;
 	case FI_SOCKADDR_IN:
 		addrlen = sizeof(struct sockaddr_in);
-		sin = info->src_addr;
 		break;
-	case FI_ADDR_STR:
-		sin = usdf_format_to_sin(info, info->src_addr);
-		if (NULL == sin) {
-			ret = -FI_ENOMEM;
-			goto fail;
-		}
-		goto skip_size_check;
 	default:
 		ret = -FI_EINVAL;
 		goto fail;
 	}
-
-	if (info->src_addrlen != addrlen) {
-		ret =  -FI_EINVAL;
-		goto fail;
-	}
-
-skip_size_check:
-	if (sin->sin_family != AF_INET ||
+	sin = info->src_addr;
+	if (info->src_addrlen != addrlen || sin->sin_family != AF_INET ||
 	    sin->sin_addr.s_addr != fp->fab_dev_attrs->uda_ipaddr_be) {
 		USDF_DBG_SYS(DOMAIN, "requested src_addr (%s) != fabric addr (%s)\n",
 			inet_ntop(AF_INET, &sin->sin_addr.s_addr,
@@ -309,10 +286,8 @@ skip_size_check:
 				actual, sizeof(actual)));
 
 		ret = -FI_EINVAL;
-		usdf_free_sin_if_needed(info, sin);
 		goto fail;
 	}
-	usdf_free_sin_if_needed(info, sin);
 
 	ret = usd_open(fp->fab_dev_attrs->uda_devname, &udp->dom_dev);
 	if (ret != 0) {
@@ -351,8 +326,8 @@ skip_size_check:
 
 	udp->dom_fabric = fp;
 	LIST_INSERT_HEAD(&fp->fab_domain_list, udp, dom_link);
-	ofi_atomic_initialize32(&udp->dom_refcnt, 0);
-	ofi_atomic_inc32(&fp->fab_refcnt);
+	atomic_initialize(&udp->dom_refcnt, 0);
+	atomic_inc(&fp->fab_refcnt);
 
 	*domain = &udp->dom_fid;
 	return 0;
@@ -369,147 +344,4 @@ fail:
 		free(udp);
 	}
 	return ret;
-}
-
-int usdf_domain_getname(uint32_t version, struct usd_device_attrs *dap,
-			char **name)
-{
-	int ret = FI_SUCCESS;
-	char *buf = NULL;
-
-	if (FI_VERSION_GE(version, FI_VERSION(1, 4))) {
-		buf = strdup(dap->uda_devname);
-		if (!buf) {
-			ret = -errno;
-			USDF_DBG("strdup failed while creating domain name\n");
-		}
-	}
-
-	*name = buf;
-	return ret;
-}
-
-/* In pre-1.4 the domain name was NULL. This is unfortunate as it makes it
- * difficult to tell whether providing a name was intended. In this case, it can
- * be broken into 4 cases:
- *
- * 1. Version is greater than or equal to 1.4 and a non-NULL hint is provided.
- *    Just do a string compare.
- * 2. Version is greater than or equal to 1.4 and provided hint is NULL.  Treat
- *    this as _valid_ as it could be an application requesting a 1.4 domain name
- *    but not providing an explicit hint.
- * 3. Version is less than 1.4 and a name hint is provided.  This should always
- *    be _invalid_.
- * 4. Version is less than 1.4 and name hint is NULL. This will always be
- *    _valid_.
- */
-bool usdf_domain_checkname(uint32_t version, struct usd_device_attrs *dap,
-			   const char *hint)
-{
-	char *reference;
-	bool valid;
-	int ret;
-
-	USDF_DBG("checking domain name: version=%d, domain name='%s'\n",
-		 version, hint);
-
-	if (version) {
-		valid = false;
-
-		ret = usdf_domain_getname(version, dap, &reference);
-		if (ret < 0)
-			return false;
-
-		/* If the reference name exists, then this is version 1.4 or
-		 * greater.
-		 */
-		if (reference) {
-			if (hint) {
-				/* Case 1 */
-				valid = (strcmp(reference, hint) == 0);
-			} else {
-				/* Case 2 */
-				valid = true;
-			}
-		} else {
-			/* Case 3 & 4 */
-			valid = (hint == NULL);
-		}
-
-		if (!valid)
-			USDF_DBG("given hint %s does not match %s -- invalid\n",
-				 hint, reference);
-
-		free(reference);
-		return valid;
-	}
-
-	/* If hint is non-NULL then assume the version is 1.4 if not provided.
-	 */
-	if (hint)
-		return usdf_domain_checkname(FI_VERSION(1, 4), dap, hint);
-
-	return usdf_domain_checkname(FI_VERSION(1, 3), dap, hint);
-}
-
-/* Query domain's atomic capability.
- * We dont support atomic operations, just return EOPNOTSUPP.
- */
-int usdf_query_atomic(struct fid_domain *domain, enum fi_datatype datatype,
-		      enum fi_op op, struct fi_atomic_attr *attr, uint64_t flags)
-{
-	return -FI_EOPNOTSUPP;
-}
-
-/* Catch the version changes for domain_attr. */
-int usdf_catch_dom_attr(uint32_t version, const struct fi_info *hints,
-			struct fi_domain_attr *dom_attr)
-{
-	/* version 1.5 introduced new bits. If the user asked for older
-	 * version, we can't return these new bits.
-	 */
-	if (FI_VERSION_LT(version, FI_VERSION(1, 5))) {
-		/* We checked mr_mode compatibility before calling
-		 * this function. This means it is safe to return
-		 * 1.4 default mr_mode.
-		 */
-		dom_attr->mr_mode = FI_MR_BASIC;
-
-		/* FI_REMOTE_COMM is introduced in 1.5. So don't return it. */
-		dom_attr->caps &= ~FI_REMOTE_COMM;
-
-		/* If FI_REMOTE_COMM is given for version < 1.5, fail. */
-		if (hints && hints->domain_attr) {
-			if (hints->domain_attr->caps == FI_REMOTE_COMM)
-				return -FI_EBADFLAGS;
-		}
-        } else {
-            dom_attr->mr_mode &= ~(FI_MR_BASIC | FI_MR_SCALABLE);
-	}
-
-	return FI_SUCCESS;
-}
-
-/* Catch the version changes for tx_attr. */
-int usdf_catch_tx_attr(uint32_t version, const struct fi_tx_attr *tx_attr)
-{
-	/* In version < 1.5, FI_LOCAL_MR is required. */
-	if (FI_VERSION_LT(version, FI_VERSION(1, 5))) {
-		if ((tx_attr->mode & FI_LOCAL_MR) == 0)
-			return -FI_ENODATA;
-	}
-
-	return FI_SUCCESS;
-}
-
-/* Catch the version changes for rx_attr. */
-int usdf_catch_rx_attr(uint32_t version, const struct fi_rx_attr *rx_attr)
-{
-	/* In version < 1.5, FI_LOCAL_MR is required. */
-	if (FI_VERSION_LT(version, FI_VERSION(1, 5))) {
-		if ((rx_attr->mode & FI_LOCAL_MR) == 0)
-			return -FI_ENODATA;
-	}
-
-	return FI_SUCCESS;
 }

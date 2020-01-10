@@ -50,10 +50,11 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
+#include <rdma/fi_prov.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-#include "ofi.h"
+#include "fi.h"
 
 #include "usd.h"
 #include "usd_post.h"
@@ -154,7 +155,7 @@ usdf_msg_rewind_qe(struct usdf_msg_qe *qe, size_t rewind, size_t mtu)
 	}
 
 	qe->ms_cur_iov = cur_iov;
-	qe->ms_cur_ptr = ((uint8_t *)qe->ms_iov[cur_iov].iov_base) +
+	qe->ms_cur_ptr = qe->ms_iov[cur_iov].iov_base +
 		qe->ms_iov[cur_iov].iov_len - cur_resid;
 	qe->ms_iov_resid = cur_resid;
 }
@@ -277,7 +278,7 @@ usdf_msg_recvv(struct fid_ep *fep, const struct iovec *iov, void **desc,
 	rqe->ms_cur_ptr = iov[0].iov_base;
 	rqe->ms_iov_resid = iov[0].iov_len;
 	rqe->ms_resid = tot_len;
-	rqe->ms_length = 0;
+	rqe->ms_length = tot_len;
 
 	op_flags = ep->ep_rx->rx_attr.op_flags;
 	rqe->ms_signal_comp = ep->ep_rx_dflt_signal_comp ||
@@ -575,7 +576,7 @@ usdf_msg_recvmsg(struct fid_ep *fep, const struct fi_msg *msg, uint64_t flags)
 
 	rqe->ms_cur_iov = 0;
 	rqe->ms_resid = tot_len;
-	rqe->ms_length = 0;
+	rqe->ms_length = tot_len;
 	rqe->ms_cur_ptr = iov[0].iov_base;
 	rqe->ms_iov_resid = iov[0].iov_len;
 
@@ -896,8 +897,7 @@ usdf_msg_recv_complete(struct usdf_ep *ep, struct usdf_msg_qe *rqe, int status)
 	rx = ep->ep_rx;
 	hcq = rx->r.msg.rx_hcq;
 
-	hcq->cqh_post(hcq, rqe->ms_context, rqe->ms_length, status,
-		      FI_MSG | FI_RECV);
+	hcq->cqh_post(hcq, rqe->ms_context, rqe->ms_length, status);
 	usdf_msg_put_rx_rqe(rx, rqe);
 }
 
@@ -968,8 +968,7 @@ usdf_msg_process_ack(struct usdf_ep *ep, uint16_t seq)
 			USDF_DBG_SYS(EP_DATA, "send complete, signal_comp=%u\n", wqe->ms_signal_comp);
 			if (wqe->ms_signal_comp)
 				hcq->cqh_post(hcq, wqe->ms_context,
-					      wqe->ms_length, FI_SUCCESS,
-					      FI_MSG | FI_SEND);
+						wqe->ms_length, FI_SUCCESS);
 
 			usdf_msg_put_tx_wqe(tx, wqe);
 		} else {
@@ -1231,9 +1230,8 @@ ssize_t usdf_msg_rx_size_left(struct fid_ep *fep)
 
 	ep = ep_ftou(fep);
 	rx = ep->ep_rx;
-
-	if (!(ep->flags & USDF_EP_ENABLED))
-		return -FI_EOPBADSTATE;
+	if (rx == NULL)
+		return -FI_EOPBADSTATE; /* EP not enabled */
 
 	return rx->r.msg.rx_num_free_rqe;
 }
@@ -1247,9 +1245,8 @@ ssize_t usdf_msg_tx_size_left(struct fid_ep *fep)
 
 	ep = ep_ftou(fep);
 	tx = ep->ep_tx;
-
-	if (!(ep->flags & USDF_EP_ENABLED))
-		return -FI_EOPBADSTATE;
+	if (tx == NULL)
+		return -FI_EOPBADSTATE; /* EP not enabled */
 
 	return tx->t.msg.tx_num_free_wqe;
 }

@@ -1,6 +1,5 @@
 /*
  * Copyright (c) 2015 Los Alamos Nat. Security, LLC. All rights reserved.
- * Copyright (c) 2018 Amazon.com, Inc. or its affiliates. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -31,45 +30,5 @@
  * SOFTWARE.
  */
 
-#ifndef _LINUX_OSD_H_
-#define _LINUX_OSD_H_
-
-/*#define _GNU_SOURCE*/
-
 #include <byteswap.h>
 #include <endian.h>
-#include <sys/mman.h>
-#include <string.h>
-#include <assert.h>
-
-#include "unix/osd.h"
-#include "rdma/fi_errno.h"
-
-static inline int ofi_shm_remap(struct util_shm *shm,
-				size_t newsize, void **mapped)
-{
-	shm->ptr = mremap(shm->ptr, shm->size, newsize, 0);
-	shm->size = newsize;
-	*mapped = shm->ptr;
-	return shm->ptr == MAP_FAILED ? -FI_EINVAL : FI_SUCCESS;
-}
-
-ssize_t ofi_get_hugepage_size(void);
-
-static inline int ofi_alloc_hugepage_buf(void **memptr, size_t size)
-{
-	*memptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-
-	if (*memptr == MAP_FAILED)
-		return -errno;
-
-	return FI_SUCCESS;
-}
-
-static inline int ofi_free_hugepage_buf(void *memptr, size_t size)
-{
-	return munmap(memptr, size);
-}
-
-#endif /* _LINUX_OSD_H_ */

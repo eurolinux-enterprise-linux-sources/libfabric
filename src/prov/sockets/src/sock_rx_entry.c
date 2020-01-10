@@ -51,7 +51,7 @@ struct sock_rx_entry *sock_rx_new_entry(struct sock_rx_ctx *rx_ctx)
 {
 	struct sock_rx_entry *rx_entry;
 	struct slist_entry *entry;
-	size_t i;
+	int i;
 
 	if (rx_ctx->rx_entry_pool == NULL) {
 		rx_ctx->rx_entry_pool = calloc(rx_ctx->attr.size,
@@ -72,6 +72,7 @@ struct sock_rx_entry *sock_rx_new_entry(struct sock_rx_ctx *rx_ctx)
 		entry = slist_remove_head(&rx_ctx->pool_list);
 		rx_entry = container_of(entry, struct sock_rx_entry, pool_entry);
 		rx_entry->rx_ctx = rx_ctx;
+		entry = slist_remove_head(&rx_ctx->pool_list);
 	} else {
 		rx_entry = calloc(1, sizeof(*rx_entry));
 		if (!rx_entry)
@@ -124,8 +125,15 @@ struct sock_rx_entry *sock_rx_new_buffered_entry(struct sock_rx_ctx *rx_ctx,
 
 	rx_ctx->buffered_len += len;
 	dlist_insert_tail(&rx_entry->entry, &rx_ctx->rx_buffered_list);
+	rx_entry->is_busy = 1;
+	rx_entry->is_tagged = 0;
 
 	return rx_entry;
+}
+
+inline size_t sock_rx_avail_len(struct sock_rx_entry *rx_entry)
+{
+	return rx_entry->total_len - rx_entry->used;
 }
 
 struct sock_rx_entry *sock_rx_get_entry(struct sock_rx_ctx *rx_ctx,

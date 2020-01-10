@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2016 Cray Inc.  All rights reserved.
+ * Copyright (c) 2015 Cray Inc.  All rights reserved.
  * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -34,9 +34,6 @@
 #ifndef _GNIX_RMA_H_
 #define _GNIX_RMA_H_
 
-#define GNIX_RMA_READ_FLAGS_DEF  (FI_RMA | FI_READ)
-#define GNIX_RMA_WRITE_FLAGS_DEF (FI_RMA | FI_WRITE)
-
 ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 		  uint64_t loc_addr, size_t len, void *mdesc,
 		  uint64_t dest_addr, uint64_t rem_addr, uint64_t mkey,
@@ -56,8 +53,6 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
  */
 int _gnix_rma_post_irq(struct gnix_vc *vc);
 
-/* SMSG callback for RMA data control message. */
-int __smsg_rma_data(void *data, void *msg);
 
 #endif /* _GNIX_RMA_H_ */
 

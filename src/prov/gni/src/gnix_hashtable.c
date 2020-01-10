@@ -126,34 +126,22 @@ static inline gnix_ht_key_t __gnix_hash_func(
 			ht->ht_attr.ht_hash_seed) % ht->ht_size;
 }
 
-static inline gnix_ht_entry_t *__gnix_ht_lookup_entry_collision(
-                struct dlist_entry *head,
-                gnix_ht_key_t key,
-                uint64_t *collision_count)
-{
-        gnix_ht_entry_t *ht_entry;
-
-        dlist_for_each(head, ht_entry, entry) {
-                READ_PREFETCH(ht_entry->entry.next);
-                if (ht_entry->key == key)
-                        return ht_entry;
-
-                *collision_count += 1;
-        }
-
-        return NULL;
-}
-
 static inline gnix_ht_entry_t *__gnix_ht_lookup_entry(
 		struct dlist_entry *head,
-		gnix_ht_key_t key)
+		gnix_ht_key_t key,
+		uint64_t *collision_count)
 {
 	gnix_ht_entry_t *ht_entry;
 
+	if (dlist_empty(head))
+		return NULL;
+
 	dlist_for_each(head, ht_entry, entry) {
-		READ_PREFETCH(ht_entry->entry.next);
 		if (ht_entry->key == key)
 			return ht_entry;
+
+		if (collision_count)
+			*collision_count += 1;
 	}
 
 	return NULL;
@@ -163,9 +151,12 @@ static inline void *__gnix_ht_lookup_key(
 		struct dlist_entry *head,
 		gnix_ht_key_t key)
 {
-	gnix_ht_entry_t *ht_entry = __gnix_ht_lookup_entry(head, key);
+	gnix_ht_entry_t *ht_entry = __gnix_ht_lookup_entry(head, key, NULL);
 
-	return ((ht_entry != NULL) ? ht_entry->value : NULL);
+	if (!ht_entry)
+		return NULL;
+
+	return ht_entry->value;
 }
 
 static inline int __gnix_ht_destroy_list(
@@ -195,7 +186,7 @@ static inline int __gnix_ht_insert_list(
 {
 	gnix_ht_entry_t *found;
 
-	found = __gnix_ht_lookup_entry_collision(head, ht_entry->key, collisions);
+	found = __gnix_ht_lookup_entry(head, ht_entry->key, collisions);
 	if (!found) {
 		dlist_insert_tail(&ht_entry->entry, head);
 	} else {
@@ -211,7 +202,7 @@ static inline int __gnix_ht_remove_list(
 {
 	gnix_ht_entry_t *ht_entry;
 
-	ht_entry = __gnix_ht_lookup_entry(head, key);
+	ht_entry = __gnix_ht_lookup_entry(head, key, NULL);
 	if (!ht_entry) {
 		return -FI_ENOENT;
 	}
@@ -227,7 +218,6 @@ static inline void __gnix_ht_rehash_list(
 	gnix_ht_entry_t *ht_entry, *tmp;
 	gnix_ht_key_t bucket;
 	struct dlist_entry *ht_lh;
-	uint64_t trash; // No collision information is recorded
 
 	if (dlist_empty(head))
 		return;
@@ -238,7 +228,7 @@ static inline void __gnix_ht_rehash_list(
 
 		dlist_remove(&ht_entry->entry);
 
-		__gnix_ht_insert_list(ht_lh, ht_entry, &trash);
+		__gnix_ht_insert_list(ht_lh, ht_entry, NULL);
 	}
 }
 
@@ -287,13 +277,13 @@ static inline void __gnix_ht_resize_hashtable_dec(gnix_hashtable_t *ht)
 static inline void __gnix_ht_common_init(gnix_hashtable_t *ht)
 {
 	if (ht->ht_state == GNIX_HT_STATE_UNINITIALIZED) {
-		ofi_atomic_initialize32(&ht->ht_elements, 0);
-		ofi_atomic_initialize32(&ht->ht_collisions, 0);
-		ofi_atomic_initialize32(&ht->ht_insertions, 0);
+		atomic_initialize(&ht->ht_elements, 0);
+		atomic_initialize(&ht->ht_collisions, 0);
+		atomic_initialize(&ht->ht_insertions, 0);
 	} else {
-		ofi_atomic_set32(&ht->ht_elements, 0);
-		ofi_atomic_set32(&ht->ht_collisions, 0);
-		ofi_atomic_set32(&ht->ht_insertions, 0);
+		atomic_set(&ht->ht_elements, 0);
+		atomic_set(&ht->ht_collisions, 0);
+		atomic_set(&ht->ht_insertions, 0);
 	}
 
 	ht->ht_state = GNIX_HT_STATE_READY;
@@ -302,9 +292,9 @@ static inline void __gnix_ht_common_init(gnix_hashtable_t *ht)
 static inline void __gnix_ht_common_destroy(gnix_hashtable_t *ht)
 {
 	ht->ht_size = 0;
-	ofi_atomic_set32(&ht->ht_collisions, 0);
-	ofi_atomic_set32(&ht->ht_insertions, 0);
-	ofi_atomic_set32(&ht->ht_elements, 0);
+	atomic_set(&ht->ht_collisions, 0);
+	atomic_set(&ht->ht_insertions, 0);
+	atomic_set(&ht->ht_elements, 0);
 	ht->ht_state = GNIX_HT_STATE_DEAD;
 }
 
@@ -344,7 +334,7 @@ static int __gnix_ht_lf_destroy(gnix_hashtable_t *ht)
 		freed_entries = __gnix_ht_destroy_list(ht, &lh->head);
 
 		if (freed_entries)
-			ofi_atomic_sub32(&ht->ht_elements, freed_entries);
+			atomic_sub(&ht->ht_elements, freed_entries);
 	}
 
 	free(ht->ht_lf_tbl);
@@ -478,7 +468,7 @@ static int __gnix_ht_lk_destroy(gnix_hashtable_t *ht)
 		freed_entries = __gnix_ht_destroy_list(ht, &lh->head);
 
 		if (freed_entries)
-			ofi_atomic_sub32(&ht->ht_elements, freed_entries);
+			atomic_sub(&ht->ht_elements, freed_entries);
 	}
 
 	free(ht->ht_lk_tbl);
@@ -613,7 +603,7 @@ static inline int __gnix_ht_should_decrease_size(gnix_hashtable_t *ht)
 	/* This is just an approximation of the collision rate since we
 	 *     don't track collisions on removal
 	 */
-	return ((ofi_atomic_get32(&ht->ht_elements) * 100) /
+	return ((atomic_get(&ht->ht_elements) * 100) /
 			(ht->ht_size - decrease)) <= desired_thresh;
 }
 
@@ -676,20 +666,20 @@ int _gnix_ht_insert(gnix_hashtable_t *ht, gnix_ht_key_t key, void *value)
 	}
 
 	if (ht->ht_size < ht->ht_attr.ht_maximum_size) {
-		collisions = ofi_atomic_add32(&ht->ht_collisions, hits);
-		insertions = ofi_atomic_inc32(&ht->ht_insertions);
+		collisions = atomic_add(&ht->ht_collisions, hits);
+		insertions = atomic_inc(&ht->ht_insertions);
 		if (insertions > 10 &&
 				((collisions * 100) / insertions)
 				> ht->ht_attr.ht_collision_thresh) {
 
-			ofi_atomic_set32(&ht->ht_collisions, 0);
-			ofi_atomic_set32(&ht->ht_insertions, 0);
+			atomic_set(&ht->ht_collisions, 0);
+			atomic_set(&ht->ht_insertions, 0);
 
 			__gnix_ht_resize_hashtable_inc(ht);
 		}
 	}
 
-	ofi_atomic_inc32(&ht->ht_elements);
+	atomic_inc(&ht->ht_elements);
 
 	return ret;
 }
@@ -705,7 +695,7 @@ int _gnix_ht_remove(gnix_hashtable_t *ht, gnix_ht_key_t key)
 
 	/* on success, we may have to resize */
 	if (ret == 0) {
-		ofi_atomic_dec32(&ht->ht_elements);
+		atomic_dec(&ht->ht_elements);
 
 		if (ht->ht_size > ht->ht_attr.ht_initial_size &&
 				__gnix_ht_should_decrease_size(ht)) {
@@ -713,8 +703,8 @@ int _gnix_ht_remove(gnix_hashtable_t *ht, gnix_ht_key_t key)
 			/* since we are resizing the table,
 			 * reset the collision info
 			 */
-			ofi_atomic_set32(&ht->ht_collisions, 0);
-			ofi_atomic_set32(&ht->ht_insertions, 0);
+			atomic_set(&ht->ht_collisions, 0);
+			atomic_set(&ht->ht_insertions, 0);
 
 			__gnix_ht_resize_hashtable_dec(ht);
 		}
@@ -725,12 +715,15 @@ int _gnix_ht_remove(gnix_hashtable_t *ht, gnix_ht_key_t key)
 
 void *_gnix_ht_lookup(gnix_hashtable_t *ht, gnix_ht_key_t key)
 {
+	if (ht->ht_state != GNIX_HT_STATE_READY)
+		return NULL;
+
 	return ht->ht_ops->lookup(ht, key);
 }
 
 int _gnix_ht_empty(gnix_hashtable_t *ht)
 {
-	return ofi_atomic_get32(&ht->ht_elements) == 0;
+	return atomic_get(&ht->ht_elements) == 0;
 }
 
 void *__gnix_ht_lf_iter_next(struct gnix_hashtable_iter *iter)

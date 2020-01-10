@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2017 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -132,9 +132,9 @@ static struct psmx_unexp *psmx_am_search_and_dequeue_unexp(
 int psmx_am_msg_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 			psm_amarg_t *args, int nargs, void *src, uint32_t len)
 {
-	psm_amarg_t rep_args[8];
-	struct psmx_am_request *req;
-	struct psmx_cq_event *event;
+        psm_amarg_t rep_args[8];
+        struct psmx_am_request *req;
+        struct psmx_cq_event *event;
 	struct psmx_epaddr_context *epaddr_context;
 	struct psmx_fid_domain *domain;
 	int copy_len;
@@ -159,7 +159,7 @@ int psmx_am_msg_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 	switch (cmd) {
 	case PSMX_AM_REQ_SEND:
 		assert(len == args[0].u32w1);
-		offset = args[3].u64;
+                offset = args[3].u64;
 		if (offset == 0) {
 			/* this is the first packet */
 			req = psmx_am_search_and_dequeue_recv(domain, (const void *)epaddr);
@@ -243,7 +243,7 @@ int psmx_am_msg_handler(psm_am_token_t token, psm_epaddr_t epaddr,
 					rep_args, 3, NULL, 0, 0,
 					NULL, NULL );
 		}
-		break;
+                break;
 
 	case PSMX_AM_REP_SEND:
 		req = (struct psmx_am_request *)(uintptr_t)args[1].u64;
@@ -330,7 +330,7 @@ int psmx_am_process_send(struct psmx_fid_domain *domain, struct psmx_am_request 
 	req->send.len_sent = offset + len;
 	err = psm_am_request_short((psm_epaddr_t) req->send.dest_addr,
 				PSMX_AM_MSG_HANDLER, args, 4,
-				req->send.buf+offset, len,
+				(void *)req->send.buf+offset, len,
 				am_flags, NULL, NULL);
 
 	return psmx_errno(err);
@@ -350,9 +350,9 @@ static ssize_t _psmx_recv2(struct fid_ep *ep, void *buf, size_t len,
 	int err = 0;
 	size_t idx;
 
-	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
+        ep_priv = container_of(ep, struct psmx_fid_ep, ep);
 
-	if ((ep_priv->caps & FI_DIRECTED_RECV) && src_addr != FI_ADDR_UNSPEC) {
+        if ((ep_priv->caps & FI_DIRECTED_RECV) && src_addr != FI_ADDR_UNSPEC) {
 		av = ep_priv->av;
 		if (av && av->type == FI_AV_TABLE) {
 			idx = (size_t)src_addr;
@@ -439,8 +439,8 @@ static ssize_t psmx_recv2(struct fid_ep *ep, void *buf, size_t len,
 {
 	struct psmx_fid_ep *ep_priv;
 
-	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
-	return _psmx_recv2(ep, buf, len, desc, src_addr, context, ep_priv->rx_flags);
+        ep_priv = container_of(ep, struct psmx_fid_ep, ep);
+	return _psmx_recv2(ep, buf, len, desc, src_addr, context, ep_priv->flags);
 }
 
 static ssize_t psmx_recvmsg2(struct fid_ep *ep, const struct fi_msg *msg,
@@ -453,7 +453,7 @@ static ssize_t psmx_recvmsg2(struct fid_ep *ep, const struct fi_msg *msg,
 		return -FI_EINVAL;
 
 	if (msg->iov_count > 1) {
-		return -FI_ENOSYS;
+		return -FI_EINVAL;
 	} else if (msg->iov_count) {
 		buf = msg->msg_iov[0].iov_base;
 		len = msg->msg_iov[0].iov_len;
@@ -477,7 +477,7 @@ static ssize_t psmx_recvv2(struct fid_ep *ep, const struct iovec *iov,
 		return -FI_EINVAL;
 
 	if (count > 1) {
-		return -FI_ENOSYS;
+		return -FI_EINVAL;
 	} else if (count) {
 		buf = iov[0].iov_base;
 		len = iov[0].iov_len;
@@ -558,8 +558,8 @@ static ssize_t psmx_send2(struct fid_ep *ep, const void *buf,
 {
 	struct psmx_fid_ep *ep_priv;
 
-	ep_priv = container_of(ep, struct psmx_fid_ep, ep);
-	return _psmx_send2(ep, buf, len, desc, dest_addr, context, ep_priv->tx_flags);
+        ep_priv = container_of(ep, struct psmx_fid_ep, ep);
+	return _psmx_send2(ep, buf, len, desc, dest_addr, context, ep_priv->flags);
 }
 
 static ssize_t psmx_sendmsg2(struct fid_ep *ep, const struct fi_msg *msg,
@@ -572,7 +572,7 @@ static ssize_t psmx_sendmsg2(struct fid_ep *ep, const struct fi_msg *msg,
 		return -FI_EINVAL;
 
 	if (msg->iov_count > 1) {
-		return -FI_ENOSYS;
+		return -FI_EINVAL;
 	} else if (msg->iov_count) {
 		buf = msg->msg_iov[0].iov_base;
 		len = msg->msg_iov[0].iov_len;
@@ -596,7 +596,7 @@ static ssize_t psmx_sendv2(struct fid_ep *ep, const struct iovec *iov,
 		return -FI_EINVAL;
 
 	if (count > 1) {
-		return -FI_ENOSYS;
+		return -FI_EINVAL;
 	} else if (count) {
 		buf = iov[0].iov_base;
 		len = iov[0].iov_len;
@@ -617,7 +617,7 @@ static ssize_t psmx_inject2(struct fid_ep *ep, const void *buf, size_t len,
 
 	/* TODO: optimize it & guarantee buffered */
 	return _psmx_send2(ep, buf, len, NULL, dest_addr, NULL,
-			   ep_priv->tx_flags | FI_INJECT | PSMX_NO_COMPLETION);
+			   ep_priv->flags | FI_INJECT | PSMX_NO_COMPLETION);
 }
 
 struct fi_ops_msg psmx_msg2_ops = {

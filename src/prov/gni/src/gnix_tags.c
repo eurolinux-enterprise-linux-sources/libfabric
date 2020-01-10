@@ -505,7 +505,7 @@ int _gnix_tag_storage_init(
 	 */
 	ts->match_func = match_func;
 
-	ofi_atomic_initialize32(&ts->seq, 1);
+	atomic_initialize(&ts->seq, 1);
 	ts->gen = 0;
 	ts->state = GNIX_TS_STATE_INITIALIZED;
 
@@ -608,9 +608,7 @@ static int __gnix_tag_list_insert_tag(
 	struct gnix_tag_list_element *element;
 
 	element = &req->msg.tle;
-	if (!dlist_empty(&element->free))
-		return -FI_EALREADY;
-
+	element->free.next = NULL;
 	element->context = NULL;
 	dlist_insert_tail(&element->free, &ts->list.list);
 
@@ -653,6 +651,7 @@ static struct gnix_fab_req *__gnix_tag_list_remove_tag(
 		return NULL;
 
 	req = __to_gnix_fab_req(element);
+	element->free.next = NULL;
 
 	return req;
 }
@@ -667,6 +666,7 @@ static void __gnix_tag_list_remove_tag_by_req(
 	element = &req->msg.tle;
 	item = (struct dlist_entry *) &element->free;
 	dlist_remove(item);
+	element->free.next = NULL;
 }
 
 static struct gnix_fab_req *__gnix_tag_list_remove_req_by_context(
@@ -684,6 +684,7 @@ static struct gnix_fab_req *__gnix_tag_list_remove_req_by_context(
 			return NULL;
 
 	req = __to_gnix_fab_req(element);
+	element->free.next = NULL;
 
 	return req;
 }
@@ -745,9 +746,6 @@ static int __gnix_tag_hlist_insert_tag(
 	int bucket = get_bucket(ts, tag);
 
 	element = &req->msg.tle;
-	if (!dlist_empty(&element->free))
-		return -FI_EALREADY;
-
 	dlist_init(&element->free);
 	element->context = NULL;
 	element->seq = ++ts->hlist.last_inserted_id;
@@ -838,7 +836,7 @@ int _gnix_insert_tag(
 {
 	int ret;
 
-	GNIX_DEBUG(FI_LOG_EP_CTRL, "inserting a message by tag, "
+	GNIX_INFO(FI_LOG_EP_CTRL, "inserting a message by tag, "
 				"ts=%p tag=%llx req=%p\n", ts, tag, req);
 	req->msg.tag = tag;
 	if (ts->match_func == _gnix_match_posted_tag) {
@@ -847,7 +845,7 @@ int _gnix_insert_tag(
 
 	ret = ts->ops->insert_tag(ts, tag, req);
 
-	GNIX_DEBUG(FI_LOG_EP_CTRL, "ret=%i\n", ret);
+	GNIX_INFO(FI_LOG_EP_CTRL, "ret=%i\n", ret);
 
 	return ret;
 }
@@ -866,12 +864,12 @@ static struct gnix_fab_req *__remove_by_tag_and_addr(
 	struct gnix_fab_req *ret;
 
 	/* assuming that flags and context are correct */
-	GNIX_DEBUG(FI_LOG_EP_CTRL, "removing a message by tag, "
+	GNIX_INFO(FI_LOG_EP_CTRL, "removing a message by tag, "
 			"ts=%p tag=%llx ignore=%llx flags=%llx context=%p "
 			"addr=%p\n",
 			ts, tag, ignore, flags, context, addr);
 	ret = ts->ops->remove_tag(ts, tag, ignore, flags, context, addr);
-	GNIX_DEBUG(FI_LOG_EP_CTRL, "ret=%p\n", ret);
+	GNIX_INFO(FI_LOG_EP_CTRL, "ret=%p\n", ret);
 
 	return ret;
 }
@@ -887,7 +885,7 @@ static struct gnix_fab_req *__peek_by_tag_and_addr(
 	struct gnix_fab_req *ret;
 
 	/* assuming that flags and context are correct */
-	GNIX_DEBUG(FI_LOG_EP_CTRL, "peeking a message by tag, "
+	GNIX_INFO(FI_LOG_EP_CTRL, "peeking a message by tag, "
 			"ts=%p tag=%llx ignore=%llx flags=%llx context=%p "
 			"addr=%p\n",
 			ts, tag, ignore, flags, context, addr);
@@ -898,7 +896,7 @@ static struct gnix_fab_req *__peek_by_tag_and_addr(
 		ret->msg.tle.context = context;
 	}
 
-	GNIX_DEBUG(FI_LOG_EP_CTRL, "ret=%p\n", ret);
+	GNIX_INFO(FI_LOG_EP_CTRL, "ret=%p\n", ret);
 
 	return ret;
 }

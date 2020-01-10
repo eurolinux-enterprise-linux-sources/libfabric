@@ -33,8 +33,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <ofi_enosys.h>
-#include <ofi_util.h>
+#include <fi_enosys.h>
+#include <fi_util.h>
 
 
 static int util_poll_add(struct fid_poll *poll_fid, struct fid *event_fid,
@@ -79,8 +79,7 @@ static int util_poll_run(struct fid_poll *poll_fid, void **context, int count)
 	struct util_cntr *cntr;
 	struct fid_list_entry *fid_entry;
 	struct dlist_entry *item;
-	int i = 0, err = 0;
-	ssize_t ret;
+	int ret, i = 0, err = 0;
 	uint64_t val;
 
 	pollset = container_of(poll_fid, struct util_poll, poll_fid.fid);
@@ -100,15 +99,8 @@ static int util_poll_run(struct fid_poll *poll_fid, void **context, int count)
 			cntr = container_of(fid_entry->fid, struct util_cntr,
 					    cntr_fid.fid);
 			val = fi_cntr_read(&cntr->cntr_fid);
-			ret = (val != cntr->checkpoint_cnt);
-			if (ret) {
-				cntr->checkpoint_cnt = val;
-			} else {
-				val = fi_cntr_readerr(&cntr->cntr_fid);
-				ret = (val != cntr->checkpoint_err);
-				if (ret)
-					cntr->checkpoint_err = val;
-			}
+			if ((ret = (val != fid_entry->last_cntr_val)))
+				fid_entry->last_cntr_val = val;
 			break;
 		case FI_CLASS_EQ:
 			eq = container_of(fid_entry->fid, struct util_eq,
@@ -125,7 +117,7 @@ static int util_poll_run(struct fid_poll *poll_fid, void **context, int count)
 		if (ret > 0 && i < count)
 			context[i++] = fid_entry->fid->context;
 		else if (ret < 0 && ret != -FI_EAGAIN)
-			err = (int) ret;
+			err = ret;
 	}
 	fastlock_release(&pollset->lock);
 	return i ? i : err;
@@ -136,11 +128,11 @@ static int util_poll_close(struct fid *fid)
 	struct util_poll *pollset;
 
 	pollset = container_of(fid, struct util_poll, poll_fid.fid);
-	if (ofi_atomic_get32(&pollset->ref))
+	if (atomic_get(&pollset->ref))
 		return -FI_EBUSY;
 
 	if (pollset->domain)
-		ofi_atomic_dec32(&pollset->domain->ref);
+		atomic_dec(&pollset->domain->ref);
 	free(pollset);
 	return 0;
 }
@@ -186,7 +178,7 @@ int fi_poll_create_(const struct fi_provider *prov, struct fid_domain *domain,
 		return -FI_ENOMEM;
 
 	pollset->prov = prov;
-	ofi_atomic_initialize32(&pollset->ref, 0);
+	atomic_initialize(&pollset->ref, 0);
 	dlist_init(&pollset->fid_list);
 	fastlock_init(&pollset->lock);
 
@@ -198,7 +190,7 @@ int fi_poll_create_(const struct fi_provider *prov, struct fid_domain *domain,
 	if (domain) {
 		pollset->domain = container_of(domain, struct util_domain,
 					       domain_fid);
-		ofi_atomic_inc32(&pollset->domain->ref);
+		atomic_inc(&pollset->domain->ref);
 	}
 
 	*poll_fid = &pollset->poll_fid;

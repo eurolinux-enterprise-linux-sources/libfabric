@@ -37,7 +37,7 @@
 #ifndef _USDF_WAIT_H_
 #define _USDF_WAIT_H_
 
-#include "ofi_list.h"
+#include "fi_list.h"
 
 struct usdf_wait {
 	struct fid_wait		wait_fid;
@@ -49,7 +49,7 @@ struct usdf_wait {
 		struct fi_mutex_cond mutex_cond;
 	} object;
 
-	ofi_atomic32_t		wait_refcnt;
+	atomic_t		wait_refcnt;
 
 	fastlock_t		lock;
 	struct dlist_entry	list;

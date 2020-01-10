@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014, Cisco Systems, Inc. All rights reserved.
  *
  * LICENSE_BEGIN
  *
@@ -52,7 +52,7 @@
 #include <sys/mman.h>
 #include <sched.h>
 
-#include <infiniband/verbs.h>
+#include <infiniband/driver.h>
 
 #include "kcompat.h"
 #include "usnic_ib_abi.h"
@@ -66,9 +66,8 @@ usd_ib_cmd_get_context(struct usd_context *uctx)
 {
     struct usnic_get_context cmd;
     struct usnic_get_context_resp resp;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_get_context *icp;
-    struct ib_uverbs_get_context_resp *irp;
+    struct ibv_get_context *icp;
+    struct ibv_get_context_resp *irp;
     struct usnic_ib_get_context_cmd *ucp;
     struct usnic_ib_get_context_resp *urp;
     int n;
@@ -78,12 +77,10 @@ usd_ib_cmd_get_context(struct usd_context *uctx)
     memset(&resp, 0, sizeof(resp));
 
     /* fill in the command struct */
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_GET_CONTEXT;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = sizeof(resp) / 4;
-
     icp = &cmd.ibv_cmd;
+    icp->command = IB_USER_VERBS_CMD_GET_CONTEXT;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = sizeof(resp) / 4;
     icp->response = (uintptr_t) & resp;
 
     ucp = &cmd.usnic_cmd;
@@ -153,8 +150,7 @@ usd_ib_cmd_devcmd(
 {
     struct usnic_get_context cmd;
     struct usnic_get_context_resp resp;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_get_context *icp;
+    struct ibv_get_context *icp;
     struct usnic_ib_get_context_cmd *ucp;
     struct usnic_ib_get_context_resp *urp;
     struct usnic_udevcmd_cmd udevcmd;
@@ -171,12 +167,10 @@ usd_ib_cmd_devcmd(
     memset(&udevcmd_resp, 0, sizeof(udevcmd_resp));
 
     /* fill in the command struct */
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_GET_CONTEXT;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = sizeof(resp) / 4;
-
     icp = &cmd.ibv_cmd;
+    icp->command = IB_USER_VERBS_CMD_GET_CONTEXT;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = sizeof(resp) / 4;
     icp->response = (uintptr_t) & resp;
 
     /* fill in usnic devcmd struct */
@@ -235,19 +229,16 @@ _usd_ib_cmd_dealloc_pd(
     uint32_t pd_handle)
 {
     struct usnic_dealloc_pd cmd;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_dealloc_pd *icp;
+    struct ibv_dealloc_pd *icp;
     int n;
 
     memset(&cmd, 0, sizeof(cmd));
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_DEALLOC_PD;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = 0;
-
     icp = &cmd.ibv_cmd;
+    icp->command = IB_USER_VERBS_CMD_DEALLOC_PD;
     icp->pd_handle = pd_handle;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = 0;
 
     n = write(dev->ud_ctx->ucx_ib_dev_fd, &cmd, sizeof(cmd));
     if (n != sizeof(cmd)) {
@@ -269,10 +260,9 @@ _usd_ib_cmd_alloc_pd(
 {
     struct usnic_alloc_pd cmd;
     struct usnic_alloc_pd_resp resp;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_alloc_pd *icp;
+    struct ibv_alloc_pd *icp;
     struct usnic_ib_alloc_pd_cmd *ucp;
-    struct ib_uverbs_alloc_pd_resp *irp;
+    struct ibv_alloc_pd_resp *irp;
     struct usnic_ib_alloc_pd_resp *urp;
     int n;
 
@@ -280,12 +270,10 @@ _usd_ib_cmd_alloc_pd(
     memset(&resp, 0, sizeof(resp));
 
     /* fill in command */
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_ALLOC_PD;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = sizeof(resp) / 4;
-
     icp = &cmd.ibv_cmd;
+    icp->command = IB_USER_VERBS_CMD_ALLOC_PD;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = sizeof(resp) / 4;
     icp->response = (uintptr_t) & resp;
 
     /*
@@ -369,21 +357,19 @@ usd_ib_cmd_reg_mr(
 {
     struct usnic_reg_mr cmd;
     struct usnic_reg_mr_resp resp;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_reg_mr *icp;
-    struct ib_uverbs_reg_mr_resp *irp;
+    struct ibv_reg_mr *icp;
+    struct ibv_reg_mr_resp *irp;
     int n;
 
     memset(&cmd, 0, sizeof(cmd));
     memset(&resp, 0, sizeof(resp));
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_REG_MR;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = sizeof(resp) / 4;
-
     icp = &cmd.ibv_cmd;
+    icp->command = IB_USER_VERBS_CMD_REG_MR;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = sizeof(resp) / 4;
     icp->response = (uintptr_t) & resp;
+
     icp->start = (uintptr_t) vaddr;
     icp->length = length;
     icp->hca_va = (uintptr_t) vaddr;
@@ -410,19 +396,17 @@ usd_ib_cmd_dereg_mr(
     struct usd_device *dev,
     struct usd_mr *mr)
 {
-    struct usnic_dereg_mr cmd;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_dereg_mr *icp;
+    struct ibv_dereg_mr cmd;
+    struct ibv_dereg_mr *icp;
     int n;
 
     memset(&cmd, 0, sizeof(cmd));
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_DEREG_MR;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = 0;
+    icp = &cmd;
+    icp->command = IB_USER_VERBS_CMD_DEREG_MR;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = 0;
 
-    icp = &cmd.ibv_cmd;
     icp->mr_handle = mr->umr_handle;
 
     /* Issue command to IB driver */
@@ -447,9 +431,8 @@ usd_ib_cmd_create_cq(
 {
     struct usnic_create_cq cmd;
     struct usnic_create_cq_resp resp;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_create_cq *icp;
-    struct ib_uverbs_create_cq_resp *irp;
+    struct ibv_create_cq *icp;
+    struct ibv_create_cq_resp *irp;
     cpu_set_t *affinity_mask = NULL;
     int flags = 0;
     int n;
@@ -457,12 +440,10 @@ usd_ib_cmd_create_cq(
     memset(&cmd, 0, sizeof(cmd));
     memset(&resp, 0, sizeof(resp));
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_CREATE_CQ;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = sizeof(resp) / 4;
-
     icp = &cmd.ibv_cmd;
+    icp->command = IB_USER_VERBS_CMD_CREATE_CQ;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = sizeof(resp) / 4;
     icp->response = (uintptr_t) & resp;
 
     if (ibv_cq == NULL) {
@@ -529,19 +510,17 @@ usd_ib_cmd_destroy_cq(
     struct usd_device *dev,
     struct usd_cq_impl *cq)
 {
-    struct usnic_destroy_cq cmd;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_destroy_cq *icp;
+    struct ibv_destroy_cq cmd;
+    struct ibv_destroy_cq *icp;
     int n;
 
     memset(&cmd, 0, sizeof(cmd));
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_DESTROY_CQ;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = 0;
+    icp = &cmd;
+    icp->command = IB_USER_VERBS_CMD_DESTROY_CQ;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = 0;
 
-    icp = &cmd.ibv_cmd;
     icp->cq_handle = cq->ucq_handle;
 
     /* Issue command to IB driver */
@@ -564,9 +543,8 @@ usd_ib_cmd_create_qp(
 {
     struct usnic_create_qp cmd;
     struct usnic_create_qp_resp *resp;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_create_qp *icp;
-    struct ib_uverbs_create_qp_resp *irp = NULL;
+    struct ibv_create_qp *icp;
+    struct ibv_create_qp_resp *irp = NULL;
     struct usnic_ib_create_qp_cmd *ucp;
     struct usnic_ib_create_qp_resp *urp;
     struct usd_qp_filter *qfilt;
@@ -586,13 +564,12 @@ usd_ib_cmd_create_qp(
         return -ENOMEM;
     }
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_CREATE_QP;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = sizeof(*resp) / 4;
-
     icp = &cmd.ibv_cmd;
+    icp->command = IB_USER_VERBS_CMD_CREATE_QP;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = sizeof(*resp) / 4;
     icp->response = (uintptr_t) resp;
+
     icp->user_handle = (uintptr_t) qp;
     icp->pd_handle = dev->ud_pd_handle;
     icp->send_cq_handle = qp->uq_wq.uwq_cq->ucq_handle;
@@ -611,7 +588,7 @@ usd_ib_cmd_create_qp(
     ucp = &cmd.usnic_cmd;
 
     if (dev->ud_ctx->ucx_caps[USD_CAP_GRP_INTR]) {
-        ucp->cmd_version = 2;
+        ucp->cmd_version = USNIC_IB_CREATE_QP_VERSION;
     } else {
             /*
              * Allow compatibility with old kernel module when
@@ -623,17 +600,8 @@ usd_ib_cmd_create_qp(
     qfilt = &qp->uq_filter;
     if (qfilt->qf_type == USD_FTY_UDP ||
             qfilt->qf_type == USD_FTY_UDP_SOCK) {
-        /*
-         * Command versions 0,1,2 need to fill in the spec_v2 struct.
-         * Newer versions need to fill in the spec struct.
-         */
-        if (ucp->cmd_version <= 2) {
-            ucp->spec_v2.trans_type = USNIC_TRANSPORT_IPV4_UDP;
-            ucp->spec_v2.ip.sock_fd = qfilt->qf_filter.qf_udp.u_sockfd;
-        } else {
-            ucp->spec.trans_type = USNIC_TRANSPORT_IPV4_UDP;
-            ucp->spec.ip.sock_fd = qfilt->qf_filter.qf_udp.u_sockfd;
-        }
+        ucp->spec.trans_type = USNIC_TRANSPORT_IPV4_UDP;
+        ucp->spec.udp.sock_fd = qfilt->qf_filter.qf_udp.u_sockfd;
     } else {
         ret = -EINVAL;
         goto out;
@@ -757,19 +725,17 @@ usd_ib_cmd_modify_qp(
     struct usd_qp_impl *qp,
     int state)
 {
-    struct usnic_modify_qp cmd;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_modify_qp *icp;
+    struct ibv_modify_qp cmd;
+    struct ibv_modify_qp *icp;
     int n;
 
     memset(&cmd, 0, sizeof(cmd));
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_MODIFY_QP;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = 0;
+    icp = &cmd;
+    icp->command = IB_USER_VERBS_CMD_MODIFY_QP;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = 0;
 
-    icp = &cmd.ibv_cmd;
     icp->qp_handle = qp->uq_qp_handle;
     icp->attr_mask = IBV_QP_STATE;
     icp->qp_state = state;
@@ -788,21 +754,19 @@ usd_ib_cmd_destroy_qp(
     struct usd_device *dev,
     struct usd_qp_impl *qp)
 {
-    struct usnic_destroy_qp cmd;
-    struct ib_uverbs_destroy_qp_resp resp;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_destroy_qp *icp;
+    struct ibv_destroy_qp cmd;
+    struct ibv_destroy_qp_resp resp;
+    struct ibv_destroy_qp *icp;
     int n;
 
     memset(&cmd, 0, sizeof(cmd));
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_DESTROY_QP;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = sizeof(resp) / 4;
-
-    icp = &cmd.ibv_cmd;
+    icp = &cmd;
+    icp->command = IB_USER_VERBS_CMD_DESTROY_QP;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = sizeof(resp) / 4;
     icp->response = (uintptr_t) & resp;
+
     icp->qp_handle = qp->uq_qp_handle;
 
     /* Issue command to IB driver */
@@ -817,21 +781,18 @@ usd_ib_cmd_destroy_qp(
 static int
 usd_ib_cmd_query_device(
     struct usd_device *dev,
-    struct ib_uverbs_query_device_resp *irp)
+    struct ibv_query_device_resp *irp)
 {
-    struct usnic_query_device cmd;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_query_device *icp;
+    struct ibv_query_device cmd;
+    struct ibv_query_device *icp;
     int n;
 
     memset(&cmd, 0, sizeof(cmd));
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_QUERY_DEVICE;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = sizeof(*irp) / 4;
-
-    icp = &cmd.ibv_cmd;
+    icp = &cmd;
+    icp->command = IB_USER_VERBS_CMD_QUERY_DEVICE;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = sizeof(*irp) / 4;
     icp->response = (uintptr_t) irp;
 
     /* keep Valgrind happy */
@@ -849,22 +810,20 @@ usd_ib_cmd_query_device(
 static int
 usd_ib_cmd_query_port(
     struct usd_device *dev,
-    struct ib_uverbs_query_port_resp *irp)
+    struct ibv_query_port_resp *irp)
 {
-    struct usnic_query_port cmd;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_query_port *icp;
+    struct ibv_query_port cmd;
+    struct ibv_query_port *icp;
     int n;
 
     memset(&cmd, 0, sizeof(cmd));
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_QUERY_PORT;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = sizeof(*irp) / 4;
-
-    icp = &cmd.ibv_cmd;
+    icp = &cmd;
+    icp->command = IB_USER_VERBS_CMD_QUERY_PORT;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = sizeof(*irp) / 4;
     icp->response = (uintptr_t) irp;
+
     icp->port_num = 1;
 
     /* keep Valgrind happy */
@@ -880,37 +839,14 @@ usd_ib_cmd_query_port(
 }
 
 /*
- * For code readability, copy these two enums from kernel
- * /usr/include/rdma/ib_verbs.h (otherwise, we'd would have to
- * hard-code the integer values below).
- */
-enum ib_port_width {
-    IB_WIDTH_1X  = 1,
-    IB_WIDTH_4X  = 2,
-    IB_WIDTH_8X  = 4,
-    IB_WIDTH_12X = 8
-};
-
-enum ib_port_speed {
-    IB_SPEED_SDR   = 1,  // 2.5 Gbps
-    IB_SPEED_DDR   = 2,  // 5 Gbps
-    IB_SPEED_QDR   = 4,  // 10 Gbps
-    IB_SPEED_FDR10 = 8,  // 10.3125 Gbps
-    IB_SPEED_FDR   = 16, // 14.0625 Gbps
-    IB_SPEED_EDR   = 32, // 25.78125 Gbps
-    IB_SPEED_HDR   = 64  // 50 Gbps
-};
-
-
-/*
  * Issue query commands for device and port and interpret the resaults
  */
 int
 usd_ib_query_dev(
     struct usd_device *dev)
 {
-    struct ib_uverbs_query_device_resp dresp;
-    struct ib_uverbs_query_port_resp presp;
+    struct ibv_query_device_resp dresp;
+    struct ibv_query_port_resp presp;
     struct usd_device_attrs *dap;
     unsigned speed;
     int ret;
@@ -930,7 +866,7 @@ usd_ib_query_dev(
         (presp.state == 4) ? USD_LINK_UP : USD_LINK_DOWN;
 
     /*
-     * If link is up, derive bandwidth from speed and width.
+     * If link it up derive bandwidth from speed and width.
      * If link is down, driver reports bad speed, try to deduce from the
      * NIC device ID.
      */
@@ -938,30 +874,16 @@ usd_ib_query_dev(
 #define MKSW(S,W) (((S)<<8)|(W))
         speed = MKSW(presp.active_speed, presp.active_width);
         switch (speed) {
-        case MKSW(IB_SPEED_FDR10, IB_WIDTH_1X):
-        case MKSW(IB_SPEED_DDR, IB_WIDTH_4X):
+        case MKSW(2, 2):
+        case MKSW(8, 1):
             dap->uda_bandwidth = 10000;
             break;
-        case MKSW(IB_SPEED_QDR, IB_WIDTH_4X):
-            dap->uda_bandwidth = 25000;
-            break;
-        case MKSW(IB_SPEED_FDR10, IB_WIDTH_4X):
+        case MKSW(8, 2):
+        case MKSW(32, 2):
             dap->uda_bandwidth = 40000;
             break;
-        case MKSW(IB_SPEED_HDR, IB_WIDTH_1X):
-            dap->uda_bandwidth = 50000;
-            break;
-        case MKSW(IB_SPEED_EDR, IB_WIDTH_4X):
-            dap->uda_bandwidth = 100000;
-            break;
-        case MKSW(IB_SPEED_HDR, IB_WIDTH_4X):
-            dap->uda_bandwidth = 200000;
-            break;
-        case MKSW(IB_SPEED_HDR, IB_WIDTH_8X):
-            dap->uda_bandwidth = 400000;
-            break;
         default:
-            printf("Warning: unrecognized speed/width %d/%d, defaulting to 10G\n",
+            printf("Warning: unrecognized speed/width %d/%d, assuming 10G\n",
                    presp.active_speed, presp.active_width);
             dap->uda_bandwidth = 10000;
             break;
@@ -1003,20 +925,17 @@ usd_ib_cmd_create_comp_channel(
     int *comp_fd_o)
 {
     int n;
-    struct usnic_create_comp_channel cmd;
-    struct ib_uverbs_create_comp_channel_resp resp;
-    struct ib_uverbs_cmd_hdr *ich;
-    struct ib_uverbs_create_comp_channel *icp;
-    struct ib_uverbs_create_comp_channel_resp *irp;
+    struct ibv_create_comp_channel cmd;
+    struct ibv_create_comp_channel_resp resp;
+    struct ibv_create_comp_channel *icp;
+    struct ibv_create_comp_channel_resp *irp;
 
     memset(&cmd, 0, sizeof(cmd));
 
-    ich = &cmd.ibv_cmd_hdr;
-    ich->command = IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL;
-    ich->in_words = sizeof(cmd) / 4;
-    ich->out_words = sizeof(resp) / 4;
-
-    icp = &cmd.ibv_cmd;
+    icp = &cmd;
+    icp->command = IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL;
+    icp->in_words = sizeof(cmd) / 4;
+    icp->out_words = sizeof(resp) / 4;
     icp->response = (uintptr_t) & resp;
 
     /* Issue command to IB driver */

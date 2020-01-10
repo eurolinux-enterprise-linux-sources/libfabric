@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2016, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2015, Cisco Systems, Inc. All rights reserved.
  * Copyright (c) 2015, Intel Corp., Inc.  All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -38,13 +38,18 @@
 #include <ctype.h>
 
 #include <rdma/fi_errno.h>
+#include <rdma/fi_prov.h>
+#include <rdma/fi_log.h>
 
-#include "ofi.h"
-#include "ofi_list.h"
+#include "fi.h"
+#include "fi_list.h"
 
 
-extern int ofi_init;
-extern void fi_ini(void);
+/* When given a NULL provider pointer, use core for logging and settings. */
+extern struct fi_provider core_prov;
+
+extern int init;
+extern void fi_ini();
 
 struct fi_param_entry {
 	const struct fi_provider *provider;
@@ -78,7 +83,7 @@ fi_find_param(const struct fi_provider *provider, const char *param_name)
 	return NULL;
 }
 
-__attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
+__attribute__((visibility ("default")))
 int DEFAULT_SYMVER_PRE(fi_getparams)(struct fi_param **params, int *count)
 {
 	struct fi_param *vhead = NULL;
@@ -87,7 +92,7 @@ int DEFAULT_SYMVER_PRE(fi_getparams)(struct fi_param **params, int *count)
 	int cnt, i;
 	char *tmp;
 
-	if (!ofi_init)
+	if (!init)
 		fi_ini();
 
 	for (entry = param_list.next, cnt = 0; entry != &param_list;
@@ -109,8 +114,7 @@ int DEFAULT_SYMVER_PRE(fi_getparams)(struct fi_param **params, int *count)
 		vhead[i].type = param->type;
 		vhead[i].help_string = strdup(param->help_string);
 
-		tmp = getenv(param->env_var_name);
-		if (tmp)
+		if ((tmp = getenv(param->env_var_name)))
 			vhead[i].value = strdup(tmp);
 
 		if (!vhead[i].name || !vhead[i].help_string) {
@@ -124,20 +128,19 @@ out:
 	*params = vhead;
 	return FI_SUCCESS;
 }
-DEFAULT_SYMVER(fi_getparams_, fi_getparams, FABRIC_1.0);
+DEFAULT_SYMVER(fi_getparams_, fi_getparams);
 
-__attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
+__attribute__((visibility ("default")))
 void DEFAULT_SYMVER_PRE(fi_freeparams)(struct fi_param *params)
 {
-	int i;
-	for (i = 0; params[i].name; ++i) {
+	for (int i = 0; params[i].name; ++i) {
 		free((void*) params[i].name);
 		free((void*) params[i].help_string);
 		free((void*) params[i].value);
 	}
 	free(params);
 }
-DEFAULT_SYMVER(fi_freeparams_, fi_freeparams, FABRIC_1.0);
+DEFAULT_SYMVER(fi_freeparams_, fi_freeparams);
 
 static void fi_free_param(struct fi_param_entry *param)
 {
@@ -164,7 +167,7 @@ void fi_param_undefine(const struct fi_provider *provider)
 	}
 }
 
-__attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
+__attribute__((visibility ("default")))
 int DEFAULT_SYMVER_PRE(fi_param_define)(const struct fi_provider *provider,
 		const char *param_name, enum fi_param_type type,
 		const char *help_string)
@@ -216,14 +219,14 @@ int DEFAULT_SYMVER_PRE(fi_param_define)(const struct fi_provider *provider,
 	}
 
 	for (i = 0; v->env_var_name[i]; ++i)
-		v->env_var_name[i] = (char) toupper(v->env_var_name[i]);
+		v->env_var_name[i] = toupper(v->env_var_name[i]);
 
 	dlist_insert_tail(&v->entry, &param_list);
 
 	FI_INFO(provider, FI_LOG_CORE, "registered var %s\n", param_name);
 	return FI_SUCCESS;
 }
-DEFAULT_SYMVER(fi_param_define_, fi_param_define, FABRIC_1.0);
+DEFAULT_SYMVER(fi_param_define_, fi_param_define);
 
 static int fi_parse_bool(const char *str_value)
 {
@@ -244,7 +247,7 @@ static int fi_parse_bool(const char *str_value)
 	return -1;
 }
 
-__attribute__((visibility ("default"),EXTERNALLY_VISIBLE))
+__attribute__((visibility ("default")))
 int DEFAULT_SYMVER_PRE(fi_param_get)(struct fi_provider *provider,
 		const char *param_name, void *value)
 {
@@ -275,6 +278,7 @@ int DEFAULT_SYMVER_PRE(fi_param_get)(struct fi_provider *provider,
 	}
 
 	switch (param->type) {
+	default:
 	case FI_PARAM_STRING:
 		* ((char **) value) = str_value;
 		FI_INFO(provider, FI_LOG_CORE,
@@ -292,17 +296,12 @@ int DEFAULT_SYMVER_PRE(fi_param_get)(struct fi_provider *provider,
 		if (*(int *) value == -1)
 			ret = -FI_EINVAL;
 		break;
-	case FI_PARAM_SIZE_T:
-		* ((size_t *) value) = strtol(str_value, NULL, 0);
-		FI_INFO(provider, FI_LOG_CORE,
-			"read long var %s=%zu\n", param_name, *(size_t *) value);
-		break;
 	}
 
 out:
 	return ret;
 }
-DEFAULT_SYMVER(fi_param_get_, fi_param_get, FABRIC_1.0);
+DEFAULT_SYMVER(fi_param_get_, fi_param_get);
 
 
 void fi_param_init(void)

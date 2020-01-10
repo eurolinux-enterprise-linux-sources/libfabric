@@ -36,8 +36,8 @@
 #include <stdint.h>
 #include <pthread.h>
 
-#include <ofi.h>
-#include <ofi_list.h>
+#include <fi.h>
+#include <fi_list.h>
 
 #include "gnix_util.h"
 
@@ -143,9 +143,9 @@ typedef struct gnix_hashtable {
 	gnix_ht_state_e ht_state;
 	gnix_hashtable_attr_t ht_attr;
 	gnix_hashtable_ops_t *ht_ops;
-	ofi_atomic32_t ht_elements;
-	ofi_atomic32_t ht_collisions;
-	ofi_atomic32_t ht_insertions;
+	atomic_t ht_elements;
+	atomic_t ht_collisions;
+	atomic_t ht_insertions;
 	int ht_size;
 	union {
 		gnix_ht_lf_lh_t *ht_lf_tbl;

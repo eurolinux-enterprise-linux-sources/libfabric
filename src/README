@@ -1,5 +1,5 @@
-Version Libfabric v1.7.0
-Released on 2019-01-07
+Version Libfabric v1.3.0
+Released on 2016-04-11
 
 Introduction
 ============
@@ -76,8 +76,3 @@ To install from a libfabric source package run the following commands:
 
 If building directly from the libfabric git tree, run './autogen.sh'
 before the configure step.
-
-Windows
-=======
-Please find Windows specific instructions in docs/windows.txt file
-

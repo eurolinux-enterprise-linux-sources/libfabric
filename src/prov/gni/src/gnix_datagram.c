@@ -1,8 +1,7 @@
 /*
  * Copyright (c) 2015-2016 Cray Inc.  All rights reserved.
- * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
- *                         All rights reserved.
- * Copyright (c) 2016 Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2015-16 Los Alamos National Security, LLC.
+ *                       All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -50,11 +49,10 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
+#include <rdma/fi_prov.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-
-#include <rdma/providers/fi_prov.h>
 
 #include "gnix.h"
 #include "gnix_datagram.h"
@@ -311,7 +309,7 @@ int _gnix_dgram_wc_post(struct gnix_datagram *d)
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
-	COND_ACQUIRE(nic->requires_lock, &nic->lock);
+	fastlock_acquire(&nic->lock);
 	status = GNI_EpPostDataWId(d->gni_ep,
 				   d->dgram_in_buf,
 				   GNI_DATAGRAM_MAXSIZE,
@@ -324,9 +322,9 @@ int _gnix_dgram_wc_post(struct gnix_datagram *d)
 		/*
 		 * datagram is active now, listening
 		 */
-		d->state = GNIX_DGRAM_STATE_ACTIVE;
+		d->state = GNIX_DGRAM_STATE_LISTENING;
 	}
-	COND_RELEASE(nic->requires_lock, &nic->lock);
+	fastlock_release(&nic->lock);
 
 	return ret;
 }
@@ -354,7 +352,7 @@ int _gnix_dgram_bnd_post(struct gnix_datagram *d)
 		goto err;
 	}
 
-	COND_ACQUIRE(nic->requires_lock, &nic->lock);
+	fastlock_acquire(&nic->lock);
 	if (d->pre_post_clbk_fn != NULL) {
 		ret = d->pre_post_clbk_fn(d, &post);
 		if (ret != FI_SUCCESS)
@@ -366,11 +364,11 @@ int _gnix_dgram_bnd_post(struct gnix_datagram *d)
 	if (post) {
 		/*
 		 * if we get GNI_RC_ERROR_RESOURCE status return from
-		 * GNI_EpPostDataWId  that means that either a previously posted
+		 * GNI_EpPostDataWId  that means that a previously posted
 		 * wildcard datagram has matched up with an incoming
-		 * bound datagram or we have a previously posted bound
-		 * datagram whose transfer to the target node has
-		 * not yet completed.  Don't treat this case as an error.
+		 * connect request from the rank we are trying to send
+		 * a connect request to.  Don't treat this case as an
+		 * error.
 		 */
 		status = GNI_EpPostDataWId(d->gni_ep,
 					   d->dgram_in_buf,
@@ -387,7 +385,7 @@ int _gnix_dgram_bnd_post(struct gnix_datagram *d)
 		}
 	}
 
-	COND_RELEASE(nic->requires_lock, &nic->lock);
+	fastlock_release(&nic->lock);
 
 	if (post) {
 		if ((status != GNI_RC_SUCCESS) &&
@@ -403,7 +401,7 @@ int _gnix_dgram_bnd_post(struct gnix_datagram *d)
 			/*
 			 * datagram is active now, connecting
 			 */
-			d->state = GNIX_DGRAM_STATE_ACTIVE;
+			d->state = GNIX_DGRAM_STATE_CONNECTING;
 		} else {
 			ret = -FI_EBUSY;
 		}
@@ -420,7 +418,6 @@ int  _gnix_dgram_poll(struct gnix_dgram_hndl *hndl,
 	gni_return_t status;
 	gni_post_state_t post_state = GNI_POST_PENDING;
 	uint32_t responding_remote_id;
-	uint32_t timeout = -1;
 	unsigned int responding_remote_addr;
 	struct gnix_datagram *dg_ptr;
 	uint64_t datagram_id = 0UL;
@@ -433,13 +430,11 @@ int  _gnix_dgram_poll(struct gnix_dgram_hndl *hndl,
 	nic = cm_nic->nic;
 	assert(nic != NULL);
 
-	if (type == GNIX_DGRAM_BLOCK) {
-		if (hndl->timeout_needed &&
-			(hndl->timeout_needed(hndl->timeout_data) == true))
-				timeout = hndl->timeout;
+	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
+	if (type == GNIX_DGRAM_BLOCK) {
 		status = GNI_PostdataProbeWaitById(nic->gni_nic_hndl,
-						   timeout,
+						   -1,
 						   &datagram_id);
 		if ((status != GNI_RC_SUCCESS) &&
 			(status  != GNI_RC_TIMEOUT)) {
@@ -462,49 +457,57 @@ int  _gnix_dgram_poll(struct gnix_dgram_hndl *hndl,
 		}
 	}
 
-	switch (status) {
-	case GNI_RC_SUCCESS:
+	if (status == GNI_RC_SUCCESS) {
+
 		dg_ptr = (struct gnix_datagram *)datagram_id;
 		assert(dg_ptr != NULL);
+
+		assert((dg_ptr->state == GNIX_DGRAM_STATE_CONNECTING) ||
+			(dg_ptr->state = GNIX_DGRAM_STATE_LISTENING));
 
 		/*
 		 * do need to take lock here
 		 */
-		COND_ACQUIRE(nic->requires_lock, &nic->lock);
+		fastlock_acquire(&nic->lock);
+
+		if (dg_ptr->pre_test_clbk_fn != NULL) {
+			ret = dg_ptr->pre_test_clbk_fn(dg_ptr);
+			if (ret != FI_SUCCESS) {
+				GNIX_WARN(FI_LOG_EP_CTRL,
+					"pre_test_clbk returned %d\n",
+					ret);
+			}
+		}
 
 		status = GNI_EpPostDataTestById(dg_ptr->gni_ep,
 						datagram_id,
 						&post_state,
 						&responding_remote_addr,
 						&responding_remote_id);
-		if ((status != GNI_RC_SUCCESS) &&
-			(status !=GNI_RC_NO_MATCH)) {
+		if (status != GNI_RC_SUCCESS) {
 			GNIX_WARN(FI_LOG_EP_CTRL,
 				"GNI_EpPostDataTestById:  %s\n",
 					gni_err_str[status]);
 			ret = gnixu_to_fi_errno(status);
-			COND_RELEASE(nic->requires_lock, &nic->lock);
+			fastlock_release(&nic->lock);
 			goto err;
-		} else {
-			if ((status == GNI_RC_SUCCESS) &&
-			     (dg_ptr->state != GNIX_DGRAM_STATE_ACTIVE)) {
-				GNIX_DEBUG(FI_LOG_EP_CTRL,
-					"GNI_EpPostDataTestById ",
-					"returned success but dgram not active\n");
+		}
+
+		if (dg_ptr->post_test_clbk_fn != NULL) {
+			responding_addr.device_addr =
+				responding_remote_addr;
+			responding_addr.cdm_id =
+				responding_remote_id;
+			ret = dg_ptr->post_test_clbk_fn(dg_ptr,
+						responding_addr,
+						post_state);
+			if (ret != FI_SUCCESS) {
+				GNIX_WARN(FI_LOG_EP_CTRL,
+					"post_test_clbk returned %d\n",
+					ret);
 			}
 		}
-
-		COND_RELEASE(nic->requires_lock, &nic->lock);
-
-		/*
-		 * no match is okay, it means another thread
-		 * won the race to get this datagram
-		 */
-
-		if (status == GNI_RC_NO_MATCH) {
-			ret = FI_SUCCESS;
-			goto err;
-		}
+		fastlock_release(&nic->lock);
 
 		/*
 		 * pass COMPLETED and error post state cases to
@@ -540,46 +543,27 @@ int  _gnix_dgram_poll(struct gnix_dgram_hndl *hndl,
 				   post_state);
 			break;
 		}
-		break;
-	case GNI_RC_TIMEOUT:
-		/* call progress function */
-		if (hndl->timeout_progress)
-			hndl->timeout_progress(hndl->timeout_data);
-		break;
-	case GNI_RC_NO_MATCH:
-		break;
-	default:
-		/* an error */
-		break;
 	}
 
 err:
 	return ret;
 }
 
-int _gnix_dgram_hndl_alloc(struct gnix_cm_nic *cm_nic,
-			   enum fi_progress progress,
-			   const struct gnix_dgram_hndl_attr *attr,
-			   struct gnix_dgram_hndl **hndl_ptr)
+int _gnix_dgram_hndl_alloc(const struct gnix_fid_fabric *fabric,
+				struct gnix_cm_nic *cm_nic,
+				enum fi_progress progress,
+				struct gnix_dgram_hndl **hndl_ptr)
 {
 	int i, ret = FI_SUCCESS;
 	int n_dgrams_tot;
 	struct gnix_datagram *dgram_base = NULL, *dg_ptr;
 	struct gnix_dgram_hndl *the_hndl = NULL;
-	struct gnix_fid_domain *dom = cm_nic->domain;
-	struct gnix_fid_fabric *fabric = NULL;
 	struct gnix_nic *nic;
 	gni_return_t status;
-	uint32_t num_corespec_cpus = 0;
 
 	GNIX_TRACE(FI_LOG_EP_CTRL, "\n");
 
 	nic = cm_nic->nic;
-
-	if (dom == NULL)
-		return -FI_EINVAL;
-
-	fabric = dom->fabric;
 
 	the_hndl = calloc(1, sizeof(struct gnix_dgram_hndl));
 	if (the_hndl == NULL) {
@@ -594,8 +578,6 @@ int _gnix_dgram_hndl_alloc(struct gnix_cm_nic *cm_nic,
 
 	dlist_init(&the_hndl->wc_dgram_free_list);
 	dlist_init(&the_hndl->wc_dgram_active_list);
-
-	the_hndl->timeout = -1;
 
 	/*
 	 * inherit some stuff from the fabric object being
@@ -667,13 +649,6 @@ int _gnix_dgram_hndl_alloc(struct gnix_cm_nic *cm_nic,
 
 	if (progress == FI_PROGRESS_AUTO) {
 
-		if (attr != NULL) {
-			the_hndl->timeout_needed = attr->timeout_needed;
-			the_hndl->timeout_progress = attr->timeout_progress;
-			the_hndl->timeout_data = attr->timeout_data;
-			the_hndl->timeout = attr->timeout;
-		}
-
 		/*
 		 * tell CLE job container that next thread should be
 		 * runnable anywhere in the cpuset, don't treat as
@@ -681,21 +656,10 @@ int _gnix_dgram_hndl_alloc(struct gnix_cm_nic *cm_nic,
 		 * though...
 		 */
 
-		ret = _gnix_get_num_corespec_cpus(&num_corespec_cpus);
-		if (ret != FI_SUCCESS) {
-			GNIX_WARN(FI_LOG_EP_CTRL,
-				  "failed to get num corespec cpus\n");
-		}
-
-		if (num_corespec_cpus > 0) {
-			ret = _gnix_job_disable_affinity_apply();
-		} else {
-			ret = _gnix_job_enable_unassigned_cpus();
-		}
+		ret = _gnix_job_disable_affinity_apply();
 		if (ret != 0)
 			GNIX_WARN(FI_LOG_EP_CTRL,
-			"disable_affinity/unassigned_cpus call returned %d\n",
-			ret);
+			"_gnix_job_disable call returned %d\n", ret);
 
 		ret = pthread_create(&the_hndl->progress_thread,
 				     NULL,

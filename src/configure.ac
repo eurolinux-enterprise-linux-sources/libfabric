@@ -4,7 +4,7 @@ dnl
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.60])
-AC_INIT([libfabric], [1.7.0], [ofiwg@lists.openfabrics.org])
+AC_INIT([libfabric], [1.3.0], [ofiwg@lists.openfabrics.org])
 AC_CONFIG_SRCDIR([src/fabric.c])
 AC_CONFIG_AUX_DIR(config)
 AC_CONFIG_MACRO_DIR(config)
@@ -37,26 +37,21 @@ AM_CONDITIONAL([MACOS], [test "x$macos" = "x1"])
 AM_CONDITIONAL([LINUX], [test "x$linux" = "x1"])
 AM_CONDITIONAL([FREEBSD], [test "x$freebsd" = "x1"])
 
-base_c_warn_flags="-Wall -Wundef -Wpointer-arith"
-debug_c_warn_flags="-Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers"
-debug_c_other_flags="-fstack-protector-strong"
-picky_c_warn_flags="-Wno-long-long -Wmissing-prototypes -Wstrict-prototypes -Wcomment -pedantic"
+AC_ARG_ENABLE([debug],
+	      [AS_HELP_STRING([--enable-debug],
+			      [Enable debugging @<:@default=no@:>@])
+	      ],
+	      [CFLAGS="$CFLAGS -g -O0 -Wall -Wextra -Wundef -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers"
+	       dbg=1],
+	      [enable_debug=no
+               dbg=0])
 
-AC_ARG_WITH([build_id],
-	    [AC_HELP_STRING([--with-build_id],
-			    [Enable build_id annotation @<:@default=no@:>@])],
-	    [], [with_build_id=no])
-AS_IF([test x"$with_build_id" = x"no"], [with_build_id=""])
-AC_DEFINE_UNQUOTED([BUILD_ID],["$with_build_id"],
-                   [adds build_id to version if it was defined])
+AC_DEFINE_UNQUOTED([ENABLE_DEBUG],[$dbg],
+                   [defined to 1 if libfabric was configured with --enable-debug, 0 otherwise])
 
-# Override autoconf default CFLAG settings (e.g. "-g -O2") while still
-# allowing the user to explicitly set CFLAGS=""
-: ${CFLAGS="-fvisibility=hidden ${base_c_warn_flags}"}
-
-# AM_PROG_AS would set CFLAGS="-g -O2" by default if not set already so it
-# should not be called earlier
-AM_PROG_AS()
+dnl Fix autoconf's habit of adding -g -O2 by default
+AS_IF([test -z "$CFLAGS"],
+      [CFLAGS='-fvisibility=hidden -O2 -DNDEBUG -Wall -Wundef'])
 
 # AM PROG_AR did not exist pre AM 1.11.x (where x is somewhere >0 and
 # <3), but it is necessary in AM 1.12.x.
@@ -70,7 +65,7 @@ if test "$with_valgrind" != "" && test "$with_valgrind" != "no"; then
 	AC_DEFINE([INCLUDE_VALGRIND], 1,
 		  [Define to 1 to enable valgrind annotations])
 	if test -d $with_valgrind; then
-		CPPFLAGS="$CPPFLAGS -I$with_valgrind/include"
+		CPPFLAGS="$CPPLFAGS -I$with_valgrind/include"
 	fi
 fi
 
@@ -86,35 +81,6 @@ AC_PROG_CC_C99
 AM_PROG_CC_C_O
 AC_PROG_CPP
 
-AC_ARG_ENABLE([debug],
-	      [AS_HELP_STRING([--enable-debug],
-			      [Enable debugging @<:@default=no@:>@])
-	      ],
-	      [],
-	      [enable_debug=no])
-
-AS_IF([test x"$enable_debug" != x"no"],
-      [dbg=1
-       # See if all the flags in $debug_c_other_flags work
-       good_flags=
-       for flag in $debug_c_other_flags; do
-           AC_MSG_CHECKING([to see if compiler supports $flag])
-           CFLAGS="$flag $CFLAGS"
-           AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[]], [[int i = 3;]])],
-	                     [AC_MSG_RESULT([yes])
-			      good_flags="$flag $good_flags"],
-			     [AC_MSG_RESULT([no])])
-       done
-       debug_c_other_flags=$good_flags
-       unset good_flags
-
-       CFLAGS="-g -O0 ${base_c_warn_flags} ${debug_c_warn_flags} ${debug_c_other_flags} $CFLAGS"],
-      [dbg=0
-       CFLAGS="-O2 -DNDEBUG $CFLAGS"])
-
-AC_DEFINE_UNQUOTED([ENABLE_DEBUG],[$dbg],
-                   [defined to 1 if libfabric was configured with --enable-debug, 0 otherwise])
-
 dnl Checks for header files.
 AC_HEADER_STDC
 
@@ -122,7 +88,6 @@ dnl Check for compiler features
 AC_C_TYPEOF
 
 LT_INIT
-LT_OUTPUT
 
 dnl dlopen support is optional
 AC_ARG_WITH([dlopen],
@@ -137,17 +102,6 @@ AC_CHECK_LIB(dl, dlopen, [],
 ])
 fi
 
-dnl handle picky option
-AC_ARG_ENABLE([picky],
-    [AC_HELP_STRING([--enable-picky],
-                    [Enable developer-level compiler pickyness when building @<:@default=no@:>@])])
-AS_IF([test x"$enable_picky" = x"yes" && test x"$GCC" = x"yes"],
-      [AS_IF([test x"$enable_debug" = x"no"],
-             [CFLAGS="${base_c_warn_flags} ${debug_c_warn_flags}
-		      ${debug_c_other_flags} ${picky_c_warn_flags} $CFLAGS"],
-             [CFLAGS="${picky_c_warn_flags} $CFLAGS"])
-      ])
-
 dnl Checks for libraries
 AC_CHECK_LIB(pthread, pthread_mutex_init, [],
     AC_MSG_ERROR([pthread_mutex_init() not found.  libfabric requires libpthread.]))
@@ -156,37 +110,28 @@ AC_CHECK_FUNC([pthread_spin_init],
 	[have_spinlock=1],
 	[have_spinlock=0])
 
-dnl shm_open not used in the common code on os-x
-
-if test "$macos" -eq 0; then
-AC_CHECK_FUNC([shm_open],
-	[],
-	[AC_SEARCH_LIBS([shm_open],[rt],[],
-	 [AC_MSG_ERROR([shm_open() not found.  libfabric requires shm_open.])])])
-fi
-
 AC_DEFINE_UNQUOTED([PT_LOCK_SPIN], [$have_spinlock],
 	[Define to 1 if pthread_spin_init is available.])
+
+have_clock_gettime=0
+have_host_get_clock_service=0
 
 AC_CHECK_FUNCS([epoll_create])
 if test "$ac_cv_func_epoll_create" = yes; then
   AC_DEFINE([HAVE_EPOLL], [1], [Define if you have epoll support.])
 fi
 
-AC_CHECK_HEADER([linux/perf_event.h],
-    [AC_CHECK_DECL([__builtin_ia32_rdpmc],
-        [
-            AC_TRY_LINK([#include <linux/perf_event.h>],
-                [__builtin_ia32_rdpmc(0);],
-                [linux_perf_rdpmc=1],
-                [linux_perf_rdpmc=0])
-	],
-        [linux_perf_rdpmc=0],
-        [#include <linux/perf_event.h>])],
-    [linux_perf_rdpmc=0])
-AC_DEFINE_UNQUOTED(HAVE_LINUX_PERF_RDPMC, [$linux_perf_rdpmc],
-    [Whether we have __builtin_ia32_rdpmc() and linux/perf_event.h file or not])
-AM_CONDITIONAL([HAVE_LINUX_PERF_RDPMC], [test "x$linux_perf_rdpmc" = "x1"])
+AC_SEARCH_LIBS([clock_gettime],[rt],
+		[have_clock_gettime=1],
+		[AC_CHECK_FUNCS([host_get_clock_service],
+			[have_host_get_clock_service=1],
+			[AC_MSG_ERROR([clock_gettime or host_get_clock_service
+			 not found.])])])
+
+AC_DEFINE_UNQUOTED(HAVE_CLOCK_GETTIME, [$have_clock_gettime],
+		   [Define to 1 if clock_gettime is available.])
+AC_DEFINE_UNQUOTED(HAVE_HOST_GET_CLOCK_SERVICE, [$have_host_get_clock_service],
+		   [Define to 1 if host_clock_get_service is available.])
 
 dnl Check for gcc atomic intrinsics
 AC_MSG_CHECKING(compiler support for c11 atomics)
@@ -205,94 +150,6 @@ AC_TRY_LINK([#include <stdatomic.h>],
     ],
     [AC_MSG_RESULT(no)])
 
-
-AC_MSG_CHECKING(compiler support for c11 atomic `least` types)
-AC_TRY_LINK([#include <stdatomic.h>],
-    [atomic_int_least32_t a;
-     atomic_int_least64_t b;
-    ],
-    [
-        AC_MSG_RESULT(yes)
-        AC_DEFINE(HAVE_ATOMICS_LEAST_TYPES, 1,
-                  [Set to 1 to use c11 atomic `least` types])
-    ],
-    [
-        AC_MSG_RESULT(no)
-    ])
-
-dnl Check for gcc built-in atomics
-AC_MSG_CHECKING(compiler support for built-in atomics)
-AC_TRY_LINK([#include <stdint.h>],
-    [int32_t a;
-     __sync_add_and_fetch(&a, 0);
-     __sync_sub_and_fetch(&a, 0);
-     #if defined(__PPC__) && !defined(__PPC64__)
-       #error compiler built-in atomics are not supported on PowerPC 32-bit
-     #else
-       return 0;
-     #endif
-    ],
-    [
-	AC_MSG_RESULT(yes)
-        AC_DEFINE(HAVE_BUILTIN_ATOMICS, 1, [Set to 1 to use built-in intrincics atomics])
-    ],
-    [AC_MSG_RESULT(no)])
-
-dnl Check for gcc memory model aware built-in atomics
-dnl If supported check to see if not internal to compiler
-AC_MSG_CHECKING(compiler support for built-in memory model aware atomics)
-AC_TRY_LINK([#include <stdint.h>],
-    [uint64_t d;
-     uint64_t s;
-     uint64_t c;
-     uint64_t r;
-      r = __atomic_fetch_add(&d, s, __ATOMIC_SEQ_CST);
-      __atomic_load(&d, &r, __ATOMIC_SEQ_CST);
-      __atomic_exchange(&d, &s, &r, __ATOMIC_SEQ_CST);
-      __atomic_compare_exchange(&d,&c,&s,0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-     #if defined(__PPC__) && !defined(__PPC64__)
-       #error compiler built-in memory model aware atomics are not supported on PowerPC 32-bit
-     #else
-       return 0;
-     #endif
-    ],
-    [
-        AC_MSG_RESULT(yes)
-        AC_SEARCH_LIBS([__atomic_load_8], [atomic])
-        AC_DEFINE(HAVE_BUILTIN_MM_ATOMICS, 1, [Set to 1 to use built-in intrinsics memory model aware atomics])
-    ],
-    [AC_MSG_RESULT(no)])
-
-dnl Check for gcc cpuid intrinsics
-AC_MSG_CHECKING(compiler support for cpuid)
-AC_TRY_LINK([
-     #include <stddef.h>
-     #include <cpuid.h>],
-    [
-     int a, b, c, d;
-     __cpuid_count(0, 0, a, b, c, d);
-    ],
-    [
-	AC_MSG_RESULT(yes)
-        AC_DEFINE(HAVE_CPUID, 1, [Set to 1 to to use cpuid])
-    ],
-    [AC_MSG_RESULT(no)])
-
-dnl Check for glibc malloc hooks
-AC_MSG_CHECKING(compiler support for glibc malloc hooks)
-AC_TRY_LINK([#include <malloc.h>],
-    [
-     __malloc_hook = NULL;
-     __realloc_hook = NULL;
-     __memalign_hook = NULL;
-     __free_hook = NULL;
-    ],
-    [
-	AC_MSG_RESULT(yes)
-        AC_DEFINE(HAVE_GLIBC_MALLOC_HOOKS, 1, [Set to 1 to use glibc malloc hooks])
-    ],
-    [AC_MSG_RESULT(no)])
-
 if test "$with_valgrind" != "" && test "$with_valgrind" != "no"; then
 AC_CHECK_HEADER(valgrind/memcheck.h, [],
     AC_MSG_ERROR([valgrind requested but <valgrind/memcheck.h> not found.]))
@@ -304,15 +161,6 @@ AC_CACHE_CHECK(whether ld accepts --version-script, ac_cv_version_script,
     else
         ac_cv_version_script=no
     fi])
-
-AC_ARG_ENABLE([embedded],
-	      [AS_HELP_STRING([--enable-embedded],
-			      [Enable embedded support (turns off symbol versioning) @<:@default=no@:>@])
-	      ],
-	      [ac_asm_symver_support=0
-               icc_symver_hack=1],
-	      [enable_embedded=no])
-AM_CONDITIONAL([EMBEDDED], [test x"$enable_embedded" = x"yes"])
 
 AM_CONDITIONAL(HAVE_LD_VERSION_SCRIPT, test "$ac_cv_version_script" = "yes")
 
@@ -369,7 +217,6 @@ AC_TRY_LINK(
 
 AC_DEFINE_UNQUOTED([HAVE_ALIAS_ATTRIBUTE], [$ac_prog_cc_alias_symbols],
 	  	   [Define to 1 if the linker supports alias attribute.])
-AC_CHECK_FUNCS([getifaddrs])
 
 dnl Provider-specific checks
 FI_PROVIDER_INIT
@@ -380,17 +227,9 @@ FI_PROVIDER_SETUP([verbs])
 dnl The usnic provider must be setup after the verbs provider.  See
 dnl prov/usnic/configure.m4 for details.
 FI_PROVIDER_SETUP([usnic])
-FI_PROVIDER_SETUP([mlx])
+FI_PROVIDER_SETUP([mxm])
 FI_PROVIDER_SETUP([gni])
 FI_PROVIDER_SETUP([udp])
-FI_PROVIDER_SETUP([tcp])
-FI_PROVIDER_SETUP([rxm])
-FI_PROVIDER_SETUP([mrail])
-FI_PROVIDER_SETUP([rxd])
-FI_PROVIDER_SETUP([bgq])
-FI_PROVIDER_SETUP([shm])
-FI_PROVIDER_SETUP([rstream])
-FI_PROVIDER_SETUP([perf])
 FI_PROVIDER_FINI
 dnl Configure the .pc file
 FI_PROVIDER_SETUP_PC

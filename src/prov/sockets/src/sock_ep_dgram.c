@@ -109,8 +109,7 @@ static int sock_dgram_verify_rx_attr(const struct fi_rx_attr *attr)
 	if (attr->total_buffered_recv > sock_dgram_rx_attr.total_buffered_recv)
 		return -FI_ENODATA;
 
-	if (sock_get_tx_size(attr->size) >
-	     sock_get_tx_size(sock_dgram_rx_attr.size))
+	if (attr->size > sock_dgram_rx_attr.size)
 		return -FI_ENODATA;
 
 	if (attr->iov_limit > sock_dgram_rx_attr.iov_limit)
@@ -133,8 +132,7 @@ static int sock_dgram_verify_tx_attr(const struct fi_tx_attr *attr)
 	if (attr->inject_size > sock_dgram_tx_attr.inject_size)
 		return -FI_ENODATA;
 
-	if (sock_get_tx_size(attr->size) >
-	     sock_get_tx_size(sock_dgram_tx_attr.size))
+	if (attr->size > sock_dgram_tx_attr.size)
 		return -FI_ENODATA;
 
 	if (attr->iov_limit > sock_dgram_tx_attr.iov_limit)
@@ -146,9 +144,9 @@ static int sock_dgram_verify_tx_attr(const struct fi_tx_attr *attr)
 	return 0;
 }
 
-int sock_dgram_verify_ep_attr(const struct fi_ep_attr *ep_attr,
-			      const struct fi_tx_attr *tx_attr,
-			      const struct fi_rx_attr *rx_attr)
+int sock_dgram_verify_ep_attr(struct fi_ep_attr *ep_attr,
+			    struct fi_tx_attr *tx_attr,
+			    struct fi_rx_attr *rx_attr)
 {
 	if (ep_attr) {
 		switch (ep_attr->protocol) {
@@ -197,17 +195,15 @@ int sock_dgram_verify_ep_attr(const struct fi_ep_attr *ep_attr,
 	return 0;
 }
 
-int sock_dgram_fi_info(uint32_t version, void *src_addr, void *dest_addr,
-		       const struct fi_info *hints, struct fi_info **info)
+int sock_dgram_fi_info(void *src_addr, void *dest_addr, struct fi_info *hints,
+			struct fi_info **info)
 {
-	*info = sock_fi_info(version, FI_EP_DGRAM, hints, src_addr, dest_addr);
+	*info = sock_fi_info(FI_EP_DGRAM, hints, src_addr, dest_addr);
 	if (!*info)
 		return -FI_ENOMEM;
 
 	*(*info)->tx_attr = sock_dgram_tx_attr;
-	(*info)->tx_attr->size = sock_get_tx_size(sock_dgram_tx_attr.size);
 	*(*info)->rx_attr = sock_dgram_rx_attr;
-	(*info)->rx_attr->size = sock_get_tx_size(sock_dgram_rx_attr.size);
 	*(*info)->ep_attr = sock_dgram_ep_attr;
 
 	if (hints && hints->ep_attr) {
@@ -275,7 +271,7 @@ static int sock_dgram_endpoint(struct fid_domain *domain, struct fi_info *info,
 		return ret;
 
 	if (!info || !info->ep_attr)
-		(*ep)->attr->ep_attr = sock_dgram_ep_attr;
+		(*ep)->ep_attr = sock_dgram_ep_attr;
 
 	if (!info || !info->tx_attr)
 		(*ep)->tx_attr = sock_dgram_tx_attr;

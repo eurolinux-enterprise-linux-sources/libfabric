@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014, Cisco Systems, Inc. All rights reserved.
  *
  * LICENSE_BEGIN
  *
@@ -44,9 +44,8 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <infiniband/kern-abi.h>
 #include <infiniband/verbs.h>
-
-#include <rdma/ib_user_verbs.h>
 
 #include "usnic_direct.h"
 #include "usd.h"
@@ -58,7 +57,7 @@ int
 usd_get_device_event(struct usd_device *dev,
                      struct usd_device_event *devent)
 {
-    struct ib_uverbs_async_event_desc ib_event;
+    struct ibv_kern_async_event ib_event;
     int n;
 
     n = read(dev->ud_attrs.uda_event_fd, &ib_event, sizeof(ib_event));

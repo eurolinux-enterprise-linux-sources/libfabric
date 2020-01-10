@@ -33,44 +33,46 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <ofi_enosys.h>
-#include <ofi_util.h>
+#include <fi_enosys.h>
+#include <fi_util.h>
 
-int ofi_fabric_close(struct util_fabric *fabric)
+int util_fabric_close(struct util_fabric *fabric)
 {
-	if (ofi_atomic_get32(&fabric->ref))
+	if (atomic_get(&fabric->ref))
 		return -FI_EBUSY;
 
-	ofi_fabric_remove(fabric);
-	free((char *)fabric->name);
+	fi_fabric_remove(fabric);
 	fastlock_destroy(&fabric->lock);
 	return 0;
 }
 
-int ofi_fabric_init(const struct fi_provider *prov,
-		    const struct fi_fabric_attr *prov_attr,
-		    const struct fi_fabric_attr *user_attr,
-		    struct util_fabric *fabric, void *context)
+static void util_fabric_init(struct util_fabric *fabric, const char *name)
+{
+	atomic_initialize(&fabric->ref, 0);
+	dlist_init(&fabric->domain_list);
+	fastlock_init(&fabric->lock);
+	fabric->name = name;
+}
+
+int fi_fabric_init(const struct fi_provider *prov,
+		   struct fi_fabric_attr *prov_attr,
+		   struct fi_fabric_attr *user_attr,
+		   struct util_fabric *fabric, void *context)
 {
 	int ret;
 
-	ret = ofi_check_fabric_attr(prov, prov_attr, user_attr);
+	ret = fi_check_fabric_attr(prov, prov_attr, user_attr);
 	if (ret)
 		return ret;
 
 	fabric->prov = prov;
-	ofi_atomic_initialize32(&fabric->ref, 0);
-	dlist_init(&fabric->domain_list);
-	fastlock_init(&fabric->lock);
-	fabric->name = strdup(user_attr->name);
-	if (!fabric->name)
-		return -FI_ENOMEM;
+	util_fabric_init(fabric, prov_attr->name);
 
 	fabric->fabric_fid.fid.fclass = FI_CLASS_FABRIC;
 	fabric->fabric_fid.fid.context = context;
 	/*
 	 * fabric ops set by provider
 	 */
-	ofi_fabric_insert(fabric);
+	fi_fabric_insert(fabric);
 	return 0;
 }

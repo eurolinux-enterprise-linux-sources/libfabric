@@ -1,5 +1,5 @@
 /*
- * Copyright 2008-2018 Cisco Systems, Inc.  All rights reserved.
+ * Copyright 2008-2010 Cisco Systems, Inc.  All rights reserved.
  * Copyright 2007 Nuova Systems, Inc.  All rights reserved.
  *
  * LICENSE_BEGIN
@@ -51,13 +51,11 @@
 #include "vnic_dev.h"
 #include "vnic_intr.h"
 
-EXPORT_SYMBOL(vnic_intr_free);
 void vnic_intr_free(struct vnic_intr *intr)
 {
 	intr->ctrl = NULL;
 }
 
-EXPORT_SYMBOL(vnic_intr_alloc);
 int vnic_intr_alloc(struct vnic_dev *vdev, struct vnic_intr *intr,
 	unsigned int index)
 {
@@ -73,7 +71,6 @@ int vnic_intr_alloc(struct vnic_dev *vdev, struct vnic_intr *intr,
 	return 0;
 }
 
-EXPORT_SYMBOL(vnic_intr_init);
 void vnic_intr_init(struct vnic_intr *intr, u32 coalescing_timer,
 	unsigned int coalescing_type, unsigned int mask_on_assertion)
 {
@@ -100,13 +97,11 @@ void vnic_intr_raise(struct vnic_intr *intr)
 	vnic_dev_raise_intr(intr->vdev, (u16)intr->index);
 }
 
-EXPORT_SYMBOL(vnic_grpmbrintr_free);
 void vnic_grpmbrintr_free(struct vnic_intr *intr)
 {
 	intr->ctrl = NULL;
 }
 
-EXPORT_SYMBOL(vnic_grpmbrintr_alloc);
 int vnic_grpmbrintr_alloc(struct vnic_dev *vdev, struct vnic_intr *intr,
 	unsigned int index)
 {

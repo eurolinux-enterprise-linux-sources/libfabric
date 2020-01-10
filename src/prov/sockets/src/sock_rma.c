@@ -51,8 +51,6 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#include <ofi_iov.h>
-
 #include "sock.h"
 #include "sock_util.h"
 
@@ -62,29 +60,23 @@
 ssize_t sock_ep_rma_readmsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
 			    uint64_t flags)
 {
-	int ret;
-	size_t i;
+	int ret, i;
 	struct sock_op tx_op;
 	union sock_iov tx_iov;
 	struct sock_conn *conn;
 	struct sock_tx_ctx *tx_ctx;
-	uint64_t total_len, src_len, dst_len, op_flags;
+	uint64_t total_len, src_len, dst_len;
 	struct sock_ep *sock_ep;
-	struct sock_ep_attr *ep_attr;
 
 	switch (ep->fid.fclass) {
 	case FI_CLASS_EP:
 		sock_ep = container_of(ep, struct sock_ep, ep);
-		tx_ctx = sock_ep->attr->tx_ctx->use_shared ?
-			sock_ep->attr->tx_ctx->stx_ctx : sock_ep->attr->tx_ctx;
-		ep_attr = sock_ep->attr;
-		op_flags = sock_ep->tx_attr.op_flags;
+		tx_ctx = sock_ep->tx_ctx;
 		break;
 
 	case FI_CLASS_TX_CTX:
 		tx_ctx = container_of(ep, struct sock_tx_ctx, fid.ctx);
-		ep_attr = tx_ctx->ep_attr;
-		op_flags = tx_ctx->attr.op_flags;
+		sock_ep = tx_ctx->ep;
 		break;
 
 	default:
@@ -101,16 +93,16 @@ ssize_t sock_ep_rma_readmsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
 	if (!tx_ctx->enabled)
 		return -FI_EOPBADSTATE;
 
-	ret = sock_ep_get_conn(ep_attr, tx_ctx, msg->addr, &conn);
+	ret = sock_ep_get_conn(sock_ep, tx_ctx, msg->addr, &conn);
 	if (ret)
 		return ret;
 
 	SOCK_EP_SET_TX_OP_FLAGS(flags);
 	if (flags & SOCK_USE_OP_FLAGS)
-		flags |= op_flags;
+		flags |= tx_ctx->attr.op_flags;
 
 	if (flags & FI_TRIGGER) {
-		ret = sock_queue_rma_op(ep, msg, flags, FI_OP_READ);
+		ret = sock_queue_rma_op(ep, msg, flags, SOCK_OP_READ);
 		if (ret != 1)
 			return ret;
 	}
@@ -120,7 +112,7 @@ ssize_t sock_ep_rma_readmsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
 		(msg->rma_iov_count * sizeof(union sock_iov));
 
 	sock_tx_ctx_start(tx_ctx);
-	if (ofi_rbavail(&tx_ctx->rb) < total_len) {
+	if (rbavail(&tx_ctx->rb) < total_len) {
 		ret = -FI_EAGAIN;
 		goto err;
 	}
@@ -133,7 +125,7 @@ ssize_t sock_ep_rma_readmsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
 	sock_tx_ctx_write_op_send(tx_ctx, &tx_op, flags,
 			(uintptr_t) msg->context, msg->addr,
 			(uintptr_t) msg->msg_iov[0].iov_base,
-			ep_attr, conn);
+			sock_ep, conn);
 
 	src_len = 0;
 	for (i = 0; i < msg->rma_iov_count; i++) {
@@ -172,25 +164,25 @@ static ssize_t sock_ep_rma_read(struct fid_ep *ep, void *buf, size_t len,
 				 void *desc, fi_addr_t src_addr, uint64_t addr,
 				 uint64_t key, void *context)
 {
-	struct iovec msg_iov = {
-		.iov_base = (void *)buf,
-		.iov_len = len,
-	};
-	struct fi_rma_iov rma_iov = {
-		.addr = addr,
-		.key = key,
-		.len = len,
-	};
-	struct fi_msg_rma msg = {
-		.msg_iov = &msg_iov,
-		.desc = &desc,
-		.iov_count = 1,
-		.rma_iov_count = 1,
-		.rma_iov = &rma_iov,
-		.addr = src_addr,
-		.context = context,
-		.data = 0,
-	};
+	struct fi_msg_rma msg;
+	struct iovec msg_iov;
+	struct fi_rma_iov rma_iov;
+
+	memset(&msg, 0, sizeof(msg));
+	msg_iov.iov_base = (void *) buf;
+	msg_iov.iov_len = len;
+	msg.msg_iov = &msg_iov;
+	msg.desc = &desc;
+	msg.iov_count = 1;
+
+	rma_iov.addr = addr;
+	rma_iov.key = key;
+	rma_iov.len = len;
+	msg.rma_iov_count = 1;
+	msg.rma_iov = &rma_iov;
+
+	msg.addr = src_addr;
+	msg.context = context;
 
 	return sock_ep_rma_readmsg(ep, &msg, SOCK_USE_OP_FLAGS);
 }
@@ -200,21 +192,26 @@ static ssize_t sock_ep_rma_readv(struct fid_ep *ep, const struct iovec *iov,
 				fi_addr_t src_addr, uint64_t addr, uint64_t key,
 				void *context)
 {
-	struct fi_rma_iov rma_iov = {
-		.addr = addr,
-		.len = ofi_total_iov_len(iov, count),
-		.key = key,
-	};
-	struct fi_msg_rma msg = {
-		.msg_iov = iov,
-		.desc = desc,
-		.iov_count = count,
-		.rma_iov_count = 1,
-		.rma_iov = &rma_iov,
-		.addr = src_addr,
-		.context = context,
-		.data = 0,
-	};
+	size_t len, i;
+	struct fi_msg_rma msg;
+	struct fi_rma_iov rma_iov;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_iov = iov;
+	msg.desc = desc;
+	msg.iov_count = count;
+	msg.rma_iov_count = 1;
+
+	rma_iov.addr = addr;
+	rma_iov.key = key;
+
+	for (i = 0, len = 0; i < count; i++)
+		len += iov[i].iov_len;
+	rma_iov.len = len;
+
+	msg.rma_iov = &rma_iov;
+	msg.addr = src_addr;
+	msg.context = context;
 
 	return sock_ep_rma_readmsg(ep, &msg, SOCK_USE_OP_FLAGS);
 }
@@ -222,29 +219,23 @@ static ssize_t sock_ep_rma_readv(struct fid_ep *ep, const struct iovec *iov,
 ssize_t sock_ep_rma_writemsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
 			     uint64_t flags)
 {
-	int ret;
-	size_t i;
+	int ret, i;
 	struct sock_op tx_op;
 	union sock_iov tx_iov;
 	struct sock_conn *conn;
 	struct sock_tx_ctx *tx_ctx;
-	uint64_t total_len, src_len, dst_len, op_flags;
+	uint64_t total_len, src_len, dst_len;
 	struct sock_ep *sock_ep;
-	struct sock_ep_attr *ep_attr;
 
 	switch (ep->fid.fclass) {
 	case FI_CLASS_EP:
 		sock_ep = container_of(ep, struct sock_ep, ep);
-		tx_ctx = sock_ep->attr->tx_ctx->use_shared ?
-			sock_ep->attr->tx_ctx->stx_ctx : sock_ep->attr->tx_ctx;
-		ep_attr = sock_ep->attr;
-		op_flags = sock_ep->tx_attr.op_flags;
+		tx_ctx = sock_ep->tx_ctx;
 		break;
 
 	case FI_CLASS_TX_CTX:
 		tx_ctx = container_of(ep, struct sock_tx_ctx, fid.ctx);
-		ep_attr = tx_ctx->ep_attr;
-		op_flags = tx_ctx->attr.op_flags;
+		sock_ep = tx_ctx->ep;
 		break;
 
 	default:
@@ -261,16 +252,16 @@ ssize_t sock_ep_rma_writemsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
 	if (!tx_ctx->enabled)
 		return -FI_EOPBADSTATE;
 
-	ret = sock_ep_get_conn(ep_attr, tx_ctx, msg->addr, &conn);
+	ret = sock_ep_get_conn(sock_ep, tx_ctx, msg->addr, &conn);
 	if (ret)
 		return ret;
 
 	SOCK_EP_SET_TX_OP_FLAGS(flags);
 	if (flags & SOCK_USE_OP_FLAGS)
-		flags |= op_flags;
+		flags |= tx_ctx->attr.op_flags;
 
 	if (flags & FI_TRIGGER) {
-		ret = sock_queue_rma_op(ep, msg, flags, FI_OP_WRITE);
+		ret = sock_queue_rma_op(ep, msg, flags, SOCK_OP_WRITE);
 		if (ret != 1)
 			return ret;
 	}
@@ -297,14 +288,14 @@ ssize_t sock_ep_rma_writemsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
 		      (msg->rma_iov_count * sizeof(union sock_iov)));
 
 	sock_tx_ctx_start(tx_ctx);
-	if (ofi_rbavail(&tx_ctx->rb) < total_len) {
+	if (rbavail(&tx_ctx->rb) < total_len) {
 		ret = -FI_EAGAIN;
 		goto err;
 	}
 
 	sock_tx_ctx_write_op_send(tx_ctx, &tx_op, flags,
 			(uintptr_t) msg->context, msg->addr,
-			(uintptr_t) msg->msg_iov[0].iov_base, ep_attr, conn);
+			(uintptr_t) msg->msg_iov[0].iov_base, sock_ep, conn);
 
 	if (flags & FI_REMOTE_CQ_DATA)
 		sock_tx_ctx_write(tx_ctx, &msg->data, sizeof(msg->data));
@@ -354,25 +345,27 @@ static ssize_t sock_ep_rma_write(struct fid_ep *ep, const void *buf,
 				  size_t len, void *desc, fi_addr_t dest_addr,
 				  uint64_t addr, uint64_t key, void *context)
 {
-	struct iovec msg_iov = {
-		.iov_base = (void *)buf,
-		.iov_len = len,
-	};
-	struct fi_rma_iov rma_iov = {
-		.addr = addr,
-		.key = key,
-		.len = len,
-	};
-	struct fi_msg_rma msg = {
-		.msg_iov = &msg_iov,
-		.desc = &desc,
-		.iov_count = 1,
-		.rma_iov_count = 1,
-		.rma_iov = &rma_iov,
-		.addr = dest_addr,
-		.context = context,
-		.data = 0,
-	};
+	struct fi_msg_rma msg;
+	struct iovec msg_iov;
+	struct fi_rma_iov rma_iov;
+
+	memset(&msg, 0, sizeof(msg));
+	msg_iov.iov_base = (void *) buf;
+	msg_iov.iov_len = len;
+
+	msg.msg_iov = &msg_iov;
+	msg.desc = &desc;
+	msg.iov_count = 1;
+
+	rma_iov.addr = addr;
+	rma_iov.key = key;
+	rma_iov.len = len;
+
+	msg.rma_iov_count = 1;
+	msg.rma_iov = &rma_iov;
+
+	msg.addr = dest_addr;
+	msg.context = context;
 
 	return sock_ep_rma_writemsg(ep, &msg, SOCK_USE_OP_FLAGS);
 }
@@ -381,21 +374,27 @@ static ssize_t sock_ep_rma_writev(struct fid_ep *ep, const struct iovec *iov,
 				void **desc, size_t count, fi_addr_t dest_addr,
 				uint64_t addr, uint64_t key, void *context)
 {
-	struct fi_rma_iov rma_iov = {
-		.addr = addr,
-		.key = key,
-		.len = ofi_total_iov_len(iov, count),
-	};
-	struct fi_msg_rma msg = {
-		.msg_iov = iov,
-		.desc = desc,
-		.iov_count = count,
-		.rma_iov_count = 1,
-		.rma_iov = &rma_iov,
-		.addr = dest_addr,
-		.context = context,
-		.data = 0,
-	};
+	int i;
+	size_t len;
+	struct fi_msg_rma msg;
+	struct fi_rma_iov rma_iov;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_iov = iov;
+	msg.desc = desc;
+	msg.iov_count = count;
+	msg.rma_iov_count = 1;
+
+	for (i = 0, len = 0; i < count; i++)
+		len += iov[i].iov_len;
+
+	rma_iov.addr = addr;
+	rma_iov.key = key;
+	rma_iov.len = len;
+
+	msg.rma_iov = &rma_iov;
+	msg.context = context;
+	msg.addr = dest_addr;
 
 	return sock_ep_rma_writemsg(ep, &msg, SOCK_USE_OP_FLAGS);
 }
@@ -405,25 +404,26 @@ static ssize_t sock_ep_rma_writedata(struct fid_ep *ep, const void *buf,
 				      fi_addr_t dest_addr, uint64_t addr,
 				      uint64_t key, void *context)
 {
-	struct iovec msg_iov = {
-		.iov_base = (void *)buf,
-		.iov_len = len,
-	};
-	struct fi_rma_iov rma_iov = {
-		.addr = addr,
-		.key = key,
-		.len = len,
-	};
-	struct fi_msg_rma msg = {
-		.desc = &desc,
-		.iov_count = 1,
-		.rma_iov_count = 1,
-		.rma_iov = &rma_iov,
-		.msg_iov = &msg_iov,
-		.addr = dest_addr,
-		.context = context,
-		.data = data,
-	};
+	struct fi_msg_rma msg;
+	struct iovec msg_iov;
+	struct fi_rma_iov rma_iov;
+
+	msg_iov.iov_base = (void *) buf;
+	msg_iov.iov_len = len;
+	msg.desc = &desc;
+	msg.iov_count = 1;
+	msg.rma_iov_count = 1;
+
+	rma_iov.addr = addr;
+	rma_iov.key = key;
+	rma_iov.len = len;
+
+	msg.rma_iov = &rma_iov;
+	msg.msg_iov = &msg_iov;
+
+	msg.addr = dest_addr;
+	msg.context = context;
+	msg.data = data;
 
 	return sock_ep_rma_writemsg(ep, &msg, FI_REMOTE_CQ_DATA |
 					SOCK_USE_OP_FLAGS);
@@ -433,25 +433,24 @@ static ssize_t sock_ep_rma_inject(struct fid_ep *ep, const void *buf,
 				size_t len, fi_addr_t dest_addr, uint64_t addr,
 				uint64_t key)
 {
-	struct iovec msg_iov = {
-		.iov_base = (void *)buf,
-		.iov_len = len,
-	};
-	struct fi_rma_iov rma_iov = {
-		.addr = addr,
-		.key = key,
-		.len = len,
-	};
-	struct fi_msg_rma msg = {
-		.iov_count = 1,
-		.rma_iov_count = 1,
-		.rma_iov = &rma_iov,
-		.msg_iov = &msg_iov,
-		.desc = NULL,
-		.addr = dest_addr,
-		.context = NULL,
-		.data = 0,
-	};
+	struct fi_msg_rma msg;
+	struct iovec msg_iov;
+	struct fi_rma_iov rma_iov;
+
+	memset(&msg, 0, sizeof(msg));
+	msg_iov.iov_base = (void *) buf;
+	msg_iov.iov_len = len;
+	msg.msg_iov = &msg_iov;
+	msg.iov_count = 1;
+	msg.rma_iov_count = 1;
+
+	rma_iov.addr = addr;
+	rma_iov.key = key;
+	rma_iov.len = len;
+
+	msg.rma_iov = &rma_iov;
+	msg.msg_iov = &msg_iov;
+	msg.addr = dest_addr;
 
 	return sock_ep_rma_writemsg(ep, &msg, FI_INJECT |
 				    SOCK_NO_COMPLETION | SOCK_USE_OP_FLAGS);
@@ -462,26 +461,25 @@ static ssize_t sock_ep_rma_injectdata(struct fid_ep *ep, const void *buf,
 					fi_addr_t dest_addr, uint64_t addr,
 					uint64_t key)
 {
-	struct iovec msg_iov = {
-		.iov_base = (void *)buf,
-		.iov_len = len,
-	};
-	struct fi_rma_iov rma_iov = {
-		.addr = addr,
-		.key = key,
-		.len = len,
-	};
-	struct fi_msg_rma msg = {
-		.iov_count = 1,
-		.rma_iov_count = 1,
-		.rma_iov = &rma_iov,
-		.msg_iov = &msg_iov,
-		.desc = NULL,
-		.addr = dest_addr,
-		.context = NULL,
-		.data = data,
-	};
+	struct fi_msg_rma msg;
+	struct iovec msg_iov;
+	struct fi_rma_iov rma_iov;
 
+	memset(&msg, 0, sizeof(msg));
+	msg_iov.iov_base = (void *) buf;
+	msg_iov.iov_len = len;
+	msg.msg_iov = &msg_iov;
+	msg.iov_count = 1;
+	msg.rma_iov_count = 1;
+
+	rma_iov.addr = addr;
+	rma_iov.key = key;
+	rma_iov.len = len;
+
+	msg.rma_iov = &rma_iov;
+	msg.msg_iov = &msg_iov;
+	msg.addr = dest_addr;
+	msg.data = data;
 	return sock_ep_rma_writemsg(ep, &msg, FI_INJECT | FI_REMOTE_CQ_DATA |
 		SOCK_NO_COMPLETION | SOCK_USE_OP_FLAGS);
 }

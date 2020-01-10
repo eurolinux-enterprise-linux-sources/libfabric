@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2018 Intel Corporation, Inc.  All rights reserved.
+ * Copyright (c) 2013-2015 Intel Corporation, Inc.  All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -30,35 +30,40 @@
  * SOFTWARE.
  */
 
+#include <rdma/fi_errno.h>
+
 #include "config.h"
 
 #include "fi_verbs.h"
+#include "ep_rdm/verbs_rdm.h"
+#include "ep_rdm/verbs_utils.h"
 
+#define VERBS_COMP_READ_FLAGS(ep, flags) \
+	((!VERBS_SELECTIVE_COMP(ep) || (flags & \
+	  (FI_COMPLETION | FI_TRANSMIT_COMPLETE | FI_DELIVERY_COMPLETE))) ? \
+	   IBV_SEND_SIGNALED : 0)
+#define VERBS_COMP_READ(ep) \
+	VERBS_COMP_READ_FLAGS(ep, ep->info->tx_attr->op_flags)
 
-#define VERBS_COMP_READ_FLAGS(ep, flags, context)		\
-	(((ep)->util_ep.tx_op_flags | (flags)) &			\
-	 (FI_COMPLETION | FI_TRANSMIT_COMPLETE |		\
-	  FI_DELIVERY_COMPLETE) ? context : VERBS_NO_COMP_FLAG)
-
-#define VERBS_COMP_READ(ep, context)		\
-	VERBS_COMP_READ_FLAGS(ep, 0, context)
+extern struct util_buf_pool* fi_ibv_rdm_tagged_request_pool;
 
 static ssize_t
 fi_ibv_msg_ep_rma_write(struct fid_ep *ep_fid, const void *buf, size_t len,
 		     void *desc, fi_addr_t dest_addr,
 		     uint64_t addr, uint64_t key, void *context)
 {
-	struct fi_ibv_ep *ep =
-		container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_COMP(ep, (uintptr_t)context),
-		.opcode = IBV_WR_RDMA_WRITE,
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-		.send_flags = VERBS_INJECT(ep, len),
-	};
+	struct fi_ibv_msg_ep *ep;
+	struct ibv_send_wr wr;
 
-	return fi_ibv_send_buf(ep, &wr, buf, len, desc);
+	memset(&wr, 0, sizeof(wr));
+	wr.opcode = IBV_WR_RDMA_WRITE;
+	wr.wr.rdma.remote_addr = addr;
+	wr.wr.rdma.rkey = (uint32_t) key;
+
+	ep = container_of(ep_fid, struct fi_ibv_msg_ep, ep_fid);
+	wr.send_flags = VERBS_INJECT(ep, len) | VERBS_COMP(ep);
+
+	return fi_ibv_send_buf(ep, &wr, buf, len, desc, context);
 }
 
 static ssize_t
@@ -66,30 +71,27 @@ fi_ibv_msg_ep_rma_writev(struct fid_ep *ep_fid, const struct iovec *iov, void **
 		      size_t count, fi_addr_t dest_addr,
 		      uint64_t addr, uint64_t key, void *context)
 {
-	struct fi_ibv_ep *ep =
-		container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = (uintptr_t)context,
-		.opcode = IBV_WR_RDMA_WRITE,
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-	};
+	struct fi_ibv_msg_ep *ep;
+	struct ibv_send_wr wr;
 
-	return fi_ibv_send_iov(ep, &wr, iov, desc, count);
+
+	memset(&wr, 0, sizeof(wr));
+	wr.opcode = IBV_WR_RDMA_WRITE;
+	wr.wr.rdma.remote_addr = addr;
+	wr.wr.rdma.rkey = (uint32_t) key;
+
+	ep = container_of(ep_fid, struct fi_ibv_msg_ep, ep_fid);
+	return fi_ibv_send_iov(ep, &wr, iov, desc, count, context);
 }
 
 static ssize_t
 fi_ibv_msg_ep_rma_writemsg(struct fid_ep *ep_fid, const struct fi_msg_rma *msg,
 			uint64_t flags)
 {
-	struct fi_ibv_ep *ep =
-		container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = (uintptr_t)msg->context,
-		.wr.rdma.remote_addr = msg->rma_iov->addr,
-		.wr.rdma.rkey = (uint32_t)msg->rma_iov->key,
-	};
+	struct fi_ibv_msg_ep *ep;
+	struct ibv_send_wr wr;
 
+	memset(&wr, 0, sizeof(wr));
 	if (flags & FI_REMOTE_CQ_DATA) {
 		wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
 		wr.imm_data = htonl((uint32_t)msg->data);
@@ -97,6 +99,10 @@ fi_ibv_msg_ep_rma_writemsg(struct fid_ep *ep_fid, const struct fi_msg_rma *msg,
 		wr.opcode = IBV_WR_RDMA_WRITE;
 	}
 
+	wr.wr.rdma.remote_addr = msg->rma_iov->addr;
+	wr.wr.rdma.rkey = (uint32_t) msg->rma_iov->key;
+
+	ep = container_of(ep_fid, struct fi_ibv_msg_ep, ep_fid);
 	return fi_ibv_send_msg(ep, &wr, msg, flags);
 }
 
@@ -105,16 +111,18 @@ fi_ibv_msg_ep_rma_read(struct fid_ep *ep_fid, void *buf, size_t len,
 		    void *desc, fi_addr_t src_addr,
 		    uint64_t addr, uint64_t key, void *context)
 {
-	struct fi_ibv_ep *ep =
-		container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_COMP_READ(ep, (uintptr_t)context),
-		.opcode = IBV_WR_RDMA_READ,
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-	};
+	struct fi_ibv_msg_ep *ep;
+	struct ibv_send_wr wr;
 
-	return fi_ibv_send_buf(ep, &wr, buf, len, desc);
+	memset(&wr, 0, sizeof(wr));
+	wr.opcode = IBV_WR_RDMA_READ;
+	wr.wr.rdma.remote_addr = addr;
+	wr.wr.rdma.rkey = (uint32_t) key;
+
+	ep = container_of(ep_fid, struct fi_ibv_msg_ep, ep_fid);
+	wr.send_flags = VERBS_COMP_READ(ep);
+
+	return fi_ibv_send_buf(ep, &wr, buf, len, desc, context);
 }
 
 static ssize_t
@@ -122,38 +130,42 @@ fi_ibv_msg_ep_rma_readv(struct fid_ep *ep_fid, const struct iovec *iov, void **d
 		     size_t count, fi_addr_t src_addr,
 		     uint64_t addr, uint64_t key, void *context)
 {
-	struct fi_ibv_ep *ep =
-		container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_COMP_READ(ep, (uintptr_t)context),
-		.opcode = IBV_WR_RDMA_READ,
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-		.num_sge = count,
-	};
+	struct fi_ibv_msg_ep *ep;
+	struct ibv_send_wr wr;
+	size_t len = 0;
 
-	fi_ibv_set_sge_iov(wr.sg_list, iov, count, desc);
+	memset(&wr, 0, sizeof(wr));
+	wr.opcode = IBV_WR_RDMA_READ;
+	wr.wr.rdma.remote_addr = addr;
+	wr.wr.rdma.rkey = (uint32_t) key;
 
-	return fi_ibv_send_poll_cq_if_needed(ep, &wr);
+	ep = container_of(ep_fid, struct fi_ibv_msg_ep, ep_fid);
+	wr.send_flags = VERBS_COMP_READ(ep);
+
+	fi_ibv_set_sge_iov(wr.sg_list, iov, count, desc, len);
+
+	return fi_ibv_send(ep, &wr, len, count, context);
 }
 
 static ssize_t
 fi_ibv_msg_ep_rma_readmsg(struct fid_ep *ep_fid, const struct fi_msg_rma *msg,
 			uint64_t flags)
 {
-	struct fi_ibv_ep *ep =
-		container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_COMP_READ_FLAGS(ep, flags, (uintptr_t)msg->context),
-		.opcode = IBV_WR_RDMA_READ,
-		.wr.rdma.remote_addr = msg->rma_iov->addr,
-		.wr.rdma.rkey = (uint32_t)msg->rma_iov->key,
-		.num_sge = msg->iov_count,
-	};
+	struct fi_ibv_msg_ep *ep;
+	struct ibv_send_wr wr;
+	size_t len = 0;
 
-	fi_ibv_set_sge_iov(wr.sg_list, msg->msg_iov, msg->iov_count, msg->desc);
+	memset(&wr, 0, sizeof(wr));
+	wr.opcode = IBV_WR_RDMA_READ;
+	wr.wr.rdma.remote_addr = msg->rma_iov->addr;
+	wr.wr.rdma.rkey = (uint32_t) msg->rma_iov->key;
 
-	return fi_ibv_send_poll_cq_if_needed(ep, &wr);
+	ep = container_of(ep_fid, struct fi_ibv_msg_ep, ep_fid);
+	wr.send_flags = VERBS_COMP_READ_FLAGS(ep, flags);
+
+	fi_ibv_set_sge_iov(wr.sg_list, msg->msg_iov, msg->iov_count, msg->desc,	len);
+
+	return fi_ibv_send(ep, &wr, len, msg->iov_count, msg->context);
 }
 
 static ssize_t
@@ -161,52 +173,37 @@ fi_ibv_msg_ep_rma_writedata(struct fid_ep *ep_fid, const void *buf, size_t len,
 			void *desc, uint64_t data, fi_addr_t dest_addr,
 			uint64_t addr, uint64_t key, void *context)
 {
-	struct fi_ibv_ep *ep =
-		container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_COMP(ep, (uintptr_t)context),
-		.opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
-		.imm_data = htonl((uint32_t)data),
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-		.send_flags = VERBS_INJECT(ep, len),
-	};
+	struct fi_ibv_msg_ep *ep;
+	struct ibv_send_wr wr;
 
-	return fi_ibv_send_buf(ep, &wr, buf, len, desc);
+	memset(&wr, 0, sizeof(wr));
+	wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+	wr.imm_data = htonl((uint32_t)data);
+	wr.wr.rdma.remote_addr = addr;
+	wr.wr.rdma.rkey = (uint32_t) key;
+
+	ep = container_of(ep_fid, struct fi_ibv_msg_ep, ep_fid);
+	wr.send_flags = VERBS_INJECT(ep, len) | VERBS_COMP(ep);
+
+	return fi_ibv_send_buf(ep, &wr, buf, len, desc, context);
 }
 
 static ssize_t
 fi_ibv_msg_ep_rma_inject_write(struct fid_ep *ep_fid, const void *buf, size_t len,
 		     fi_addr_t dest_addr, uint64_t addr, uint64_t key)
 {
-	struct fi_ibv_ep *ep =
-		container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_NO_COMP_FLAG,
-		.opcode = IBV_WR_RDMA_WRITE,
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-		.send_flags = IBV_SEND_INLINE,
-	};
+	struct fi_ibv_msg_ep *ep;
+	struct ibv_send_wr wr;
+
+	memset(&wr, 0, sizeof(wr));
+	wr.opcode = IBV_WR_RDMA_WRITE;
+	wr.wr.rdma.remote_addr = addr;
+	wr.wr.rdma.rkey = (uint32_t) key;
+	wr.send_flags = IBV_SEND_INLINE;
+
+	ep = container_of(ep_fid, struct fi_ibv_msg_ep, ep_fid);
 
 	return fi_ibv_send_buf_inline(ep, &wr, buf, len);
-}
-
-static ssize_t
-fi_ibv_rma_write_fast(struct fid_ep *ep_fid, const void *buf, size_t len,
-		      fi_addr_t dest_addr, uint64_t addr, uint64_t key)
-{
-	struct fi_ibv_ep *ep;
-
-	ep = container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-
-	ep->wrs->rma_wr.wr.rdma.remote_addr = addr;
-	ep->wrs->rma_wr.wr.rdma.rkey = (uint32_t) key;
-
-	ep->wrs->sge.addr = (uintptr_t) buf;
-	ep->wrs->sge.length = (uint32_t) len;
-
-	return fi_ibv_send_poll_cq_if_needed(ep, &ep->wrs->rma_wr);
 }
 
 static ssize_t
@@ -214,43 +211,21 @@ fi_ibv_msg_ep_rma_inject_writedata(struct fid_ep *ep_fid, const void *buf, size_
 			uint64_t data, fi_addr_t dest_addr, uint64_t addr,
 			uint64_t key)
 {
-	struct fi_ibv_ep *ep =
-		container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_NO_COMP_FLAG,
-		.opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
-		.imm_data = htonl((uint32_t)data),
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-		.send_flags = IBV_SEND_INLINE,
-	};
+	struct fi_ibv_msg_ep *ep;
+	struct ibv_send_wr wr;
 
+	memset(&wr, 0, sizeof(wr));
+	wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+	wr.imm_data = htonl((uint32_t)data);
+	wr.wr.rdma.remote_addr = addr;
+	wr.wr.rdma.rkey = (uint32_t) key;
+	wr.send_flags = IBV_SEND_INLINE;
+
+	ep = container_of(ep_fid, struct fi_ibv_msg_ep, ep_fid);
 	return fi_ibv_send_buf_inline(ep, &wr, buf, len);
 }
 
-static ssize_t
-fi_ibv_msg_ep_rma_inject_writedata_fast(struct fid_ep *ep_fid, const void *buf, size_t len,
-					uint64_t data, fi_addr_t dest_addr, uint64_t addr,
-					uint64_t key)
-{
-	ssize_t ret;
-	struct fi_ibv_ep *ep =
-		container_of(ep_fid, struct fi_ibv_ep, util_ep.ep_fid);
-	ep->wrs->rma_wr.wr.rdma.remote_addr = addr;
-	ep->wrs->rma_wr.wr.rdma.rkey = (uint32_t) key;
-
-	ep->wrs->rma_wr.imm_data = htonl((uint32_t) data);
-	ep->wrs->rma_wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-
-	ep->wrs->sge.addr = (uintptr_t) buf;
-	ep->wrs->sge.length = (uint32_t) len;
-
-	ret = fi_ibv_send_poll_cq_if_needed(ep, &ep->wrs->rma_wr);
-	ep->wrs->rma_wr.opcode = IBV_WR_RDMA_WRITE;
-	return ret;
-}
-
-struct fi_ops_rma fi_ibv_msg_ep_rma_ops_ts = {
+static struct fi_ops_rma fi_ibv_msg_ep_rma_ops = {
 	.size = sizeof(struct fi_ops_rma),
 	.read = fi_ibv_msg_ep_rma_read,
 	.readv = fi_ibv_msg_ep_rma_readv,
@@ -263,271 +238,306 @@ struct fi_ops_rma fi_ibv_msg_ep_rma_ops_ts = {
 	.injectdata = fi_ibv_msg_ep_rma_inject_writedata,
 };
 
-struct fi_ops_rma fi_ibv_msg_ep_rma_ops = {
-	.size = sizeof(struct fi_ops_rma),
-	.read = fi_ibv_msg_ep_rma_read,
-	.readv = fi_ibv_msg_ep_rma_readv,
-	.readmsg = fi_ibv_msg_ep_rma_readmsg,
-	.write = fi_ibv_msg_ep_rma_write,
-	.writev = fi_ibv_msg_ep_rma_writev,
-	.writemsg = fi_ibv_msg_ep_rma_writemsg,
-	.inject = fi_ibv_rma_write_fast,
-	.writedata = fi_ibv_msg_ep_rma_writedata,
-	.injectdata = fi_ibv_msg_ep_rma_inject_writedata_fast,
-};
-
-static ssize_t
-fi_ibv_msg_xrc_ep_rma_write(struct fid_ep *ep_fid, const void *buf,
-		size_t len, void *desc, fi_addr_t dest_addr,
-		uint64_t addr, uint64_t key, void *context)
+struct fi_ops_rma *fi_ibv_msg_ep_ops_rma(struct fi_ibv_msg_ep *ep)
 {
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_COMP(&ep->base_ep, (uintptr_t)context),
-		.opcode = IBV_WR_RDMA_WRITE,
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-		.send_flags = VERBS_INJECT(&ep->base_ep, len),
-	};
-
-	FI_IBV_SET_REMOTE_SRQN(wr, ep->peer_srqn);
-
-	return fi_ibv_send_buf(&ep->base_ep, &wr, buf, len, desc);
+	return &fi_ibv_msg_ep_rma_ops;
 }
 
-static ssize_t
-fi_ibv_msg_xrc_ep_rma_writev(struct fid_ep *ep_fid, const struct iovec *iov,
-		void **desc, size_t count, fi_addr_t dest_addr,
-		uint64_t addr, uint64_t key, void *context)
+static inline ssize_t
+fi_ibv_rdm_ep_rma_preinit(void **desc, void **raw_buf, size_t len,
+			  struct fi_ibv_rdm_tagged_conn *conn,
+			  struct fi_ibv_rdm_ep *ep)
 {
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = (uintptr_t)context,
-		.opcode = IBV_WR_RDMA_WRITE,
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-	};
+	int again = 0;
 
-	FI_IBV_SET_REMOTE_SRQN(wr, ep->peer_srqn);
-
-	return fi_ibv_send_iov(&ep->base_ep, &wr, iov, desc, count);
-}
-
-static ssize_t
-fi_ibv_msg_xrc_ep_rma_writemsg(struct fid_ep *ep_fid,
-			const struct fi_msg_rma *msg, uint64_t flags)
-{
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = (uintptr_t)msg->context,
-		.wr.rdma.remote_addr = msg->rma_iov->addr,
-		.wr.rdma.rkey = (uint32_t)msg->rma_iov->key,
-	};
-
-	FI_IBV_SET_REMOTE_SRQN(wr, ep->peer_srqn);
-
-	if (flags & FI_REMOTE_CQ_DATA) {
-		wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-		wr.imm_data = htonl((uint32_t)msg->data);
-	} else {
-		wr.opcode = IBV_WR_RDMA_WRITE;
+	if ((desc == NULL && len >= ep->rndv_threshold) ||
+	    (desc && *desc == NULL && len >= ep->rndv_threshold))
+	{
+		return -FI_EINVAL;
 	}
 
-	return fi_ibv_send_msg(&ep->base_ep, &wr, msg, flags);
+	again = (!fi_ibv_rdm_check_connection(conn, ep) ||
+		RMA_RESOURCES_IS_BUSY(conn, ep) || conn->postponed_entry);
+
+	if ((!again) && raw_buf && desc && (*desc == NULL)) {
+		*raw_buf = fi_ibv_rdm_rma_prepare_resources(conn, ep);
+		if (*raw_buf) {
+			*desc = (void*)(uintptr_t)conn->rma_mr->lkey;
+		}
+		again = !(*raw_buf);
+	}
+
+	if (again) {
+		fi_ibv_rdm_tagged_poll(ep);
+		return -FI_EAGAIN;
+	}
+
+	return FI_SUCCESS;
 }
 
 static ssize_t
-fi_ibv_msg_xrc_ep_rma_read(struct fid_ep *ep_fid, void *buf, size_t len,
-		void *desc, fi_addr_t src_addr, uint64_t addr,
-		uint64_t key, void *context)
+fi_ibv_rdm_ep_rma_read(struct fid_ep *ep_fid, void *buf, size_t len,
+		    void *desc, fi_addr_t src_addr,
+		    uint64_t addr, uint64_t key, void *context)
 {
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_COMP_READ(&ep->base_ep, (uintptr_t)context),
-		.opcode = IBV_WR_RDMA_READ,
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
+	struct fi_ibv_rdm_ep *ep = container_of(ep_fid, struct fi_ibv_rdm_ep,
+						ep_fid);
+	struct fi_ibv_rdm_tagged_conn *conn =
+		(struct fi_ibv_rdm_tagged_conn *)src_addr;
+	void *raw_buf = NULL;
+
+	ssize_t ret = fi_ibv_rdm_ep_rma_preinit(&desc, &raw_buf, len, conn, ep);
+	if (ret) {
+		return ret;
+	}
+
+	struct fi_ibv_rdm_tagged_request *request = 
+		util_buf_alloc(fi_ibv_rdm_tagged_request_pool);
+	FI_IBV_RDM_TAGGED_DBG_REQUEST("get_from_pool: ", request, FI_LOG_DEBUG);
+
+	/* Initial state */
+	request->state.eager = FI_IBV_STATE_EAGER_BEGIN;
+	request->state.rndv  = FI_IBV_STATE_RNDV_NOT_USED;
+	request->rmabuf = raw_buf;
+
+	struct fi_ibv_rdm_rma_start_data start_data = {
+		.ep_rdm = container_of(ep_fid, struct fi_ibv_rdm_ep, ep_fid),
+		.conn = (struct fi_ibv_rdm_tagged_conn *) src_addr,
+		.context = context,
+		.data_len = (uint32_t)len,
+		.rbuf = addr,
+		.lbuf = (uintptr_t)buf,
+		.rkey = (uint32_t)key,
+		.lkey = (uint32_t)(uintptr_t)desc,
+		.op_code = IBV_WR_RDMA_READ
 	};
 
-	FI_IBV_SET_REMOTE_SRQN(wr, ep->peer_srqn);
+	fi_ibv_rdm_tagged_req_hndl(request, FI_IBV_EVENT_RMA_START, &start_data);
 
-	return fi_ibv_send_buf(&ep->base_ep, &wr, buf, len, desc);
+	struct fi_ibv_rma_post_ready_data post_ready_data = { .ep_rdm = ep };
+
+	ret = fi_ibv_rdm_tagged_req_hndl(request, FI_IBV_EVENT_SEND_READY,
+					 &post_ready_data);
+	return (ret == FI_EP_RDM_HNDL_SUCCESS) ? FI_SUCCESS : -FI_EOTHER;
 }
 
 static ssize_t
-fi_ibv_msg_xrc_ep_rma_readv(struct fid_ep *ep_fid, const struct iovec *iov,
-		void **desc, size_t count, fi_addr_t src_addr,
-		uint64_t addr, uint64_t key, void *context)
+fi_ibv_rdm_ep_rma_readmsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
+		uint64_t flags)
 {
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_COMP_READ(&ep->base_ep, (uintptr_t)context),
-		.opcode = IBV_WR_RDMA_READ,
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-		.num_sge = count,
+	if(msg->iov_count == 1 && msg->rma_iov_count == 1) {
+		return fi_ibv_rdm_ep_rma_read(ep,
+					      msg->msg_iov[0].iov_base,
+					      msg->msg_iov[0].iov_len,
+					      msg->desc[0],
+					      msg->addr,
+					      msg->rma_iov[0].addr,
+					      msg->rma_iov[0].key,
+					      msg->context);
+	}
+
+	assert(0);
+	return -FI_EMSGSIZE;
+}
+
+static ssize_t
+fi_ibv_rdm_ep_rma_readv(struct fid_ep *ep, const struct iovec *iov, void **desc,
+		size_t count, fi_addr_t src_addr, uint64_t addr, uint64_t key,
+		void *context)
+{
+	struct fi_rma_iov rma_iov = {
+		.addr = src_addr,
+		.len = 0,
+		.key = key
 	};
 
-	FI_IBV_SET_REMOTE_SRQN(wr, ep->peer_srqn);
+	size_t i;
+	for (i = 0; i < count; i++) {
+		rma_iov.len += iov[i].iov_len;
+	}
 
-	fi_ibv_set_sge_iov(wr.sg_list, iov, count, desc);
-
-	return fi_ibv_send_poll_cq_if_needed(&ep->base_ep, &wr);
-}
-
-static ssize_t
-fi_ibv_msg_xrc_ep_rma_readmsg(struct fid_ep *ep_fid,
-		const struct fi_msg_rma *msg, uint64_t flags)
-{
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_COMP_READ_FLAGS(&ep->base_ep, flags,
-					       (uintptr_t)msg->context),
-		.opcode = IBV_WR_RDMA_READ,
-		.wr.rdma.remote_addr = msg->rma_iov->addr,
-		.wr.rdma.rkey = (uint32_t)msg->rma_iov->key,
-		.num_sge = msg->iov_count,
+	struct fi_msg_rma msg = {
+		.msg_iov = iov,
+		.desc = desc,
+		.iov_count = count,
+		.addr = addr,
+		.rma_iov = &rma_iov,
+		.rma_iov_count = 1,
+		.context = context,
+		.data = 0
 	};
 
-	FI_IBV_SET_REMOTE_SRQN(wr, ep->peer_srqn);
-
-	fi_ibv_set_sge_iov(wr.sg_list, msg->msg_iov, msg->iov_count, msg->desc);
-
-	return fi_ibv_send_poll_cq_if_needed(&ep->base_ep, &wr);
+	return fi_ibv_rdm_ep_rma_readmsg(ep, &msg, 0);
 }
 
 static ssize_t
-fi_ibv_msg_xrc_ep_rma_writedata(struct fid_ep *ep_fid, const void *buf,
-		size_t len, void *desc, uint64_t data, fi_addr_t dest_addr,
-		uint64_t addr, uint64_t key, void *context)
+fi_ibv_rdm_ep_rma_write(struct fid_ep *ep_fid, const void *buf, size_t len,
+		     void *desc, fi_addr_t dest_addr,
+		     uint64_t addr, uint64_t key, void *context)
 {
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_COMP(&ep->base_ep, (uintptr_t)context),
-		.opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
-		.imm_data = htonl((uint32_t)data),
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-		.send_flags = VERBS_INJECT(&ep->base_ep, len),
+	struct fi_ibv_rdm_ep *ep = container_of(ep_fid, struct fi_ibv_rdm_ep,
+						ep_fid);
+	struct fi_ibv_rdm_tagged_conn *conn =
+		(struct fi_ibv_rdm_tagged_conn *) dest_addr;
+	void *raw_buf = NULL;
+
+	ssize_t ret = fi_ibv_rdm_ep_rma_preinit(&desc, &raw_buf, len, conn, ep);
+	if (ret) {
+		return ret;
+	}
+
+	struct fi_ibv_rdm_tagged_request *request = 
+		util_buf_alloc(fi_ibv_rdm_tagged_request_pool);
+	FI_IBV_RDM_TAGGED_DBG_REQUEST("get_from_pool: ", request, FI_LOG_DEBUG);
+
+	/* Initial state */
+	request->state.eager = FI_IBV_STATE_EAGER_BEGIN;
+	request->state.rndv  = FI_IBV_STATE_RNDV_NOT_USED;
+	request->rmabuf = raw_buf;
+
+	struct fi_ibv_rdm_rma_start_data start_data = {
+		.conn = conn,
+		.ep_rdm = ep,
+		.context = context,
+		.data_len = (uint32_t)len,
+		.rbuf = addr,
+		.lbuf = (uintptr_t)buf,
+		.rkey = (uint32_t)key,
+		.lkey = (uint32_t)(uintptr_t)desc,
+		.op_code = IBV_WR_RDMA_WRITE
 	};
 
-	FI_IBV_SET_REMOTE_SRQN(wr, ep->peer_srqn);
+	fi_ibv_rdm_tagged_req_hndl(request, FI_IBV_EVENT_RMA_START, &start_data);
 
-	return fi_ibv_send_buf(&ep->base_ep, &wr, buf, len, desc);
+	struct fi_ibv_rma_post_ready_data post_ready_data = { .ep_rdm = ep };
+
+	ret = fi_ibv_rdm_tagged_req_hndl(request, FI_IBV_EVENT_SEND_READY,
+					 &post_ready_data);
+	return (ret == FI_EP_RDM_HNDL_SUCCESS) ? FI_SUCCESS : -FI_EOTHER;
 }
 
 static ssize_t
-fi_ibv_msg_xrc_ep_rma_inject_write(struct fid_ep *ep_fid, const void *buf,
-		size_t len, fi_addr_t dest_addr, uint64_t addr,
-		uint64_t key)
+fi_ibv_rdm_ep_rma_writemsg(struct fid_ep *ep, const struct fi_msg_rma *msg,
+		uint64_t flags)
 {
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_NO_COMP_FLAG,
-		.opcode = IBV_WR_RDMA_WRITE,
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-		.send_flags = IBV_SEND_INLINE,
+	if(msg->iov_count == 1 && msg->rma_iov_count == 1) {
+		return fi_ibv_rdm_ep_rma_write(ep,
+					       msg->msg_iov[0].iov_base,
+					       msg->msg_iov[0].iov_len,
+					       msg->desc[0],
+					       msg->addr,
+					       msg->rma_iov[0].addr,
+					       msg->rma_iov[0].key,
+					       msg->context);
+	}
+
+	assert(0);
+	return -FI_EMSGSIZE;
+}
+
+static ssize_t
+fi_ibv_rdm_ep_rma_writev(struct fid_ep *ep, const struct iovec *iov, void **desc,
+		size_t count, fi_addr_t dest_addr, uint64_t addr, uint64_t key,
+		void *context)
+{
+	struct fi_rma_iov rma_iov = {
+		.addr = dest_addr,
+		.len = 0,
+		.key = key
 	};
 
-	FI_IBV_SET_REMOTE_SRQN(wr, ep->peer_srqn);
+	size_t i;
+	for (i = 0; i < count; i++) {
+		rma_iov.len += iov[i].iov_len;
+	}
 
-	return fi_ibv_send_buf_inline(&ep->base_ep, &wr, buf, len);
-}
-
-static ssize_t
-fi_ibv_xrc_rma_write_fast(struct fid_ep *ep_fid, const void *buf,
-	  size_t len, fi_addr_t dest_addr, uint64_t addr, uint64_t key)
-{
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-
-	ep->base_ep.wrs->rma_wr.wr.rdma.remote_addr = addr;
-	ep->base_ep.wrs->rma_wr.wr.rdma.rkey = (uint32_t) key;
-	FI_IBV_SET_REMOTE_SRQN(ep->base_ep.wrs->rma_wr, ep->peer_srqn);
-	ep->base_ep.wrs->sge.addr = (uintptr_t) buf;
-	ep->base_ep.wrs->sge.length = (uint32_t) len;
-
-	return fi_ibv_send_poll_cq_if_needed(&ep->base_ep,
-					     &ep->base_ep.wrs->rma_wr);
-}
-
-static ssize_t
-fi_ibv_msg_xrc_ep_rma_inject_writedata(struct fid_ep *ep_fid,
-		const void *buf, size_t len, uint64_t data,
-		fi_addr_t dest_addr, uint64_t addr, uint64_t key)
-{
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-
-	struct ibv_send_wr wr = {
-		.wr_id = VERBS_NO_COMP_FLAG,
-		.opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
-		.imm_data = htonl((uint32_t)data),
-		.wr.rdma.remote_addr = addr,
-		.wr.rdma.rkey = (uint32_t)key,
-		.send_flags = IBV_SEND_INLINE,
+	struct fi_msg_rma msg = {
+		.msg_iov = iov,
+		.desc = desc,
+		.iov_count = count,
+		.addr = addr,
+		.rma_iov = &rma_iov,
+		.rma_iov_count = 1,
+		.context = context,
+		.data = 0
 	};
 
-	FI_IBV_SET_REMOTE_SRQN(wr, ep->peer_srqn);
-
-	return fi_ibv_send_buf_inline(&ep->base_ep, &wr, buf, len);
+	return fi_ibv_rdm_ep_rma_writemsg(ep, &msg, 0);
 }
 
-static ssize_t
-fi_ibv_msg_xrc_ep_rma_inject_writedata_fast(struct fid_ep *ep_fid,
-		const void *buf, size_t len, uint64_t data,
-		fi_addr_t dest_addr, uint64_t addr, uint64_t key)
+static ssize_t fi_ibv_rdm_ep_rma_inject_write(struct fid_ep *ep,
+					      const void *buf, size_t len,
+					      fi_addr_t dest_addr,
+					      uint64_t addr, uint64_t key)
 {
-	ssize_t ret;
-	struct fi_ibv_xrc_ep *ep = container_of(ep_fid, struct fi_ibv_xrc_ep,
-						base_ep.util_ep.ep_fid);
-	ep->base_ep.wrs->rma_wr.wr.rdma.remote_addr = addr;
-	ep->base_ep.wrs->rma_wr.wr.rdma.rkey = (uint32_t) key;
-	FI_IBV_SET_REMOTE_SRQN(ep->base_ep.wrs->rma_wr, ep->peer_srqn);
+	struct fi_ibv_rdm_ep *ep_rdm = container_of(ep, struct fi_ibv_rdm_ep,
+						    ep_fid);
+	struct fi_ibv_rdm_tagged_conn *conn =
+		(struct fi_ibv_rdm_tagged_conn *) dest_addr;
+	struct fi_ibv_rdm_tagged_request *request = NULL;
 
-	ep->base_ep.wrs->rma_wr.imm_data = htonl((uint32_t) data);
-	ep->base_ep.wrs->rma_wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+	ssize_t ret = fi_ibv_rdm_ep_rma_preinit(NULL, NULL, len, conn, ep_rdm);
+	if (ret) {
+		return ret;
+	}
 
-	ep->base_ep.wrs->sge.addr = (uintptr_t) buf;
-	ep->base_ep.wrs->sge.length = (uint32_t) len;
+	request = util_buf_alloc(fi_ibv_rdm_tagged_request_pool);
 
-	ret = fi_ibv_send_poll_cq_if_needed(&ep->base_ep,
-					    &ep->base_ep.wrs->rma_wr);
-	ep->base_ep.wrs->rma_wr.opcode = IBV_WR_RDMA_WRITE;
+	FI_IBV_RDM_TAGGED_DBG_REQUEST("get_from_pool: ", request, FI_LOG_DEBUG);
+
+	/* Initial state */
+	request->state.eager = FI_IBV_STATE_EAGER_RMA_INJECT;
+	request->state.rndv  = FI_IBV_STATE_RNDV_NOT_USED;
+
+	struct fi_ibv_rdm_rma_start_data start_data = {
+		.conn = conn,
+		.ep_rdm = ep_rdm,
+		.data_len = (uint32_t)len,
+		.rbuf = addr,
+		.lbuf = (uintptr_t)buf,
+		.rkey = (uint32_t)key,
+		.lkey = 0
+
+	};
+
+	ret =  fi_ibv_rdm_tagged_req_hndl(request, FI_IBV_EVENT_RMA_START,
+					  &start_data);
+
+	switch (ret)
+	{
+	case FI_EP_RDM_HNDL_SUCCESS:
+		return ret;
+	case FI_EP_RDM_HNDL_AGAIN:
+		ret = -FI_EAGAIN;
+		break;
+	default:
+		ret = -errno;
+		break;
+	}
+
+	FI_IBV_RDM_TAGGED_DBG_REQUEST("to_pool: ", request,
+				      FI_LOG_DEBUG);
+	util_buf_release(fi_ibv_rdm_tagged_request_pool, request);
+
+	fi_ibv_rdm_tagged_poll(ep_rdm);
+
 	return ret;
 }
 
-struct fi_ops_rma fi_ibv_msg_xrc_ep_rma_ops_ts = {
-	.size = sizeof(struct fi_ops_rma),
-	.read = fi_ibv_msg_xrc_ep_rma_read,
-	.readv = fi_ibv_msg_xrc_ep_rma_readv,
-	.readmsg = fi_ibv_msg_xrc_ep_rma_readmsg,
-	.write = fi_ibv_msg_xrc_ep_rma_write,
-	.writev = fi_ibv_msg_xrc_ep_rma_writev,
-	.writemsg = fi_ibv_msg_xrc_ep_rma_writemsg,
-	.inject = fi_ibv_msg_xrc_ep_rma_inject_write,
-	.writedata = fi_ibv_msg_xrc_ep_rma_writedata,
-	.injectdata = fi_ibv_msg_xrc_ep_rma_inject_writedata,
+static struct fi_ops_rma fi_ibv_rdm_ep_rma_ops = {
+	.size		= sizeof(struct fi_ops_rma),
+	.read		= fi_ibv_rdm_ep_rma_read,
+	.readv		= fi_ibv_rdm_ep_rma_readv,
+	.readmsg	= fi_ibv_rdm_ep_rma_readmsg,
+	.write		= fi_ibv_rdm_ep_rma_write,
+	.writev		= fi_ibv_rdm_ep_rma_writev,
+	.writemsg	= fi_ibv_rdm_ep_rma_writemsg,
+	.inject		= fi_ibv_rdm_ep_rma_inject_write,
+	.writedata	= fi_no_rma_writedata,
+	.injectdata	= fi_no_rma_injectdata,
 };
 
-struct fi_ops_rma fi_ibv_msg_xrc_ep_rma_ops = {
-	.size = sizeof(struct fi_ops_rma),
-	.read = fi_ibv_msg_xrc_ep_rma_read,
-	.readv = fi_ibv_msg_xrc_ep_rma_readv,
-	.readmsg = fi_ibv_msg_xrc_ep_rma_readmsg,
-	.write = fi_ibv_msg_xrc_ep_rma_write,
-	.writev = fi_ibv_msg_xrc_ep_rma_writev,
-	.writemsg = fi_ibv_msg_xrc_ep_rma_writemsg,
-	.inject = fi_ibv_xrc_rma_write_fast,
-	.writedata = fi_ibv_msg_xrc_ep_rma_writedata,
-	.injectdata = fi_ibv_msg_xrc_ep_rma_inject_writedata_fast,
-};
+struct fi_ops_rma *fi_ibv_rdm_ep_ops_rma(struct fi_ibv_rdm_ep *ep)
+{
+	return &fi_ibv_rdm_ep_rma_ops;
+}

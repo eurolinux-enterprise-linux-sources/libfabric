@@ -50,6 +50,8 @@
 #include <errno.h>
 #include <sys/stat.h>
 
+#include <infiniband/driver.h>
+
 #include "usd.h"
 #include "usd_ib_sysfs.h"
 #include "usd_util.h"
@@ -69,8 +71,8 @@ usd_ib_get_devlist(
     DIR *class_dir;
     struct dirent *dent;
     struct stat sbuf;
-    char *dev_path = NULL;
-    char *ibdev_path = NULL;
+    char dev_path[PATH_MAX];
+    char ibdev_path[PATH_MAX];
     char ibdev_buf[32];
     struct usd_ib_dev *idp;
     struct usd_ib_dev *last_idp;
@@ -90,17 +92,14 @@ usd_ib_get_devlist(
     last_idp = NULL;
     fd = -1;
     while ((dent = readdir(class_dir)) != NULL) {
+
         /* skip "." and ".." */
         if (dent->d_name[0] == '.')
             continue;
 
         /* build path to entry */
-        if (asprintf(&dev_path, "%s/%s", class_path,
-                     dent->d_name) <= 0) {
-            rc = -errno;
-            usd_perror("failed to asprintf");
-            goto out;
-        }
+        snprintf(dev_path, sizeof(dev_path), "%s/%s", class_path,
+                 dent->d_name);
 
         /* see if it's a dir */
         rc = stat(dev_path, &sbuf);
@@ -115,11 +114,7 @@ usd_ib_get_devlist(
             continue;
 
         /* read the ibdev */
-        if (asprintf(&ibdev_path, "%s/ibdev", dev_path) <= 0) {
-            rc = -errno;
-            usd_perror(ibdev_path);
-            goto out;
-        }
+        snprintf(ibdev_path, sizeof(ibdev_path), "%s/ibdev", dev_path);
         fd = open(ibdev_path, O_RDONLY);
         if (fd == -1) {
             usd_perror(ibdev_path);
@@ -163,17 +158,11 @@ usd_ib_get_devlist(
             idp->id_next = NULL;
             last_idp = idp;
         }
-        free(dev_path);
-        dev_path = NULL;
-        free(ibdev_path);
-        ibdev_path = NULL;
     }
     rc = 0;
 
 out:
     /* clean up */
-    free(dev_path);
-    free(ibdev_path);
     if (class_dir != NULL) {
         closedir(class_dir);
     }
@@ -193,7 +182,7 @@ usd_get_mac(
     struct usd_device *dev,
     uint8_t * mac)
 {
-    char name[PATH_MAX + 128];
+    char name[128];
     char gid[80];
     char *p;
     uint16_t v;
@@ -243,7 +232,7 @@ int
 usd_get_iface(
     struct usd_device *dev)
 {
-    char name[PATH_MAX + 128];
+    char name[128];
     struct usd_ib_dev *idp;
     int fd;
     int n;
@@ -280,7 +269,7 @@ usd_ib_sysfs_get_int(
     char *entry,
     int *result)
 {
-    char name[PATH_MAX + 128];
+    char name[128];
     char buf[32];
     struct usd_ib_dev *idp;
     int fd;
@@ -355,7 +344,7 @@ int
 usd_get_firmware(
     struct usd_device *dev)
 {
-    char name[PATH_MAX + 128];
+    char name[128];
     struct usd_ib_dev *idp;
     char *fw;
     int fd;

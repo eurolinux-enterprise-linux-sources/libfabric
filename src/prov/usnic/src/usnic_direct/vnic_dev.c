@@ -1,5 +1,5 @@
 /*
- * Copyright 2008-2018 Cisco Systems, Inc.  All rights reserved.
+ * Copyright 2008-2010 Cisco Systems, Inc.  All rights reserved.
  * Copyright 2007 Nuova Systems, Inc.  All rights reserved.
  *
  * LICENSE_BEGIN
@@ -126,6 +126,7 @@ int vnic_dev_get_size(void)
 	return sizeof(struct vnic_dev);
 }
 
+
 static int vnic_dev_discover_res(struct vnic_dev *vdev,
 	struct vnic_dev_bar *bar, unsigned int num_bars)
 {
@@ -201,7 +202,6 @@ static int vnic_dev_discover_res(struct vnic_dev *vdev,
 				return -EINVAL;
 			}
 			break;
-		case RES_TYPE_DPKT:
 		case RES_TYPE_MEM:
 		case RES_TYPE_INTR_PBA_LEGACY:
 #ifdef CONFIG_MIPS
@@ -209,6 +209,9 @@ static int vnic_dev_discover_res(struct vnic_dev *vdev,
 #endif
 		case RES_TYPE_DEVCMD2:
 		case RES_TYPE_DEVCMD:
+#ifdef ENIC_UPT
+		case RES_TYPE_PASS_THRU_PAGE:
+#endif
 			len = count;
 			break;
 		default:
@@ -248,18 +251,16 @@ void vnic_dev_upd_res_vaddr(struct vnic_dev *vdev,
 			continue;
 		if (vdev->res[i].bus_addr >= map->bus_addr &&
 			vdev->res[i].bus_addr < map->bus_addr + map->len)
-			vdev->res[i].vaddr = ((uint8_t *)map->vaddr) +
+			vdev->res[i].vaddr = map->vaddr +
 					(vdev->res[i].bus_addr - map->bus_addr);
 	}
 }
-EXPORT_SYMBOL(vnic_dev_upd_res_vaddr);
 
 unsigned int vnic_dev_get_res_count(struct vnic_dev *vdev,
 	enum vnic_res_type type)
 {
 	return vdev->res[type].count;
 }
-EXPORT_SYMBOL(vnic_dev_get_res_count);
 
 void __iomem *vnic_dev_get_res(struct vnic_dev *vdev, enum vnic_res_type type,
 	unsigned int index)
@@ -279,7 +280,6 @@ void __iomem *vnic_dev_get_res(struct vnic_dev *vdev, enum vnic_res_type type,
 		return (char __iomem *)vdev->res[type].vaddr;
 	}
 }
-EXPORT_SYMBOL(vnic_dev_get_res);
 
 dma_addr_t vnic_dev_get_res_bus_addr(struct vnic_dev *vdev,
 	enum vnic_res_type type, unsigned int index)
@@ -296,14 +296,12 @@ dma_addr_t vnic_dev_get_res_bus_addr(struct vnic_dev *vdev,
 		return vdev->res[type].bus_addr;
 	}
 }
-EXPORT_SYMBOL(vnic_dev_get_res_bus_addr);
 
 uint8_t vnic_dev_get_res_bar(struct vnic_dev *vdev,
 	enum vnic_res_type type)
 {
 	return vdev->res[type].bar_num;
 }
-EXPORT_SYMBOL(vnic_dev_get_res_bar);
 
 uint32_t vnic_dev_get_res_offset(struct vnic_dev *vdev,
 	enum vnic_res_type type, unsigned int index)
@@ -320,7 +318,6 @@ uint32_t vnic_dev_get_res_offset(struct vnic_dev *vdev,
 		return vdev->res[type].bar_offset;
 	}
 }
-EXPORT_SYMBOL(vnic_dev_get_res_offset);
 
 /*
  * Get the length of the res type
@@ -330,7 +327,6 @@ unsigned long vnic_dev_get_res_type_len(struct vnic_dev *vdev,
 {
 	return vdev->res[type].len;
 }
-EXPORT_SYMBOL(vnic_dev_get_res_type_len);
 
 unsigned int vnic_dev_desc_ring_size(struct vnic_dev_ring *ring,
 	unsigned int desc_count, unsigned int desc_size)
@@ -420,8 +416,12 @@ static int _vnic_dev_cmd(struct vnic_dev *vdev, enum vnic_devcmd_cmd cmd,
 		return -ENODEV;
 	}
 	if (status & STAT_BUSY) {
+#ifndef __WINDOWS__
 		pr_err("%s: Busy devcmd %d\n",
 			pci_name(vdev->pdev), _CMD_N(cmd));
+#else
+		pr_err("Busy devcmd %d\n", _CMD_N(cmd));
+#endif
 		return -EBUSY;
 	}
 
@@ -450,10 +450,16 @@ static int _vnic_dev_cmd(struct vnic_dev *vdev, enum vnic_devcmd_cmd cmd,
 			if (status & STAT_ERROR) {
 				err = -(int)readq(&devcmd->args[0]);
 				if (cmd != CMD_CAPABILITY)
+#ifndef __WINDOWS__
 					pr_err("%s: Devcmd %d failed "
 						"with error code %d\n",
 						pci_name(vdev->pdev),
 						_CMD_N(cmd), err);
+#else
+					pr_err("Devcmd %d failed "
+						"with error code %d\n",
+						_CMD_N(cmd), err);
+#endif
 				return err;
 			}
 
@@ -467,8 +473,12 @@ static int _vnic_dev_cmd(struct vnic_dev *vdev, enum vnic_devcmd_cmd cmd,
 		}
 	}
 
+#ifndef __WINDOWS__
 	pr_err("%s: Timedout devcmd %d\n",
 		pci_name(vdev->pdev), _CMD_N(cmd));
+#else
+	pr_err("Timedout devcmd %d\n", _CMD_N(cmd));
+#endif
 	return -ETIMEDOUT;
 #endif
 }
@@ -1189,7 +1199,7 @@ int vnic_dev_raise_intr(struct vnic_dev *vdev, u16 intr)
 	return err;
 }
 
-static int vnic_dev_notify_setcmd(struct vnic_dev *vdev,
+int vnic_dev_notify_setcmd(struct vnic_dev *vdev,
 	void *notify_addr, dma_addr_t notify_pa, u16 intr)
 {
 	u64 a0, a1;
@@ -1228,7 +1238,7 @@ int vnic_dev_notify_set(struct vnic_dev *vdev, u16 intr)
 	return vnic_dev_notify_setcmd(vdev, notify_addr, notify_pa, intr);
 }
 
-static int vnic_dev_notify_unsetcmd(struct vnic_dev *vdev)
+int vnic_dev_notify_unsetcmd(struct vnic_dev *vdev)
 {
 	u64 a0, a1;
 	int wait = 1000;
@@ -1248,6 +1258,21 @@ static int vnic_dev_notify_unsetcmd(struct vnic_dev *vdev)
 
 int vnic_dev_notify_unset(struct vnic_dev *vdev)
 {
+#ifdef __VMKLNX__	
+	struct vnic_devcmd_notify *notify_tmp = vdev->notify;
+	dma_addr_t notify_pa_tmp = vdev->notify_pa;
+	int r;
+	
+	r = vnic_dev_notify_unsetcmd(vdev);
+	if (notify_tmp) {
+		pci_free_consistent(vdev->pdev,
+			sizeof(struct vnic_devcmd_notify),
+			notify_tmp,
+			notify_pa_tmp);
+	}
+
+	return r;
+#else 
 	if (vdev->notify) {
 		pci_free_consistent(vdev->pdev,
 			sizeof(struct vnic_devcmd_notify),
@@ -1256,6 +1281,7 @@ int vnic_dev_notify_unset(struct vnic_dev *vdev)
 	}
 
 	return vnic_dev_notify_unsetcmd(vdev);
+#endif       	
 }
 
 static int vnic_dev_notify_ready(struct vnic_dev *vdev)
@@ -1350,7 +1376,6 @@ int vnic_dev_deinit(struct vnic_dev *vdev)
 	return vnic_dev_cmd(vdev, CMD_DEINIT, &a0, &a1, wait);
 }
 
-EXPORT_SYMBOL(vnic_dev_intr_coal_timer_info_default);
 void vnic_dev_intr_coal_timer_info_default(struct vnic_dev *vdev)
 {
 	/* Default: hardware intr coal timer is in units of 1.5 usecs */
@@ -1464,14 +1489,12 @@ u32 vnic_dev_perbi_rebuild_cnt(struct vnic_dev *vdev)
 	return vdev->notify_copy.perbi_rebuild_cnt;
 }
 
-EXPORT_SYMBOL(vnic_dev_set_intr_mode);
 void vnic_dev_set_intr_mode(struct vnic_dev *vdev,
 	enum vnic_dev_intr_mode intr_mode)
 {
 	vdev->intr_mode = intr_mode;
 }
 
-EXPORT_SYMBOL(vnic_dev_get_intr_mode);
 enum vnic_dev_intr_mode vnic_dev_get_intr_mode(
 	struct vnic_dev *vdev)
 {
@@ -1517,7 +1540,6 @@ void vnic_dev_unregister(struct vnic_dev *vdev)
 		kfree(vdev);
 	}
 }
-EXPORT_SYMBOL(vnic_dev_unregister);
 
 struct vnic_dev *vnic_dev_alloc_discover(struct vnic_dev *vdev,
 	void *priv, struct pci_dev *pdev, struct vnic_dev_bar *bar,
@@ -1541,7 +1563,6 @@ err_out:
 	vnic_dev_unregister(vdev);
 	return NULL;
 }
-EXPORT_SYMBOL(vnic_dev_alloc_discover);
 
 struct vnic_dev *vnic_dev_register(struct vnic_dev *vdev,
 	void *priv, struct pci_dev *pdev, struct vnic_dev_bar *bar,
@@ -1561,13 +1582,11 @@ err_free:
 err_out:
 	return NULL;
 }
-EXPORT_SYMBOL(vnic_dev_register);
 
 struct pci_dev *vnic_dev_get_pdev(struct vnic_dev *vdev)
 {
 	return vdev->pdev;
 }
-EXPORT_SYMBOL(vnic_dev_get_pdev);
 
 int vnic_devcmd_init(struct vnic_dev *vdev, int fallback)
 {
@@ -1741,18 +1760,17 @@ int vnic_dev_classifier(struct vnic_dev *vdev, u8 cmd, u16 *entry, struct filter
 
 	return ret;
 }
-
+#ifdef ENIC_VXLAN
 int vnic_dev_overlay_offload_ctrl(struct vnic_dev *vdev, u8 overlay,
 	u8 config)
 {
 	u64 a0, a1;
 	int wait = 1000;
 	int ret = -EINVAL;
-
 	a0 = overlay;
 	a1 = config;
-
-	ret = vnic_dev_cmd(vdev, CMD_OVERLAY_OFFLOAD_CTRL, &a0, &a1, wait);
+	ret = vnic_dev_cmd(vdev, CMD_OVERLAY_OFFLOAD_CTRL,
+		&a0, &a1, wait);
 
 	return ret;
 }
@@ -1763,10 +1781,8 @@ int vnic_dev_overlay_offload_cfg(struct vnic_dev *vdev, u8 overlay,
 	u64 a0, a1;
 	int wait = 1000;
 	int ret = -EINVAL;
-
 	a0 = overlay;
 	a1 = vxlan_udp_port_number;
-
 	ret = vnic_dev_cmd(vdev, CMD_OVERLAY_OFFLOAD_CFG, &a0, &a1, wait);
 
 	return ret;
@@ -1778,10 +1794,9 @@ int vnic_dev_get_supported_feature_ver(struct vnic_dev *vdev, u8 feature,
 	u64 a0 = feature, a1 = 0;
 	int wait = 1000;
 	int ret = -EINVAL;
-
 	ret = vnic_dev_cmd(vdev, CMD_GET_SUPP_FEATURE_VER, &a0, &a1, wait);
 	if (!ret)
 		*supported_versions = a0;
-
 	return ret;
 }
+#endif

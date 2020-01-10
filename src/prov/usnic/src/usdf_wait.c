@@ -35,9 +35,9 @@
  */
 
 /* This needs to be included for usdf.h */
-#include "ofi.h"
-#include "ofi_enosys.h"
-#include "ofi_util.h"
+#include "fi.h"
+#include "fi_enosys.h"
+#include "fi_util.h"
 
 #include "usdf.h"
 #include "usdf_cq.h"
@@ -217,11 +217,11 @@ int usdf_wait_open(struct fid_fabric *fabric, struct fi_wait_attr *attr,
 	wait_priv->wait_obj = attr->wait_obj;
 	wait_priv->object.epfd = epfd;
 
-	ofi_atomic_initialize32(&wait_priv->wait_refcnt, 0);
+	atomic_initialize(&wait_priv->wait_refcnt, 0);
 	fastlock_init(&wait_priv->lock);
 	dlist_init(&wait_priv->list);
 
-	ofi_atomic_inc32(&wait_priv->wait_fabric->fab_refcnt);
+	atomic_inc(&wait_priv->wait_fabric->fab_refcnt);
 
 	*waitset = &wait_priv->wait_fid;
 
@@ -249,7 +249,7 @@ static int usdf_wait_close(struct fid *waitset)
 
 	wait_priv = wait_ftou(waitset);
 
-	if (ofi_atomic_get32(&wait_priv->wait_refcnt) > 0) {
+	if (atomic_get(&wait_priv->wait_refcnt) > 0) {
 		USDF_DBG_SYS(FABRIC,
 				"failed to close waitset with non-zero refcnt");
 		return -FI_EBUSY;
@@ -266,7 +266,7 @@ static int usdf_wait_close(struct fid *waitset)
 		return -FI_EINVAL;
 	}
 
-	ofi_atomic_dec32(&wait_priv->wait_fabric->fab_refcnt);
+	atomic_dec(&wait_priv->wait_fabric->fab_refcnt);
 	free(wait_priv);
 
 	return FI_SUCCESS;

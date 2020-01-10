@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
- * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
+ * Copyright (c) 2015 Cray Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -34,25 +34,33 @@
 #ifndef _GNIX_CNTR_H_
 #define _GNIX_CNTR_H_
 
-#include <ofi.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <fi.h>
 
 #include "gnix.h"
-#include "gnix_progress.h"
 #include "gnix_wait.h"
 #include "gnix_util.h"
+
+/* many to many relationship between counters and polled NICs */
+struct gnix_cntr_poll_nic {
+	struct dlist_entry list;
+	int ref_cnt;
+	struct gnix_nic *nic;
+};
 
 struct gnix_fid_cntr {
 	struct fid_cntr cntr_fid;
 	struct gnix_fid_domain *domain;
 	struct fid_wait *wait;
 	struct fi_cntr_attr attr;
-	ofi_atomic32_t cnt;
-	ofi_atomic32_t cnt_err;
+	rwlock_t nic_lock;
+	struct dlist_entry poll_nics;
+	atomic_t cnt;
+	atomic_t cnt_err;
 	struct gnix_reference ref_cnt;
-	struct dlist_entry trigger_list;
-	fastlock_t trigger_lock;
-	struct gnix_prog_set pset;
-	bool requires_lock;
 };
 
 /**
@@ -72,25 +80,25 @@ int _gnix_cntr_inc(struct gnix_fid_cntr *cntr);
 int _gnix_cntr_inc_err(struct gnix_fid_cntr *cntr);
 
 /**
- * @brief              Add an object to the list progressed when fi_cntr_read
+ * @brief              Add a nic to the set of nics progressed when fi_cntr_read
  *                     and related functions are called.
  * @param[in] cntr     pointer to previously allocated gnix_fid_cntr structure
- * @param[in] obj      pointer to object to add to the progress list.
- * @param[in] prog_fn  object progress function
+ * @param[in] nic      pointer to previously allocated gnix_nic structure
  * @return             FI_SUCCESS on success, -FI_EINVAL on invalid argument
  */
-int _gnix_cntr_poll_obj_add(struct gnix_fid_cntr *cntr, void *obj,
-			    int (*prog_fn)(void *data));
+int _gnix_cntr_poll_nic_add(struct gnix_fid_cntr *cntr, struct gnix_nic *nic);
 
 /**
- * @brief              Remove an object from the list progressed when
- *                     fi_cntr_read and related functions are called.
+ * @brief              remove a nic from the set of nics progressed when fi_cntr_read
+ *                     and related functions are called.
  * @param[in] cntr     pointer to previously allocated gnix_fid_cntr structure
- * @param[in] obj      pointer to previously added object
- * @param[in] prog_fn  object progress function
+ * @param[in] nic      pointer to previously allocated gnix_nic structure
  * @return             FI_SUCCESS on success, -FI_EINVAL on invalid argument
  */
-int _gnix_cntr_poll_obj_rem(struct gnix_fid_cntr *cntr, void *obj,
-			    int (*prog_fn)(void *data));
+int _gnix_cntr_poll_nic_rem(struct gnix_fid_cntr *cntr, struct gnix_nic *nic);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

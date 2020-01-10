@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -50,11 +50,11 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
+#include <rdma/fi_prov.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-#include "ofi.h"
-#include "ofi_file.h"
+#include "fi.h"
 
 #include "usnic_direct.h"
 #include "usdf.h"
@@ -64,7 +64,7 @@
 #include "usdf_av.h"
 #include "usdf_cm.h"
 
-void
+static void
 usdf_cm_msg_connreq_cleanup(struct usdf_connreq *crp)
 {
 	struct usdf_ep *ep;
@@ -114,7 +114,7 @@ usdf_cm_msg_accept_complete(struct usdf_connreq *crp)
 	ret = usdf_eq_write_internal(ep->ep_eq, FI_CONNECTED, &entry,
 			sizeof(entry), 0);
 	if (ret != sizeof(entry)) {
-		usdf_cm_report_failure(crp, ret, false);
+		usdf_cm_msg_connreq_failed(crp, ret);
 		return 0;
 	}
 
@@ -157,8 +157,9 @@ usdf_cm_msg_accept(struct fid_ep *fep, const void *param, size_t paramlen)
 	ep->e.msg.ep_lcl_peer_id = ntohs(reqp->creq_peer_id);
 
 	/* start creating the dest early */
-	ret = usd_create_dest(udp->dom_dev, reqp->creq_ipaddr,
-			reqp->creq_port, &ep->e.msg.ep_dest);
+	ret = usd_create_dest_with_mac(udp->dom_dev, reqp->creq_ipaddr,
+			reqp->creq_port, reqp->creq_mac,
+			&ep->e.msg.ep_dest);
 	if (ret != 0) {
 		goto fail;
 	}
@@ -184,6 +185,7 @@ usdf_cm_msg_accept(struct fid_ep *fep, const void *param, size_t paramlen)
 	reqp->creq_ipaddr = fp->fab_dev_attrs->uda_ipaddr_be;
 	reqp->creq_port =
 		qp->uq_attrs.uqa_local_addr.ul_addr.ul_udp.u_addr.sin_port;
+	memcpy(reqp->creq_mac, fp->fab_dev_attrs->uda_mac_addr, ETH_ALEN);
 	reqp->creq_result = htonl(0);
 	reqp->creq_datalen = htonl(paramlen);
 	memcpy(reqp->creq_data, param, paramlen);
@@ -209,82 +211,22 @@ fail:
 	return ret;
 }
 
-/* Given a connection request structure containing data, make a copy of the data
- * that can be accessed in error entries on the EQ. The return value is the size
- * of the data stored in the error entry. If the return value is a non-negative
- * value, then the function has suceeded and the size and output data can be
- * assumed to be valid. If the function fails, then the data will be NULL and
- * the size will be a negative error value.
+/*
+ * Connection request attempt failed
  */
-static int usdf_cm_generate_err_data(struct usdf_eq *eq,
-		struct usdf_connreq *crp, void **data)
+void
+usdf_cm_msg_connreq_failed(struct usdf_connreq *crp, int error)
 {
-	struct usdf_err_data_entry *err_data_entry;
-	struct usdf_connreq_msg *reqp;
-	size_t entry_size;
-	size_t data_size;
-
-	if (!eq || !crp || !data) {
-		USDF_DBG_SYS(EP_CTRL,
-				"eq, crp, or data is NULL.\n");
-		return -FI_EINVAL;
-	}
-
-	/* Initialize to NULL so data can't be used in the error case. */
-	*data = NULL;
-
-	reqp = (struct usdf_connreq_msg *) crp->cr_data;
-
-	/* This is a normal case, maybe there was no data. */
-	if (!reqp || !reqp->creq_datalen)
-		return 0;
-
-	data_size = reqp->creq_datalen;
-
-	entry_size = sizeof(*err_data_entry) + data_size;
-
-	err_data_entry = calloc(1, entry_size);
-	if (!err_data_entry) {
-		USDF_WARN_SYS(EP_CTRL,
-				"failed to allocate err data entry\n");
-		return -FI_ENOMEM;
-	}
-
-	/* This data should be copied and owned by the provider. Keep
-	 * track of it in the EQ, this will be freed in the next EQ read
-	 * call after it has been read.
-	 */
-	memcpy(err_data_entry->err_data, reqp->creq_data, data_size);
-	slist_insert_tail(&err_data_entry->entry, &eq->eq_err_data);
-
-	*data = err_data_entry->err_data;
-
-	return data_size;
-}
-
-/* Report a connection management related failure. Sometimes there is connection
- * event data that should be copied into the generated event. If the copy_data
- * parameter evaluates to true, then the data will be copied.
- *
- * If data is to be generated for the error entry, then the connection request
- * is assumed to have the data size in host order. If something fails during
- * processing of the error data, then the EQ entry will still be generated
- * without the error data.
- */
-void usdf_cm_report_failure(struct usdf_connreq *crp, int error, bool copy_data)
-{
-	struct fi_eq_err_entry err = {0};
         struct usdf_pep *pep;
         struct usdf_ep *ep;
         struct usdf_eq *eq;
 	fid_t fid;
-	int ret;
+        struct fi_eq_err_entry err;
 
-	USDF_DBG_SYS(EP_CTRL, "error=%d (%s)\n", error, fi_strerror(error));
+	USDF_DBG_SYS(EP_CTRL, "error=%d (%s)\n", error, fi_strerror(-error));
 
         pep = crp->cr_pep;
         ep = crp->cr_ep;
-
 	if (ep != NULL) {
 		fid = ep_utofid(ep);
 		eq = ep->ep_eq;
@@ -294,19 +236,13 @@ void usdf_cm_report_failure(struct usdf_connreq *crp, int error, bool copy_data)
 		eq = pep->pep_eq;
 	}
 
-	/* Try to generate the space necessary for the error data. If the
-	 * function returns a number greater than or equal to 0, then it was a
-	 * success. The return value is the size of the data.
-	 */
-	if (copy_data) {
-		ret = usdf_cm_generate_err_data(eq, crp, &err.err_data);
-		if (ret >= 0)
-			err.err_data_size = ret;
-	}
-
         err.fid = fid;
+        err.context = NULL;
+        err.data = 0;
         err.err = -error;
-
+        err.prov_errno = 0;
+        err.err_data = NULL;
+        err.err_data_size = 0;
         usdf_eq_write_internal(eq, 0, &err, sizeof(err), USDF_EVENT_FLAG_ERROR);
 
         usdf_cm_msg_connreq_cleanup(crp);
@@ -332,12 +268,12 @@ usdf_cm_msg_connect_cb_rd(void *v)
 	fp = ep->ep_domain->dom_fabric;
 
 	ret = read(crp->cr_sockfd, crp->cr_ptr, crp->cr_resid);
-	if (ret == -1)
-		goto report_failure_skip_data;
+	if (ret == -1) {
+		usdf_cm_msg_connreq_failed(crp, -errno);
+		return 0;
+	}
 
-	crp->cr_ptr += ret;
 	crp->cr_resid -= ret;
-
 	reqp = (struct usdf_connreq_msg *)crp->cr_data;
 	if (crp->cr_resid == 0 && crp->cr_ptr == crp->cr_data + sizeof(*reqp)) {
 		reqp->creq_datalen = ntohl(reqp->creq_datalen);
@@ -346,31 +282,28 @@ usdf_cm_msg_connect_cb_rd(void *v)
 
 	/* if resid is 0 now, completely done */
 	if (crp->cr_resid == 0) {
-		reqp->creq_result = ntohl(reqp->creq_result);
-
 		ret = epoll_ctl(fp->fab_epollfd, EPOLL_CTL_DEL,
 				crp->cr_sockfd, NULL);
 		close(crp->cr_sockfd);
 		crp->cr_sockfd = -1;
 
-		if (reqp->creq_result != FI_SUCCESS) {
-			/* Copy the data since this was an explicit rejection.
-			 */
-			usdf_cm_report_failure(crp, reqp->creq_result, true);
-			return 0;
-		}
-
 		entry_len = sizeof(*entry) + reqp->creq_datalen;
 		entry = malloc(entry_len);
-		if (entry == NULL)
-			goto report_failure_skip_data;
-
+		if (entry == NULL) {
+			usdf_cm_msg_connreq_failed(crp, -errno);
+			return 0;
+		}
+		
 		udp = ep->ep_domain;
 		ep->e.msg.ep_lcl_peer_id = ntohs(reqp->creq_peer_id);
-		ret = usd_create_dest(udp->dom_dev, reqp->creq_ipaddr,
-				reqp->creq_port, &ep->e.msg.ep_dest);
-		if (ret != 0)
-			goto free_entry_and_report_failure;
+		ret = usd_create_dest_with_mac(udp->dom_dev, reqp->creq_ipaddr,
+				reqp->creq_port, reqp->creq_mac,
+				&ep->e.msg.ep_dest);
+		if (ret != 0) {
+			free(entry);
+			usdf_cm_msg_connreq_failed(crp, ret);
+			return 0;
+		}
 
 		ep->e.msg.ep_dest->ds_dest.ds_udp.u_hdr.uh_ip.frag_off |=
 			htons(IP_DF);
@@ -380,22 +313,16 @@ usdf_cm_msg_connect_cb_rd(void *v)
 		memcpy(entry->data, reqp->creq_data, reqp->creq_datalen);
 		ret = usdf_eq_write_internal(ep->ep_eq, FI_CONNECTED, entry,
 				entry_len, 0);
+		free(entry);
 		if (ret != (int)entry_len) {
 			free(ep->e.msg.ep_dest);
 			ep->e.msg.ep_dest = NULL;
-
-			goto free_entry_and_report_failure;
+			usdf_cm_msg_connreq_failed(crp, ret);
+			return 0;
 		}
 
-		free(entry);
 		usdf_cm_msg_connreq_cleanup(crp);
 	}
-	return 0;
-
-free_entry_and_report_failure:
-	free(entry);
-report_failure_skip_data:
-	usdf_cm_report_failure(crp, ret, false);
 	return 0;
 }
 
@@ -419,24 +346,24 @@ usdf_cm_msg_connect_cb_wr(void *v)
 
 	ret = write(crp->cr_sockfd, crp->cr_ptr, crp->cr_resid);
 	if (ret == -1) {
-		usdf_cm_report_failure(crp, -errno, false);
+		usdf_cm_msg_connreq_failed(crp, -errno);
 		return 0;
 	}
 
 	crp->cr_resid -= ret;
 	if (crp->cr_resid == 0) {
 		crp->cr_pollitem.pi_rtn = usdf_cm_msg_connect_cb_rd;
-		crp->cr_ptr = crp->cr_data;
-		crp->cr_resid = sizeof(struct usdf_connreq_msg);
-
 		ev.events = EPOLLIN;
 		ev.data.ptr = &crp->cr_pollitem;
 		ret = epoll_ctl(fp->fab_epollfd, EPOLL_CTL_MOD,
 				crp->cr_sockfd, &ev);
 		if (ret != 0) {
-			usdf_cm_report_failure(crp, -errno, false);
+			usdf_cm_msg_connreq_failed(crp, -errno);
 			return 0;
 		}
+
+		crp->cr_ptr = crp->cr_data;
+		crp->cr_resid = sizeof(struct usdf_connreq_msg);
 	}
 	return 0;
 }
@@ -454,8 +381,6 @@ usdf_cm_msg_connect(struct fid_ep *fep, const void *addr,
 	struct usdf_fabric *fp;
 	struct usdf_connreq_msg *reqp;
 	struct usd_qp_impl *qp;
-	struct fi_info *info;
-	size_t request_size;
 	int ret;
 
 	USDF_TRACE_SYS(EP_CTRL, "\n");
@@ -466,19 +391,11 @@ usdf_cm_msg_connect(struct fid_ep *fep, const void *addr,
 	ep = ep_ftou(fep);
 	udp = ep->ep_domain;
 	fp = udp->dom_fabric;
-	info = ep->ep_domain->dom_info;
+	sin = addr;
+	crp = NULL;
 
-	sin = usdf_format_to_sin(info, addr);
-
-	/* Although paramlen may be less than USDF_MAX_CONN_DATA, the same crp
-	 * struct is used for receiving the accept and reject payload. The
-	 * structure has to be prepared to receive the maximum allowable amount
-	 * of data per transfer. The maximum size includes the connection
-	 * request structure, the connection request message, and the maximum
-	 * amount of data per connection request message.
-	 */
-	request_size = sizeof(*crp) + sizeof(*reqp) + USDF_MAX_CONN_DATA;
-	crp = calloc(1, request_size);
+	crp = calloc(1, sizeof(*crp) + sizeof(struct usdf_connreq_msg) +
+			paramlen);
 	if (crp == NULL) {
 		ret = -errno;
 		goto fail;
@@ -498,8 +415,13 @@ usdf_cm_msg_connect(struct fid_ep *fep, const void *addr,
 		ep->e.msg.ep_cm_sock = -1;
 	}
 
-	ret = fi_fd_nonblock(crp->cr_sockfd);
-	if (ret) {
+	ret = fcntl(crp->cr_sockfd, F_GETFL, 0);
+	if (ret == -1) {
+		ret = -errno;
+		goto fail;
+	}
+	ret = fcntl(crp->cr_sockfd, F_SETFL, ret | O_NONBLOCK);
+	if (ret == -1) {
 		ret = -errno;
 		goto fail;
 	}
@@ -523,6 +445,18 @@ usdf_cm_msg_connect(struct fid_ep *fep, const void *addr,
 	if (ret)
 		goto fail;
 
+	/* register for notification when connect completes */
+	crp->cr_pollitem.pi_rtn = usdf_cm_msg_connect_cb_wr;
+	crp->cr_pollitem.pi_context = crp;
+	ev.events = EPOLLOUT;
+	ev.data.ptr = &crp->cr_pollitem;
+	ret = epoll_ctl(fp->fab_epollfd, EPOLL_CTL_ADD, crp->cr_sockfd, &ev);
+	if (ret != 0) {
+		crp->cr_pollitem.pi_rtn = NULL;
+		ret = -errno;
+		goto fail;
+	}
+
 	/* allocate remote peer ID */
 	ep->e.msg.ep_rem_peer_id = udp->dom_next_peer;
 	udp->dom_peer_tab[udp->dom_next_peer] = ep;
@@ -537,28 +471,13 @@ usdf_cm_msg_connect(struct fid_ep *fep, const void *addr,
 	reqp->creq_ipaddr = fp->fab_dev_attrs->uda_ipaddr_be;
 	reqp->creq_port =
 		qp->uq_attrs.uqa_local_addr.ul_addr.ul_udp.u_addr.sin_port;
+	memcpy(reqp->creq_mac, fp->fab_dev_attrs->uda_mac_addr, ETH_ALEN);
 	reqp->creq_datalen = htonl(paramlen);
 	memcpy(reqp->creq_data, param, paramlen);
-
-	/* register for notification when connect completes */
-	crp->cr_pollitem.pi_rtn = usdf_cm_msg_connect_cb_wr;
-	crp->cr_pollitem.pi_context = crp;
-	ev.events = EPOLLOUT;
-	ev.data.ptr = &crp->cr_pollitem;
-	ret = epoll_ctl(fp->fab_epollfd, EPOLL_CTL_ADD, crp->cr_sockfd, &ev);
-	if (ret != 0) {
-		crp->cr_pollitem.pi_rtn = NULL;
-		ret = -errno;
-		goto fail;
-	}
-
-	usdf_free_sin_if_needed(info, (struct sockaddr_in *)sin);
 
 	return 0;
 
 fail:
-	usdf_free_sin_if_needed(info, (struct sockaddr_in *)sin);
-
 	if (crp != NULL) {
 		if (crp->cr_sockfd != -1) {
 			close(crp->cr_sockfd);
@@ -570,107 +489,26 @@ fail:
 	return ret;
 }
 
-/* A wrapper to core function to translate string address to
- * sockaddr_in type. We are expecting a NULL sockaddr_in**.
- * The core function will allocated it for us. The caller HAS TO FREE it.
- */
-int usdf_str_toaddr(const char *str, struct sockaddr_in **outaddr)
-{
-	uint32_t type;
-	size_t size;
-	int ret;
-
-	type = FI_SOCKADDR_IN;
-
-	/* call the core function. The core always allocate the addr for us. */
-	ret = ofi_str_toaddr(str, &type, (void **)outaddr, &size);
-
-#if ENABLE_DEBUG
-	char outstr[USDF_ADDR_STR_LEN];
-	size_t out_size = USDF_ADDR_STR_LEN;
-
-	inet_ntop(AF_INET, &((*outaddr)->sin_addr), outstr, out_size);
-	USDF_DBG_SYS(EP_CTRL,
-		    "%s(string) converted to addr :%s:%u(inet)\n",
-		    str, outstr, ntohs((*outaddr)->sin_port));
-#endif
-
-	return ret;
-}
-
-/* A wrapper to core function to translate sockaddr_in address to
- * string. This function is not allocating any memory. We are expected
- * an allocated buffer.
- */
-const char *usdf_addr_tostr(const struct sockaddr_in *sin,
-			    char *addr_str, size_t *size)
-{
-	const char *ret;
-
-	ret = ofi_straddr(addr_str, size, FI_SOCKADDR_IN, sin);
-
-#if ENABLE_DEBUG
-	char outstr[USDF_ADDR_STR_LEN];
-	size_t out_size = USDF_ADDR_STR_LEN;
-
-	inet_ntop(AF_INET, &sin->sin_addr, outstr, out_size);
-	USDF_DBG_SYS(EP_CTRL,
-		    "%s:%d(inet) converted to %s(string)\n",
-		    outstr, ntohs(sin->sin_port), addr_str);
-#endif
-
-	return ret;
-}
-
 /*
  * Return local address of an EP
  */
-static int usdf_cm_copy_name(struct fi_info *info, struct sockaddr_in *sin,
-		void *addr, size_t *addrlen)
-{
-	int ret;
-	char addr_str[USDF_ADDR_STR_LEN];
-	size_t len;
-
-	USDF_TRACE_SYS(EP_CTRL, "\n");
-
-	ret = FI_SUCCESS;
-	switch (info->addr_format) {
-	case FI_ADDR_STR:
-		len = USDF_ADDR_STR_LEN;
-		usdf_addr_tostr(sin, addr_str, &len);
-		snprintf(addr, MIN(len, *addrlen), "%s", addr_str);
-		break;
-	case FI_SOCKADDR:
-	case FI_SOCKADDR_IN:
-		len = sizeof(*sin);
-		memcpy(addr, sin, MIN(len, *addrlen));
-		break;
-	default:
-		return -FI_EINVAL;
-	}
-
-	/* If the buffer is too small, tell the user. */
-	if (*addrlen < len)
-		ret = -FI_ETOOSMALL;
-
-	/* Always return the actual size. */
-	*addrlen = len;
-	return ret;
-}
-
 int usdf_cm_rdm_getname(fid_t fid, void *addr, size_t *addrlen)
 {
 	struct usdf_ep *ep;
 	struct usdf_rx *rx;
 	struct sockaddr_in sin;
-	struct fi_info *info;
+	size_t copylen;
 
 	USDF_TRACE_SYS(EP_CTRL, "\n");
 
 	ep = ep_fidtou(fid);
 	rx = ep->ep_rx;
-	info = ep->ep_domain->dom_info;
+
+	copylen = sizeof(sin);
+	if (copylen > *addrlen) {
+		copylen = *addrlen;
+	}
+	*addrlen = sizeof(sin);
 
 	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
@@ -681,8 +519,13 @@ int usdf_cm_rdm_getname(fid_t fid, void *addr, size_t *addrlen)
 	} else {
 		sin.sin_port = to_qpi(rx->rx_qp)->uq_attrs.uqa_local_addr.ul_addr.ul_udp.u_addr.sin_port;
 	}
+	memcpy(addr, &sin, copylen);
 
-	return usdf_cm_copy_name(info, &sin, addr, addrlen);
+	if (copylen < sizeof(sin)) {
+		return -FI_ETOOSMALL;
+	} else {
+		return 0;
+	}
 }
 
 int usdf_cm_dgram_getname(fid_t fid, void *addr, size_t *addrlen)
@@ -690,13 +533,15 @@ int usdf_cm_dgram_getname(fid_t fid, void *addr, size_t *addrlen)
 	int ret;
 	struct usdf_ep *ep;
 	struct sockaddr_in sin;
-	struct fi_info *info;
 	socklen_t slen;
+	size_t copylen;
 
 	USDF_TRACE_SYS(EP_CTRL, "\n");
 
 	ep = ep_fidtou(fid);
-	info = ep->ep_domain->dom_info;
+
+	copylen = MIN(sizeof(sin), *addrlen);
+	*addrlen = sizeof(sin);
 
 	memset(&sin, 0, sizeof(sin));
 	if (ep->e.dg.ep_qp == NULL) {
@@ -715,21 +560,31 @@ int usdf_cm_dgram_getname(fid_t fid, void *addr, size_t *addrlen)
 		assert(sin.sin_addr.s_addr ==
 			ep->ep_domain->dom_fabric->fab_dev_attrs->uda_ipaddr_be);
 	}
+	memcpy(addr, &sin, copylen);
 
-	return usdf_cm_copy_name(info, &sin, addr, addrlen);
+	if (copylen < sizeof(sin))
+		return -FI_ETOOSMALL;
+	else
+		return 0;
 }
 
 int usdf_cm_msg_getname(fid_t fid, void *addr, size_t *addrlen)
 {
 	struct usdf_ep *ep;
-	struct fi_info *info;
+	size_t copylen;
 
 	USDF_TRACE_SYS(EP_CTRL, "\n");
 
 	ep = ep_fidtou(fid);
-	info = ep->ep_domain->dom_info;
 
-	return usdf_cm_copy_name(info, &ep->e.msg.ep_lcl_addr, addr, addrlen);
+	copylen = MIN(sizeof(ep->e.msg.ep_lcl_addr), *addrlen);
+	*addrlen = sizeof(ep->e.msg.ep_lcl_addr);
+	memcpy(addr, &ep->e.msg.ep_lcl_addr, copylen);
+
+	if (copylen < sizeof(ep->e.msg.ep_lcl_addr))
+		return -FI_ETOOSMALL;
+	else
+		return 0;
 }
 
 /* Checks that the given address is actually a sockaddr_in of appropriate

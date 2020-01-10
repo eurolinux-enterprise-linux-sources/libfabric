@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2016, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -49,15 +49,15 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
+#include <rdma/fi_prov.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
-#include "ofi.h"
-#include "ofi_enosys.h"
+#include "fi.h"
+#include "fi_enosys.h"
 
 #include "usdf.h"
 #include "usdf_endpoint.h"
-#include "usdf_cm.h"
 
 int
 usdf_endpoint_open(struct fid_domain *domain, struct fi_info *info,
@@ -75,53 +75,4 @@ usdf_endpoint_open(struct fid_domain *domain, struct fi_info *info,
 	default:
 		return -FI_ENODEV;
 	}
-}
-
-int usdf_ep_getopt_connected(fid_t fid, int level, int optname, void *optval,
-		size_t *optlen)
-{
-	size_t *cm_size;
-	size_t dest_size;
-
-	USDF_TRACE_SYS(EP_CTRL, "\n");
-
-	if (!optval || !optlen)
-		return -FI_EINVAL;
-
-	if (level != FI_OPT_ENDPOINT)
-		return -FI_ENOPROTOOPT;
-
-	switch (optname) {
-	case FI_OPT_CM_DATA_SIZE:
-		dest_size = *optlen;
-		*optlen = sizeof(*cm_size);
-
-		if (dest_size < sizeof(*cm_size))
-			return -FI_ETOOSMALL;
-
-		cm_size = optval;
-		*cm_size = USDF_MAX_CONN_DATA;
-		break;
-	default:
-		return -FI_ENOPROTOOPT;
-	}
-
-	return FI_SUCCESS;
-}
-
-int usdf_ep_getopt_unconnected(fid_t fid, int level, int optname, void *optval,
-		size_t *optlen)
-{
-	USDF_TRACE_SYS(EP_CTRL, "\n");
-
-	return -FI_ENOPROTOOPT;
-}
-
-
-int usdf_ep_setopt(fid_t fid, int level, int optname, const void *optval,
-		size_t optlen)
-{
-	USDF_TRACE_SYS(EP_CTRL, "\n");
-
-	return -FI_ENOPROTOOPT;
 }

@@ -1,7 +1,6 @@
 /*
- * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
- * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
- *                         All rights reserved.
+ * Copyright (c) 2015-2016 Cray Inc. All rights reserved.
+ * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -54,22 +53,18 @@ static int __gnix_amo_send_err(struct gnix_fid_ep *ep,
 	if (ep->send_cq) {
 		rc = _gnix_cq_add_error(ep->send_cq, req->user_context,
 					flags, 0, 0, 0, 0, 0, error,
-					GNI_RC_TRANSACTION_ERROR, NULL, 0);
+					GNI_RC_TRANSACTION_ERROR, NULL);
 		if (rc) {
 			GNIX_WARN(FI_LOG_EP_DATA,
 				  "_gnix_cq_add_error() failed: %d\n", rc);
 		}
 	}
 
-	if (((req->type == GNIX_FAB_RQ_AMO) ||
-	     (req->type == GNIX_FAB_RQ_NAMO_AX) ||
-	     (req->type == GNIX_FAB_RQ_NAMO_AX_S)) &&
+	if ((req->type == GNIX_FAB_RQ_AMO) &&
 	    ep->write_cntr) {
 		cntr = ep->write_cntr;
 	} else if ((req->type == GNIX_FAB_RQ_FAMO ||
-		    req->type == GNIX_FAB_RQ_CAMO ||
-		    req->type == GNIX_FAB_RQ_NAMO_FAX ||
-		    req->type == GNIX_FAB_RQ_NAMO_FAX_S) &&
+		    req->type == GNIX_FAB_RQ_CAMO) &&
 		   ep->read_cntr) {
 		cntr = ep->read_cntr;
 	}
@@ -92,7 +87,7 @@ static int __gnix_amo_send_completion(struct gnix_fid_ep *ep,
 	uint64_t flags = req->flags & GNIX_AMO_COMPLETION_FLAGS;
 
 	if ((req->flags & FI_COMPLETION) && ep->send_cq) {
-		rc = _gnix_cq_add_event(ep->send_cq, ep, req->user_context,
+		rc = _gnix_cq_add_event(ep->send_cq, req->user_context,
 					flags, 0, 0, 0, 0, FI_ADDR_NOTAVAIL);
 		if (rc) {
 			GNIX_WARN(FI_LOG_EP_DATA,
@@ -100,15 +95,11 @@ static int __gnix_amo_send_completion(struct gnix_fid_ep *ep,
 		}
 	}
 
-	if ((req->type == GNIX_FAB_RQ_AMO ||
-	     req->type == GNIX_FAB_RQ_NAMO_AX ||
-	     req->type == GNIX_FAB_RQ_NAMO_AX_S) &&
+	if ((req->type == GNIX_FAB_RQ_AMO) &&
 	    ep->write_cntr) {
 		cntr = ep->write_cntr;
 	} else if ((req->type == GNIX_FAB_RQ_FAMO ||
-		    req->type == GNIX_FAB_RQ_CAMO ||
-		    req->type == GNIX_FAB_RQ_NAMO_FAX ||
-		    req->type == GNIX_FAB_RQ_NAMO_FAX_S) &&
+		    req->type == GNIX_FAB_RQ_CAMO) &&
 		   ep->read_cntr) {
 		cntr = ep->read_cntr;
 	}
@@ -123,24 +114,17 @@ static int __gnix_amo_send_completion(struct gnix_fid_ep *ep,
 	return FI_SUCCESS;
 }
 
-static void __gnix_amo_fr_complete(struct gnix_fab_req *req)
+static void __gnix_amo_fr_complete(struct gnix_fab_req *req,
+				   struct gnix_tx_descriptor *txd)
 {
-	int rc;
-
 	if (req->flags & FI_LOCAL_MR) {
 		GNIX_INFO(FI_LOG_EP_DATA, "freeing auto-reg MR: %p\n",
 			  req->amo.loc_md);
-		rc = fi_close(&req->amo.loc_md->mr_fid.fid);
-		if (rc != FI_SUCCESS) {
-			GNIX_ERR(FI_LOG_DOMAIN,
-				"failed to deregister auto-registered region, "
-				"rc=%d\n", rc);
-		}
-
-		req->flags &= ~FI_LOCAL_MR;
+		fi_close(&req->amo.loc_md->mr_fid.fid);
 	}
 
-	ofi_atomic_dec32(&req->vc->outstanding_tx_reqs);
+	atomic_dec(&req->vc->outstanding_tx_reqs);
+	_gnix_nic_tx_free(req->vc->ep->nic, txd);
 
 	/* Schedule VC TX queue in case the VC is 'fenced'. */
 	_gnix_vc_tx_schedule(req->vc);
@@ -148,8 +132,9 @@ static void __gnix_amo_fr_complete(struct gnix_fab_req *req)
 	_gnix_fr_free(req->vc->ep, req);
 }
 
-static int __gnix_amo_post_err(struct gnix_fab_req *req, int error)
+static int __gnix_amo_post_err(struct gnix_tx_descriptor *txd, int error)
 {
+	struct gnix_fab_req *req = txd->req;
 	int rc;
 
 	rc = __gnix_amo_send_err(req->vc->ep, req, error);
@@ -158,125 +143,8 @@ static int __gnix_amo_post_err(struct gnix_fab_req *req, int error)
 			  "__gnix_amo_send_err() failed: %d\n",
 			  rc);
 
-	__gnix_amo_fr_complete(req);
+	__gnix_amo_fr_complete(req, txd);
 	return FI_SUCCESS;
-}
-
-/* SMSG callback for AMO remote counter control message. */
-int __smsg_amo_cntr(void *data, void *msg)
-{
-	int ret = FI_SUCCESS;
-	struct gnix_vc *vc = (struct gnix_vc *)data;
-	struct gnix_smsg_amo_cntr_hdr *hdr =
-			(struct gnix_smsg_amo_cntr_hdr *)msg;
-	struct gnix_fid_ep *ep = vc->ep;
-	gni_return_t status;
-
-	if (hdr->flags & FI_REMOTE_WRITE && ep->rwrite_cntr) {
-		ret = _gnix_cntr_inc(ep->rwrite_cntr);
-		if (ret != FI_SUCCESS)
-			GNIX_WARN(FI_LOG_EP_DATA,
-				  "_gnix_cntr_inc() failed: %d\n",
-				  ret);
-	}
-
-	if (hdr->flags & FI_REMOTE_READ && ep->rread_cntr) {
-		ret = _gnix_cntr_inc(ep->rread_cntr);
-		if (ret != FI_SUCCESS)
-			GNIX_WARN(FI_LOG_EP_DATA,
-				  "_gnix_cntr_inc() failed: %d\n",
-				  ret);
-	}
-
-	status = GNI_SmsgRelease(vc->gni_ep);
-	if (OFI_UNLIKELY(status != GNI_RC_SUCCESS)) {
-		GNIX_WARN(FI_LOG_EP_DATA,
-			  "GNI_SmsgRelease returned %s\n",
-			  gni_err_str[status]);
-		ret = gnixu_to_fi_errno(status);
-	}
-
-	return ret;
-}
-
-static int __gnix_amo_txd_cntr_complete(void *arg, gni_return_t tx_status)
-{
-	struct gnix_tx_descriptor *txd = (struct gnix_tx_descriptor *)arg;
-	struct gnix_fab_req *req = txd->req;
-	int rc;
-
-	_gnix_nic_tx_free(req->gnix_ep->nic, txd);
-
-	if (tx_status != GNI_RC_SUCCESS)
-		return __gnix_amo_post_err(req, FI_ECANCELED);
-
-	/* Successful data delivery.  Generate local completion. */
-	rc = __gnix_amo_send_completion(req->vc->ep, req);
-	if (rc != FI_SUCCESS)
-		GNIX_WARN(FI_LOG_EP_DATA,
-			  "__gnix_amo_send_completion() failed: %d\n",
-			  rc);
-
-	__gnix_amo_fr_complete(req);
-
-	return FI_SUCCESS;
-}
-
-static int __gnix_amo_send_cntr_req(void *arg)
-{
-	struct gnix_fab_req *req = (struct gnix_fab_req *)arg;
-	struct gnix_fid_ep *ep = req->gnix_ep;
-	struct gnix_nic *nic = ep->nic;
-	struct gnix_tx_descriptor *txd;
-	gni_return_t status;
-	int rc;
-	int inject_err = _gnix_req_inject_err(req);
-
-	rc = _gnix_nic_tx_alloc(nic, &txd);
-	if (rc) {
-		GNIX_INFO(FI_LOG_EP_DATA,
-				"_gnix_nic_tx_alloc() failed: %d\n",
-				rc);
-		return -FI_ENOSPC;
-	}
-
-	txd->req = req;
-	txd->completer_fn = __gnix_amo_txd_cntr_complete;
-
-	if (req->type == GNIX_FAB_RQ_AMO) {
-		txd->amo_cntr_hdr.flags = FI_REMOTE_WRITE;
-	} else {
-		txd->amo_cntr_hdr.flags = FI_REMOTE_READ;
-	}
-
-	COND_ACQUIRE(nic->requires_lock, &nic->lock);
-	if (inject_err) {
-		_gnix_nic_txd_err_inject(nic, txd);
-		status = GNI_RC_SUCCESS;
-	} else {
-		status = GNI_SmsgSendWTag(req->vc->gni_ep,
-					  &txd->amo_cntr_hdr,
-					  sizeof(txd->amo_cntr_hdr),
-					  NULL, 0, txd->id,
-					  GNIX_SMSG_T_AMO_CNTR);
-	}
-	COND_RELEASE(nic->requires_lock, &nic->lock);
-
-	if (status == GNI_RC_NOT_DONE) {
-		_gnix_nic_tx_free(nic, txd);
-		GNIX_INFO(FI_LOG_EP_DATA,
-			  "GNI_SmsgSendWTag returned %s\n",
-			  gni_err_str[status]);
-	} else if (status != GNI_RC_SUCCESS) {
-		_gnix_nic_tx_free(nic, txd);
-		GNIX_WARN(FI_LOG_EP_DATA,
-			  "GNI_SmsgSendWTag returned %s\n",
-			  gni_err_str[status]);
-	} else {
-		GNIX_INFO(FI_LOG_EP_DATA, "Sent RMA CQ data, req: %p\n", req);
-	}
-
-	return gnixu_to_fi_errno(status);
 }
 
 static int __gnix_amo_txd_complete(void *arg, gni_return_t tx_status)
@@ -284,27 +152,40 @@ static int __gnix_amo_txd_complete(void *arg, gni_return_t tx_status)
 	struct gnix_tx_descriptor *txd = (struct gnix_tx_descriptor *)arg;
 	struct gnix_fab_req *req = txd->req;
 	int rc = FI_SUCCESS;
-
-	_gnix_nic_tx_free(req->vc->ep->nic, txd);
+	uint32_t read_data32;
+	uint64_t read_data64;
 
 	if (tx_status != GNI_RC_SUCCESS) {
-		return __gnix_amo_post_err(req, FI_ECANCELED);
+		return __gnix_amo_post_err(txd, FI_ECANCELED);
 	}
 
-	if (req->vc->peer_caps & FI_RMA_EVENT) {
-		/* control message needed for a counter event. */
-		req->work_fn = __gnix_amo_send_cntr_req;
-		_gnix_vc_queue_work_req(req);
-	} else {
-		/* complete request */
-		rc = __gnix_amo_send_completion(req->vc->ep, req);
-		if (rc != FI_SUCCESS)
-			GNIX_WARN(FI_LOG_EP_DATA,
-				  "__gnix_amo_send_completion() failed: %d\n",
-				  rc);
-
-		__gnix_amo_fr_complete(req);
+	/* FI_ATOMIC_READ data is delivered to operand buffer in addition to
+	 * the results buffer. */
+	if (req->amo.op == FI_ATOMIC_READ) {
+		switch(fi_datatype_size(req->amo.datatype)) {
+		case sizeof(uint32_t):
+			read_data32 = *(uint32_t *)req->amo.loc_addr;
+			*(uint32_t *)req->amo.read_buf = read_data32;
+			break;
+		case sizeof(uint64_t):
+			read_data64 = *(uint64_t *)req->amo.loc_addr;
+			*(uint64_t *)req->amo.read_buf = read_data64;
+			break;
+		default:
+			GNIX_FATAL(FI_LOG_EP_DATA, "Invalid datatype: %d\n",
+				   req->amo.datatype);
+			break;
+		}
 	}
+
+	/* complete request */
+	rc = __gnix_amo_send_completion(req->vc->ep, req);
+	if (rc != FI_SUCCESS)
+		GNIX_WARN(FI_LOG_EP_DATA,
+			  "__gnix_amo_send_completion() failed: %d\n",
+			  rc);
+
+	__gnix_amo_fr_complete(req, txd);
 
 	return FI_SUCCESS;
 }
@@ -365,34 +246,22 @@ static int __gnix_cmp_amo_cmds[FI_ATOMIC_OP_LAST][FI_DATATYPE_LAST] = {
 int _gnix_atomic_cmd(enum fi_datatype dt, enum fi_op op,
 		     enum gnix_fab_req_type fr_type)
 {
-	if (!((fr_type == GNIX_FAB_RQ_NAMO_AX)   ||
-	      (fr_type == GNIX_FAB_RQ_NAMO_FAX)  ||
-	      (fr_type == GNIX_FAB_RQ_NAMO_AX_S) ||
-	      (fr_type == GNIX_FAB_RQ_NAMO_FAX_S)) &&
-	    (dt >= FI_DATATYPE_LAST || op >= FI_ATOMIC_OP_LAST)) {
-		return -FI_EOPNOTSUPP;
+	if (dt >= FI_DATATYPE_LAST || op >= FI_ATOMIC_OP_LAST) {
+		return -FI_ENOENT;
 	}
 
 	switch(fr_type) {
 	case GNIX_FAB_RQ_AMO:
-		return __gnix_amo_cmds[op][dt] ?: -FI_EOPNOTSUPP;
+		return __gnix_amo_cmds[op][dt] ?: -FI_ENOENT;
 	case GNIX_FAB_RQ_FAMO:
-		return __gnix_fetch_amo_cmds[op][dt] ?: -FI_EOPNOTSUPP;
+		return __gnix_fetch_amo_cmds[op][dt] ?: -FI_ENOENT;
 	case GNIX_FAB_RQ_CAMO:
-		return __gnix_cmp_amo_cmds[op][dt] ?: -FI_EOPNOTSUPP;
-	case GNIX_FAB_RQ_NAMO_AX:
-		return GNI_FMA_ATOMIC2_AX;
-	case GNIX_FAB_RQ_NAMO_AX_S:
-		return GNI_FMA_ATOMIC2_AX_S;
-	case GNIX_FAB_RQ_NAMO_FAX:
-		return GNI_FMA_ATOMIC2_FAX;
-	case GNIX_FAB_RQ_NAMO_FAX_S:
-		return GNI_FMA_ATOMIC2_FAX_S;
+		return __gnix_cmp_amo_cmds[op][dt] ?: -FI_ENOENT;
 	default:
 		break;
 	}
 
-	return -FI_EOPNOTSUPP;
+	return -FI_ENOENT;
 }
 
 int _gnix_amo_post_req(void *data)
@@ -407,22 +276,6 @@ int _gnix_amo_post_req(void *data)
 	int rc;
 	int inject_err = _gnix_req_inject_err(fab_req);
 
-	if (!gnix_ops_allowed(ep, fab_req->vc->peer_caps, fab_req->flags)) {
-		GNIX_DEBUG(FI_LOG_EP_DATA, "flags:0x%llx, %s\n", fab_req->flags,
-			   fi_tostr(&fab_req->flags, FI_TYPE_OP_FLAGS));
-		GNIX_DEBUG(FI_LOG_EP_DATA, "caps:0x%llx, %s\n",
-			   ep->caps, fi_tostr(&ep->caps, FI_TYPE_CAPS));
-		GNIX_DEBUG(FI_LOG_EP_DATA, "peer_caps:0x%llx, %s\n",
-			   fab_req->vc->peer_caps,
-			   fi_tostr(&fab_req->vc->peer_caps, FI_TYPE_OP_FLAGS));
-
-		rc = __gnix_amo_post_err(fab_req, FI_EOPNOTSUPP);
-		if (rc != FI_SUCCESS)
-			GNIX_WARN(FI_LOG_EP_DATA,
-				  "__gnix_amo_post_err() failed: %d\n", rc);
-		return -FI_ECANCELED;
-	}
-
 	rc = _gnix_nic_tx_alloc(nic, &txd);
 	if (rc) {
 		GNIX_INFO(FI_LOG_EP_DATA, "_gnix_nic_tx_alloc() failed: %d\n",
@@ -433,13 +286,22 @@ int _gnix_amo_post_req(void *data)
 	txd->completer_fn = __gnix_amo_txd_complete;
 	txd->req = fab_req;
 
+	if (!gnix_ops_allowed(ep, fab_req->vc->peer_caps, fab_req->flags)) {
+		GNIX_DEBUG(FI_LOG_EP_DATA, "flags:0x%llx, %s\n", fab_req->flags,
+			   fi_tostr(&fab_req->flags, FI_TYPE_OP_FLAGS));
+		GNIX_DEBUG(FI_LOG_EP_DATA, "caps:0x%llx, %s\n",
+			   ep->caps, fi_tostr(&ep->caps, FI_TYPE_CAPS));
+		GNIX_DEBUG(FI_LOG_EP_DATA, "peer_caps:0x%llx, %s\n",
+			   fab_req->vc->peer_caps,
+			   fi_tostr(&fab_req->vc->peer_caps, FI_TYPE_OP_FLAGS));
+		return __gnix_amo_post_err(txd, FI_EOPNOTSUPP);
+	}
+
 	/* Mem handle CRC is not validated during FMA operations.  Skip this
 	 * costly calculation. */
-	_GNIX_CONVERT_MR_KEY(ep->auth_key->using_vmdh,
-			fab_req->vc->peer_key_offset,
-			_gnix_convert_key_to_mhdl_no_crc,
-			&fab_req->amo.rem_mr_key, &mdh);
-
+	_gnix_convert_key_to_mhdl_no_crc(
+			(gnix_mr_key_t *)&fab_req->amo.rem_mr_key,
+			&mdh);
 	loc_md = (struct gnix_fid_mem_desc *)fab_req->amo.loc_md;
 
 	txd->gni_desc.type = GNI_POST_AMO;
@@ -461,22 +323,18 @@ int _gnix_amo_post_req(void *data)
 	txd->gni_desc.first_operand = fab_req->amo.first_operand;
 	txd->gni_desc.second_operand = fab_req->amo.second_operand;
 
-	GNIX_DEBUG(FI_LOG_EP_DATA, "fo:%016lx so:%016lx\n",
-		   txd->gni_desc.first_operand, txd->gni_desc.second_operand);
-	GNIX_DEBUG(FI_LOG_EP_DATA, "amo_cmd:%x\n",
-		   txd->gni_desc.amo_cmd);
 	GNIX_LOG_DUMP_TXD(txd);
 
-	COND_ACQUIRE(nic->requires_lock, &nic->lock);
+	fastlock_acquire(&nic->lock);
 
-	if (OFI_UNLIKELY(inject_err)) {
+	if (unlikely(inject_err)) {
 		_gnix_nic_txd_err_inject(nic, txd);
 		status = GNI_RC_SUCCESS;
 	} else {
 		status = GNI_PostFma(fab_req->vc->gni_ep, &txd->gni_desc);
 	}
 
-	COND_RELEASE(nic->requires_lock, &nic->lock);
+	fastlock_release(&nic->lock);
 
 	if (status != GNI_RC_SUCCESS) {
 		_gnix_nic_tx_free(nic, txd);
@@ -507,43 +365,16 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 	uint64_t compare_operand = 0;
 	void *loc_addr = NULL;
 	int dt_len, dt_align;
-	int connected;
-
-	if (!(flags & FI_INJECT) && !ep->send_cq &&
-	    (((fr_type == GNIX_FAB_RQ_AMO ||
-	      fr_type == GNIX_FAB_RQ_NAMO_AX ||
-	      fr_type == GNIX_FAB_RQ_NAMO_AX_S) &&
-	      !ep->write_cntr) ||
-	     ((fr_type == GNIX_FAB_RQ_FAMO ||
-	      fr_type == GNIX_FAB_RQ_CAMO ||
-	      fr_type == GNIX_FAB_RQ_NAMO_FAX ||
-	      fr_type == GNIX_FAB_RQ_NAMO_FAX_S) &&
-	      !ep->read_cntr))) {
-		return -FI_ENOCQ;
-	}
-
 
 	if (!ep || !msg || !msg->msg_iov ||
+	    !msg->msg_iov[0].addr ||
 	    msg->msg_iov[0].count != 1 ||
-	    msg->iov_count != GNIX_MAX_ATOMIC_IOV_LIMIT ||
-	    !msg->rma_iov)
+	    msg->iov_count != 1 ||
+	    !msg->rma_iov || !msg->rma_iov[0].addr)
 		return -FI_EINVAL;
 
-	/*
-	 * see fi_atomic man page
-	 */
-
-	if ((msg->op != FI_ATOMIC_READ) &&
-		!msg->msg_iov[0].addr)
-		return -FI_EINVAL;
-
-	if (flags & FI_TRIGGER) {
-		struct fi_triggered_context *trigger_context =
-				(struct fi_triggered_context *)msg->context;
-		if ((trigger_context->event_type != FI_TRIGGER_THRESHOLD) ||
-		    (flags & FI_INJECT)) {
-			return -FI_EINVAL;
-		}
+	if (!ep->send_cq && !(flags & FI_INJECT)) {
+		return -FI_ENOCQ;
 	}
 
 	if (fr_type == GNIX_FAB_RQ_CAMO) {
@@ -553,7 +384,7 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 		compare_operand = *(uint64_t *)comparev[0].addr;
 	}
 
-	dt_len = ofi_datatype_size(msg->datatype);
+	dt_len = fi_datatype_size(msg->datatype);
 	dt_align = dt_len - 1;
 	len = dt_len * msg->msg_iov->count;
 
@@ -565,10 +396,7 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 	}
 
 	/* need a memory descriptor for all fetching and comparison AMOs */
-	if (fr_type == GNIX_FAB_RQ_FAMO ||
-	    fr_type == GNIX_FAB_RQ_CAMO ||
-	    fr_type == GNIX_FAB_RQ_NAMO_FAX ||
-	    fr_type == GNIX_FAB_RQ_NAMO_FAX_S) {
+	if (fr_type == GNIX_FAB_RQ_FAMO || fr_type == GNIX_FAB_RQ_CAMO) {
 		if (!resultv || !resultv[0].addr || result_count != 1)
 			return -FI_EINVAL;
 
@@ -582,10 +410,9 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 		}
 
 		if (!result_desc || !result_desc[0]) {
-			rc = _gnix_mr_reg(&ep->domain->domain_fid.fid,
+			rc = gnix_mr_reg(&ep->domain->domain_fid.fid,
 					 loc_addr, len, FI_READ | FI_WRITE,
-					 0, 0, 0, &auto_mr,
-					 NULL, ep->auth_key, GNIX_PROV_REG);
+					 0, 0, 0, &auto_mr, NULL);
 			if (rc != FI_SUCCESS) {
 				GNIX_INFO(FI_LOG_EP_DATA,
 					  "Failed to auto-register local buffer: %d\n",
@@ -601,6 +428,15 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 		}
 	}
 
+	/* find VC for target */
+	rc = _gnix_vc_ep_get_vc(ep, msg->addr, &vc);
+	if (rc) {
+		GNIX_INFO(FI_LOG_EP_DATA,
+			  "_gnix_vc_ep_get_vc() failed, addr: %lx, rc:\n",
+			  msg->addr, rc);
+		goto err_get_vc;
+	}
+
 	/* setup fabric request */
 	req = _gnix_fr_alloc(ep);
 	if (!req) {
@@ -611,6 +447,7 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 
 	req->type = fr_type;
 	req->gnix_ep = ep;
+	req->vc = vc;
 	req->user_context = msg->context;
 	req->work_fn = _gnix_amo_post_req;
 
@@ -620,16 +457,14 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 	req->amo.loc_md = (void *)md;
 	req->amo.loc_addr = (uint64_t)loc_addr;
 
-	if ((fr_type == GNIX_FAB_RQ_NAMO_AX)   ||
-	    (fr_type == GNIX_FAB_RQ_NAMO_FAX)  ||
-	    (fr_type == GNIX_FAB_RQ_NAMO_AX_S) ||
-	    (fr_type == GNIX_FAB_RQ_NAMO_FAX_S)) {
-		req->amo.first_operand =
-			*(uint64_t *)msg->msg_iov[0].addr;
-		req->amo.second_operand =
-			*((uint64_t *)(msg->msg_iov[0].addr) + 1);
-	} else if (msg->op == FI_ATOMIC_READ) {
+	if (msg->op == FI_ATOMIC_READ) {
+		/* Atomic reads are the only AMO which write to the operand
+		 * buffer.  It's assumed that this is in addition to writing
+		 * fetched data to the result buffer.  Make the NIC write to
+		 * the result buffer, like all other AMOS, and copy read data
+		 * to the operand buffer after the completion is received. */
 		req->amo.first_operand = 0xFFFFFFFFFFFFFFFF; /* operand to FAND */
+		req->amo.read_buf = msg->msg_iov[0].addr;
 	} else if (msg->op == FI_CSWAP) {
 		req->amo.first_operand = compare_operand;
 		req->amo.second_operand = *(uint64_t *)msg->msg_iov[0].addr;
@@ -659,40 +494,10 @@ ssize_t _gnix_atomic(struct gnix_fid_ep *ep,
 		req->flags |= FI_COMPLETION;
 	}
 
-	COND_ACQUIRE(ep->requires_lock, &ep->vc_lock);
+	return _gnix_vc_queue_tx_req(req);
 
-	/* find VC for target */
-	rc = _gnix_vc_ep_get_vc(ep, msg->addr, &vc);
-	if (rc) {
-		GNIX_INFO(FI_LOG_EP_DATA,
-			  "_gnix_vc_ep_get_vc() failed, addr: %lx, rc:\n",
-			  msg->addr, rc);
-		goto err_get_vc;
-	}
-
-	req->vc = vc;
-
-	rc = _gnix_vc_queue_tx_req(req);
-	connected = (vc->conn_state == GNIX_VC_CONNECTED);
-
-	COND_RELEASE(ep->requires_lock, &ep->vc_lock);
-
-	/*
-	 *If a new VC was allocated, progress CM before returning.
-	 * If the VC is connected and there's a backlog, poke
-	 * the nic progress engine befure returning.
-	 */
-	if (!connected) {
-		_gnix_cm_nic_progress(ep->cm_nic);
-	} else if (!dlist_empty(&vc->tx_queue)) {
-		_gnix_nic_progress(vc->ep->nic);
-	}
-
-	return rc;
-
-err_get_vc:
-	COND_RELEASE(ep->requires_lock, &ep->vc_lock);
 err_fr_alloc:
+err_get_vc:
 	if (auto_mr) {
 		fi_close(&auto_mr->fid);
 	}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2014-2016, Cisco Systems, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -51,13 +51,14 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
+#include <rdma/fi_prov.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
 #include <rdma/fi_eq.h>
-#include <ofi_util.h>
-#include "ofi.h"
-#include "ofi_enosys.h"
+#include <fi_util.h>
+#include "fi.h"
+#include "fi_enosys.h"
 
 #include "usnic_direct.h"
 #include "usd.h"
@@ -88,12 +89,10 @@ usdf_cq_readerr(struct fid_cq *fcq, struct fi_cq_err_entry *entry,
 	        uint64_t flags)
 {
 	struct usdf_cq *cq;
-	uint32_t api_version;
 
 	USDF_TRACE_SYS(CQ, "\n");
 
 	cq = container_of(fcq, struct usdf_cq, cq_fid);
-	api_version = cq->cq_domain->dom_fabric->fab_attr.fabric->api_version;
 
 	// The return values are analogous to sockets cq_readerr
 	if (cq->cq_comp.uc_status == 0) {
@@ -123,10 +122,6 @@ usdf_cq_readerr(struct fid_cq *fcq, struct fi_cq_err_entry *entry,
 	entry->err = entry->prov_errno;
 
 	cq->cq_comp.uc_status = 0;
-
-	/* We don't have err_data to give back to the user. */
-	if (FI_VERSION_GE(api_version, FI_VERSION(1, 5)))
-		entry->err_data_size = 0;
 
 	return 1;
 }
@@ -300,7 +295,7 @@ usdf_cq_read_common(struct fid_cq *fcq, void *buf, size_t count,
 
 	if (cq->cq_waiting) {
 		cq->cq_waiting = false;
-		ofi_atomic_dec32(&fab->num_blocked_waiting);
+		atomic_dec(&fab->num_blocked_waiting);
 	}
 
 	return copied > 0 ? copied : -FI_EAGAIN;
@@ -372,7 +367,11 @@ usdf_cq_readfrom_context(struct fid_cq *fcq, void *buf, size_t count,
 			sin.sin_addr.s_addr = hdr->uh_ip.saddr;
 			sin.sin_port = hdr->uh_udp.source;
 
-			*src_addr = usdf_av_lookup_addr(ep->e.dg.ep_av, &sin);
+			ret = fi_av_insert(av_utof(ep->e.dg.ep_av), &sin, 1,
+					src_addr, 0, NULL);
+			if (ret != 1) {
+				*src_addr = FI_ADDR_NOTAVAIL;
+			}
 			++src_addr;
 		}
 
@@ -439,7 +438,7 @@ usdf_progress_hard_cq(struct usdf_cq_hard *hcq)
 
 void
 usdf_cq_post_soft(struct usdf_cq_hard *hcq, void *context, size_t len,
-		int prov_errno, uint64_t flags)
+		int prov_errno)
 {
 	int ret;
 	struct usdf_cq_soft_entry *entry;
@@ -462,7 +461,6 @@ usdf_cq_post_soft(struct usdf_cq_hard *hcq, void *context, size_t len,
 	entry->cse_context = context;
 	entry->cse_len = len;
 	entry->cse_prov_errno = prov_errno;
-	entry->cse_flags = flags;
 
 	/* update with wrap */
 	entry++;
@@ -578,7 +576,7 @@ static ssize_t usdf_cq_sread_fd(struct fid_cq *fcq, void *buf, size_t count,
 
 	ret = usdf_cq_trywait(&fcq->fid);
 	if (ret == FI_SUCCESS) {
-		ofi_atomic_inc32(&fabric->num_blocked_waiting);
+		atomic_inc(&fabric->num_blocked_waiting);
 
 		ret = usdf_fabric_wake_thread(fabric);
 		if (ret) {
@@ -596,7 +594,7 @@ static ssize_t usdf_cq_sread_fd(struct fid_cq *fcq, void *buf, size_t count,
 			goto err;
 		}
 
-		ofi_atomic_dec32(&fabric->num_blocked_waiting);
+		atomic_dec(&fabric->num_blocked_waiting);
 	} else if ((ret < 0) && (ret != -FI_EAGAIN)) {
 		return ret;
 	}
@@ -604,7 +602,7 @@ static ssize_t usdf_cq_sread_fd(struct fid_cq *fcq, void *buf, size_t count,
 	return fi_cq_read(fcq, buf, count);
 
 err:
-	ofi_atomic_dec32(&fabric->num_blocked_waiting);
+	atomic_dec(&fabric->num_blocked_waiting);
 	return ret;
 }
 
@@ -754,7 +752,7 @@ static int usdf_cq_unbind_wait(struct usdf_cq *cq)
 
 	fid_list_remove(&wait_priv->list, &wait_priv->lock, &cq->cq_fid.fid);
 
-	ofi_atomic_dec32(&wait_priv->wait_refcnt);
+	atomic_dec(&wait_priv->wait_refcnt);
 
 	USDF_DBG_SYS(CQ,
 			"dissasociated CQ FD %d from epoll FD %d using FID: %p\n",
@@ -776,7 +774,7 @@ usdf_cq_close(fid_t fid)
 	cq = container_of(fid, struct usdf_cq, cq_fid.fid);
 	fab = cq->cq_domain->dom_fabric;
 
-	if (ofi_atomic_get32(&cq->cq_refcnt) > 0) {
+	if (atomic_get(&cq->cq_refcnt) > 0) {
 		return -FI_EBUSY;
 	}
 
@@ -789,7 +787,7 @@ usdf_cq_close(fid_t fid)
 	if (cq->cq_is_soft) {
 		while (!TAILQ_EMPTY(&cq->c.soft.cq_list)) {
 			hcq = TAILQ_FIRST(&cq->c.soft.cq_list);
-			if (ofi_atomic_get32(&hcq->cqh_refcnt) > 0) {
+			if (atomic_get(&hcq->cqh_refcnt) > 0) {
 				return -FI_EBUSY;
 			}
 			TAILQ_REMOVE(&cq->c.soft.cq_list, hcq, cqh_link);
@@ -813,7 +811,7 @@ usdf_cq_close(fid_t fid)
 	}
 
 	if (cq->cq_waiting)
-		ofi_atomic_dec32(&fab->num_blocked_waiting);
+		atomic_dec(&fab->num_blocked_waiting);
 
 	free(cq);
 	return 0;
@@ -989,8 +987,8 @@ usdf_cq_make_soft(struct usdf_cq *cq)
 			hcq->cqh_ucq = ucq;
 			hcq->cqh_progress = usdf_progress_hard_cq;
 
-			ofi_atomic_initialize32(&hcq->cqh_refcnt,
-					ofi_atomic_get32(&cq->cq_refcnt));
+			atomic_initialize(&hcq->cqh_refcnt,
+					atomic_get(&cq->cq_refcnt));
 			TAILQ_INSERT_HEAD(&cq->c.soft.cq_list, hcq, cqh_link);
 		}
 
@@ -1141,11 +1139,11 @@ int usdf_cq_trywait(struct fid *fcq)
 	}
 
 	cq->cq_waiting = true;
-	ofi_atomic_inc32(&fab->num_blocked_waiting);
+	atomic_inc(&fab->num_blocked_waiting);
 	ret = usdf_fabric_wake_thread(fab);
 	if (ret) {
 		USDF_DBG_SYS(FABRIC, "error while waking progress thread\n");
-		ofi_atomic_dec32(&fab->num_blocked_waiting);
+		atomic_dec(&fab->num_blocked_waiting);
 	}
 
 	if (cq->cq_is_soft) {
@@ -1298,7 +1296,7 @@ usdf_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 	 */
 	if (attr->wait_obj == FI_WAIT_SET) {
 		wait_priv = wait_ftou(attr->wait_set);
-		ofi_atomic_inc32(&wait_priv->wait_refcnt);
+		atomic_inc(&wait_priv->wait_refcnt);
 	}
 
 	cq->object.fd = -1;
@@ -1306,7 +1304,7 @@ usdf_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 	cq->cq_fid.fid.fclass = FI_CLASS_CQ;
 	cq->cq_fid.fid.context = context;
 	cq->cq_fid.fid.ops = &usdf_cq_fi_ops;
-	ofi_atomic_initialize32(&cq->cq_refcnt, 0);
+	atomic_initialize(&cq->cq_refcnt, 0);
 
 	switch (attr->format) {
 	case FI_CQ_FORMAT_CONTEXT:

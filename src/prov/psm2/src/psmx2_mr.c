@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2018 Intel Corporation. All rights reserved.
+ * Copyright (c) 2013-2014 Intel Corporation. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -36,16 +36,13 @@ struct psmx2_fid_mr *psmx2_mr_get(struct psmx2_fid_domain *domain,
 				  uint64_t key)
 {
 	RbtIterator it;
-	struct psmx2_fid_mr *mr = NULL;
+	struct psmx2_fid_mr *mr;
 
-	domain->mr_lock_fn(&domain->mr_lock, 1);
 	it = rbtFind(domain->mr_map, (void *)key);
 	if (!it)
-		goto exit;
+		return NULL;
 
 	rbtKeyValue(domain->mr_map, it, (void **)&key, (void **)&mr);
-exit:
-	domain->mr_unlock_fn(&domain->mr_lock, 1);
 	return mr;
 }
 
@@ -54,11 +51,11 @@ static inline void psmx2_mr_release_key(struct psmx2_fid_domain *domain,
 {
 	RbtIterator it;
 
-	domain->mr_lock_fn(&domain->mr_lock, 1);
+	fastlock_acquire(&domain->mr_lock);
 	it = rbtFind(domain->mr_map, (void *)key);
 	if (it)
 		rbtErase(domain->mr_map, it);
-	domain->mr_unlock_fn(&domain->mr_lock, 1);
+	fastlock_release(&domain->mr_lock);
 }
 
 static int psmx2_mr_reserve_key(struct psmx2_fid_domain *domain,
@@ -71,20 +68,20 @@ static int psmx2_mr_reserve_key(struct psmx2_fid_domain *domain,
 	int try_count;
 	int err = -FI_ENOKEY;
 
-	domain->mr_lock_fn(&domain->mr_lock, 1);
+	fastlock_acquire(&domain->mr_lock);
 
-	if (domain->mr_mode == FI_MR_BASIC) {
-		key = domain->mr_reserved_key;
-		try_count = 10000; /* large enough */
-	} else {
+	if (domain->mr_mode == FI_MR_SCALABLE) {
 		key = requested_key;
 		try_count = 1;
+	} else {
+		key = domain->mr_reserved_key;
+		try_count = 10000; /* large enough */
 	}
 
 	for (i=0; i<try_count; i++, key++) {
 		if (!rbtFind(domain->mr_map, (void *)key)) {
 			if (!rbtInsert(domain->mr_map, (void *)key, mr)) {
-				if (domain->mr_mode == FI_MR_BASIC)
+				if (domain->mr_mode != FI_MR_SCALABLE)
 					domain->mr_reserved_key = key + 1;
 				*assigned_key = key;
 				err = 0;
@@ -93,7 +90,7 @@ static int psmx2_mr_reserve_key(struct psmx2_fid_domain *domain,
 		}
 	}
 
-	domain->mr_unlock_fn(&domain->mr_lock, 1);
+	fastlock_release(&domain->mr_lock);
 
 	return err;
 }
@@ -132,8 +129,7 @@ static int psmx2_mr_close(fid_t fid)
 	return 0;
 }
 
-DIRECT_FN
-STATIC int psmx2_mr_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
+static int psmx2_mr_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 {
 	struct psmx2_fid_mr *mr;
 	struct psmx2_fid_ep *ep;
@@ -141,8 +137,8 @@ STATIC int psmx2_mr_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 
 	mr = container_of(fid, struct psmx2_fid_mr, mr.fid);
 
-	assert(bfid);
-
+	if (!bfid)
+		return -FI_EINVAL;
 	switch (bfid->fclass) {
 	case FI_CLASS_EP:
 		ep = container_of(bfid, struct psmx2_fid_ep, ep.fid);
@@ -156,45 +152,7 @@ STATIC int psmx2_mr_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 			return -FI_EBUSY;
 		if (mr->domain != cntr->domain)
 			return -FI_EINVAL;
-		if (flags) {
-			if (flags != FI_REMOTE_WRITE)
-				return -FI_EINVAL;
-			mr->cntr = cntr;
-			cntr->poll_all = 1;
-		}
-		break;
-
-	default:
-		return -FI_ENOSYS;
-	}
-
-	return 0;
-}
-
-DIRECT_FN
-STATIC int psmx2_mr_control(fid_t fid, int command, void *arg)
-{
-	struct psmx2_fid_mr *mr;
-	struct fi_mr_raw_attr *attr;
-
-	mr = container_of(fid, struct psmx2_fid_mr, mr.fid);
-
-	switch (command) {
-	case FI_GET_RAW_MR:
-		attr = arg;
-		if (!attr)
-			return -FI_EINVAL;
-		if (attr->base_addr)
-			*attr->base_addr = (uint64_t)(uintptr_t)mr->iov[0].iov_base;
-		if (attr->raw_key)
-			*(uint64_t *)attr->raw_key = mr->mr.key;
-		if (attr->key_size)
-			*attr->key_size = sizeof(uint64_t);
-		break;
-
-	case FI_REFRESH:
-	case FI_ENABLE:
-		/* Nothing to do here */
+		mr->cntr = cntr;
 		break;
 
 	default:
@@ -208,7 +166,7 @@ static struct fi_ops psmx2_fi_ops = {
 	.size = sizeof(struct fi_ops),
 	.close = psmx2_mr_close,
 	.bind = psmx2_mr_bind,
-	.control = psmx2_mr_control,
+	.control = fi_no_control,
 	.ops_open = fi_no_ops_open,
 };
 
@@ -216,7 +174,6 @@ static void psmx2_mr_normalize_iov(struct iovec *iov, size_t *count)
 {
 	struct iovec tmp_iov;
 	int i, j, n, new_len;
-	uintptr_t iov_end_i, iov_end_j;
 
 	n = *count;
 
@@ -243,10 +200,8 @@ static void psmx2_mr_normalize_iov(struct iovec *iov, size_t *count)
 			if (iov[j].iov_len == 0)
 				continue;
 
-			iov_end_i = (uintptr_t)iov[i].iov_base + iov[i].iov_len;
-			iov_end_j = (uintptr_t)iov[j].iov_base + iov[j].iov_len;
-			if (iov_end_i >= (uintptr_t)iov[j].iov_base) {
-				new_len = iov_end_j - (uintptr_t)iov[i].iov_base;
+			if (iov[i].iov_base + iov[i].iov_len >= iov[j].iov_base) {
+				new_len = iov[j].iov_base + iov[j].iov_len - iov[i].iov_base;
 				if (new_len > iov[i].iov_len)
 					iov[i].iov_len = new_len;
 				iov[j].iov_len = 0;
@@ -274,8 +229,7 @@ static void psmx2_mr_normalize_iov(struct iovec *iov, size_t *count)
 	*count = i;
 }
 
-DIRECT_FN
-STATIC int psmx2_mr_reg(struct fid *fid, const void *buf, size_t len,
+static int psmx2_mr_reg(struct fid *fid, const void *buf, size_t len,
 			uint64_t access, uint64_t offset, uint64_t requested_key,
 			uint64_t flags, struct fid_mr **mr, void *context)
 {
@@ -285,8 +239,9 @@ STATIC int psmx2_mr_reg(struct fid *fid, const void *buf, size_t len,
 	uint64_t key;
 	int err;
 
-	assert(fid->fclass == FI_CLASS_DOMAIN);
-
+	if (fid->fclass != FI_CLASS_DOMAIN) {
+		return -FI_EINVAL;
+	}
 	domain = container_of(fid, struct fid_domain, fid);
 	domain_priv = container_of(domain, struct psmx2_fid_domain,
 				   util_domain.domain_fid);
@@ -307,6 +262,10 @@ STATIC int psmx2_mr_reg(struct fid *fid, const void *buf, size_t len,
 	mr_priv->mr.fid.context = context;
 	mr_priv->mr.fid.ops = &psmx2_fi_ops;
 	mr_priv->mr.mem_desc = mr_priv;
+	mr_priv->mr.fid.fclass = FI_CLASS_MR;
+	mr_priv->mr.fid.context = context;
+	mr_priv->mr.fid.ops = &psmx2_fi_ops;
+	mr_priv->mr.mem_desc = mr_priv;
 	mr_priv->mr.key = key;
 	mr_priv->domain = domain_priv;
 	mr_priv->access = access;
@@ -314,15 +273,15 @@ STATIC int psmx2_mr_reg(struct fid *fid, const void *buf, size_t len,
 	mr_priv->iov_count = 1;
 	mr_priv->iov[0].iov_base = (void *)buf;
 	mr_priv->iov[0].iov_len = len;
-	mr_priv->offset = (domain_priv->mr_mode == FI_MR_BASIC) ? 0 :
-				((uint64_t)mr_priv->iov[0].iov_base - offset);
+	mr_priv->offset = (domain_priv->mr_mode == FI_MR_SCALABLE) ?
+				((uint64_t)mr_priv->iov[0].iov_base - offset) :
+				0;
 
 	*mr = &mr_priv->mr;
 	return 0;
 }
 
-DIRECT_FN
-STATIC int psmx2_mr_regv(struct fid *fid,
+static int psmx2_mr_regv(struct fid *fid,
 			 const struct iovec *iov, size_t count,
 			 uint64_t access, uint64_t offset,
 			 uint64_t requested_key, uint64_t flags,
@@ -334,14 +293,15 @@ STATIC int psmx2_mr_regv(struct fid *fid,
 	int i, err;
 	uint64_t key;
 
-	assert(fid->fclass == FI_CLASS_DOMAIN);
-
+	if (fid->fclass != FI_CLASS_DOMAIN) {
+		return -FI_EINVAL;
+	}
 	domain = container_of(fid, struct fid_domain, fid);
 	domain_priv = container_of(domain, struct psmx2_fid_domain,
 				   util_domain.domain_fid);
 
-	assert(count);
-	assert(iov);
+	if (count == 0 || iov == NULL)
+		return -FI_EINVAL;
 
 	mr_priv = (struct psmx2_fid_mr *)
 			calloc(1, sizeof(*mr_priv) +
@@ -369,15 +329,15 @@ STATIC int psmx2_mr_regv(struct fid *fid,
 	for (i=0; i<count; i++)
 		mr_priv->iov[i] = iov[i];
 	psmx2_mr_normalize_iov(mr_priv->iov, &mr_priv->iov_count);
-	mr_priv->offset = (domain_priv->mr_mode == FI_MR_BASIC) ? 0 :
-				((uint64_t)mr_priv->iov[0].iov_base - offset);
+	mr_priv->offset = (domain_priv->mr_mode == FI_MR_SCALABLE) ?
+				((uint64_t)mr_priv->iov[0].iov_base - offset) :
+				0;
 
 	*mr = &mr_priv->mr;
 	return 0;
 }
 
-DIRECT_FN
-STATIC int psmx2_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
+static int psmx2_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
 			uint64_t flags, struct fid_mr **mr)
 {
 	struct fid_domain *domain;
@@ -386,15 +346,18 @@ STATIC int psmx2_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
 	int i, err;
 	uint64_t key;
 
-	assert(fid->fclass == FI_CLASS_DOMAIN);
-
+	if (fid->fclass != FI_CLASS_DOMAIN) {
+		return -FI_EINVAL;
+	}
 	domain = container_of(fid, struct fid_domain, fid);
 	domain_priv = container_of(domain, struct psmx2_fid_domain,
 				   util_domain.domain_fid);
 
-	assert(attr);
-	assert(attr->iov_count);
-	assert(attr->mr_iov);
+	if (!attr)
+		return -FI_EINVAL;
+
+	if (attr->iov_count == 0 || attr->mr_iov == NULL)
+		return -FI_EINVAL;
 
 	mr_priv = (struct psmx2_fid_mr *)
 			calloc(1, sizeof(*mr_priv) +
@@ -422,8 +385,9 @@ STATIC int psmx2_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
 	for (i=0; i<attr->iov_count; i++)
 		mr_priv->iov[i] = attr->mr_iov[i];
 	psmx2_mr_normalize_iov(mr_priv->iov, &mr_priv->iov_count);
-	mr_priv->offset = (domain_priv->mr_mode == FI_MR_BASIC) ? 0 :
-				((uint64_t)mr_priv->iov[0].iov_base - attr->offset);
+	mr_priv->offset = (domain_priv->mr_mode == FI_MR_SCALABLE) ?
+				((uint64_t)mr_priv->iov[0].iov_base - attr->offset) :
+				0;
 
 	*mr = &mr_priv->mr;
 	return 0;

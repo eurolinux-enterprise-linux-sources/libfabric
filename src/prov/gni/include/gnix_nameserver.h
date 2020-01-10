@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2016 Cray Inc.  All rights reserved.
+ * Copyright (c) 2015 Cray Inc.  All rights reserved.
  * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -34,6 +34,10 @@
 #ifndef _GNIX_NAMESERVER_H_
 #define _GNIX_NAMESERVER_H_
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include "gnix.h"
 
 /*
@@ -44,15 +48,12 @@
  * prototypes
  */
 
-int _gnix_local_ipaddr(struct sockaddr_in *sin);
+int gnix_resolve_name(IN const char *node, IN const char *service,
+		      IN uint64_t flags, INOUT struct gnix_ep_name
+		      *resolved_addr);
 
-int _gnix_pe_to_ip(const struct gnix_ep_name *ep_name,
-		   struct sockaddr_in *saddr);
-
-int _gnix_resolve_name(IN const char *node, IN const char *service,
-		       IN uint64_t flags, INOUT struct gnix_ep_name
-		       *resolved_addr);
-
-int _gnix_src_addr(struct gnix_ep_name *resolved_addr);
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* _GNIX_NAMESERVER_H_ */

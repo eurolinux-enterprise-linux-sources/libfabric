@@ -1,8 +1,7 @@
 /*
  * Copyright (c) 2014 Intel Corporation, Inc.  All rights reserved.
- * Copyright (c) 2015-2017 Los Alamos National Security, LLC.
- *                         All rights reserved.
- * Copyright (c) 2015-2017 Cray Inc. All rights reserved.
+ * Copyright (c) 2015 Los Alamos National Security, LLC. All rights reserved.
+ * Copyright (c) 2015 Cray Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -64,60 +63,32 @@
 #include "gnix.h"
 #include "gnix_util.h"
 
-static bool app_init;
-/* Filled in by __gnix_app_init */
-static uint8_t gnix_app_ptag;
-static uint32_t gnix_app_cookie;
-static uint32_t gnix_pes_on_node;
-static int gnix_pe_node_rank = -1;
-#if HAVE_CRITERION
-int gnix_first_pe_on_node; /* globally visible for  criterion */
-#else
-static int gnix_first_pe_on_node;
-#endif
-/* CCM/ccmlogin specific stuff */
-static bool ccm_init;
-/* This file provides ccm_alps_info */
-#define CCM_ALPS_INFO_FILE "/tmp/ccm_alps_info"
-typedef struct ccm_alps_info {
-	uint32_t version;
-	uint8_t ptag;
-	uint32_t cookie;
-} ccm_alps_info_t;
-/* Format for the nodelist filename: $HOME/.crayccm/ccmnodlist.<WLM jobid> */
-#define CCM_NODELIST_FN ".crayccm/ccm_nodelist."
-/* alps specific stuff */
+static int alps_init;
 static uint64_t gnix_apid;
 static alpsAppLayout_t gnix_appLayout;
+static uint8_t gnix_app_ptag;
+static uint32_t gnix_app_cookie;
 static uint32_t gnix_device_id;
-static int gnix_cq_limit;
-/* These are not used currently and could be static to gnix_alps_init */
-static int alps_init;
+
 static int *gnix_app_placementList;
 static int *gnix_app_targetNids;
 static int *gnix_app_targetPes;
 static int *gnix_app_targetLen;
-static struct in_addr *gnix_app_targetIps;
+struct in_addr *gnix_app_targetIps;
 static int *gnix_app_startPe;
 static int *gnix_app_totalPes;
 static int *gnix_app_nodePes;
 static int *gnix_app_peCpus;
 
-fastlock_t __gnix_alps_lock;
-
-int _gnix_get_cq_limit(void)
-{
-	return gnix_cq_limit;
-}
-
-static inline void __gnix_ccm_cleanup(void)
-{
-	ccm_init = false;
-}
-
-static inline void __gnix_alps_cleanup(void)
+void _gnix_alps_cleanup(void)
 {
 	alps_app_lli_lock();
+
+	if (alps_init) {
+		/* alps lli lock protects alps_init for now */
+		alps_app_lli_unlock();
+		return;
+	}
 
 	if (gnix_app_placementList)
 		free(gnix_app_placementList);
@@ -138,131 +109,25 @@ static inline void __gnix_alps_cleanup(void)
 	if (gnix_app_peCpus)
 		free(gnix_app_peCpus);
 
-	alps_init = false;
+	alps_init = 0;
 
 	alps_app_lli_unlock();
 }
 
-void _gnix_app_cleanup(void)
+static int gnix_alps_init(void)
 {
-	if (alps_init) {
-		__gnix_alps_cleanup();
-	} else if (ccm_init) {
-		__gnix_ccm_cleanup();
-	}
-}
-
-/* There are two types of errors that can happen in this function:
- * - CCM ALPS info file not found
- * - Failure while trying to get ptag, cookie and PEs/node
- *  Currently we don't distinguish between the two.
- */
-static int __gnix_ccm_init(void)
-{
-	int rc, fd;
-	FILE *f;
-	char *nodefile;
-	char nodelist[PATH_MAX];
-	const char *home;
-	ccm_alps_info_t info;
-	uint32_t num_nids = 0;
-
-	GNIX_DEBUG(FI_LOG_FABRIC, "Reading job info file %s\n",
-		   CCM_ALPS_INFO_FILE);
-
-	fd = open(CCM_ALPS_INFO_FILE, O_RDONLY);
-	if (fd < 0) {
-		return -FI_EIO;
-	}
-
-	rc = read(fd, &info, sizeof(ccm_alps_info_t));
-	if (rc != sizeof(ccm_alps_info_t))
-		return -FI_EIO;
-
-	gnix_app_ptag = info.ptag;
-	gnix_app_cookie = info.cookie;
-
-	close(fd);
-	GNIX_DEBUG(FI_LOG_FABRIC, "Ptag=0x%x, cookie=0x%x\n",
-		   gnix_app_ptag, gnix_app_cookie);
-
-	home = getenv("HOME");
-	/* use the WLM node file if using PBS */
-	nodefile = getenv("PBS_NODEFILE");
-	if (!nodefile) {
-		const char *jobid = getenv("SLURM_JOB_ID");
-		if (!jobid) {
-			jobid = getenv("SLURM_JOBID");
-		}
-		snprintf(nodelist, PATH_MAX, "%s/%s%s", home ? home : ".",
-			 CCM_NODELIST_FN, jobid ? jobid : "sdb");
-		nodefile = nodelist;
-	}
-	f = fopen(nodefile, "r");
-	if (f) {
-		char mynid[PATH_MAX];
-		char next_nid[PATH_MAX];
-
-		rc = gethostname(mynid, PATH_MAX);
-		if (rc) {
-			/* use the first address */
-			rc = fscanf(f, "%s\n", mynid);
-			/* assume this one worked, error case is same */
-			num_nids++;
-		}
-		while (true) {
-			rc = fscanf(f, "%s\n", next_nid);
-			if (rc == 1) {
-				if (strcmp(mynid, next_nid) == 0) {
-					num_nids++;
-				}
-			} else {
-				break;
-			}
-		}
-		gnix_pes_on_node = num_nids;
-		fclose(f);
-	} else {
-		/* what would be a better default? */
-		GNIX_WARN(FI_LOG_FABRIC,
-			  "CCM nodelist not found.  Assuming 1 PE per node\n");
-		gnix_pes_on_node = 1;
-	}
-	GNIX_DEBUG(FI_LOG_FABRIC, "pes per node=%u\n", gnix_pes_on_node);
-
-	/* Don't really need to do this here, but wanted to be clear */
-	gnix_app_placementList = NULL;
-	gnix_app_targetNids = NULL;
-	gnix_app_targetPes = NULL;
-	gnix_app_targetLen = NULL;
-	gnix_app_targetIps = NULL;
-	gnix_app_startPe = NULL;
-	gnix_app_totalPes = NULL;
-	gnix_app_nodePes = NULL;
-	gnix_app_peCpus = NULL;
-
-	ccm_init = true;
-	return FI_SUCCESS;
-}
-
-static int __gnix_alps_init(void)
-{
-	char *cptr = NULL;
 	int ret = FI_SUCCESS;
-	int my_pe = -1;
 	int alps_status = 0;
 	size_t alps_count;
 	alpsAppLLIGni_t *rdmacred_rsp = NULL;
 	alpsAppGni_t *rdmacred_buf = NULL;
 
-	fastlock_acquire(&__gnix_alps_lock);
 	/* lli_lock doesn't return anything useful */
 	ret = alps_app_lli_lock();
 
 	if (alps_init) {
 		/* alps lli lock protects alps_init for now */
 		alps_app_lli_unlock();
-		fastlock_release(&__gnix_alps_lock);
 		return ret;
 	}
 
@@ -365,31 +230,12 @@ static int __gnix_alps_init(void)
 		goto err;
 	}
 
-	gnix_pes_on_node = gnix_appLayout.numPesHere;
-	gnix_first_pe_on_node = gnix_appLayout.firstPe;
-
-	if ((cptr = getenv("PMI_FORK_RANK")) != NULL) {
-		my_pe = atoi(cptr);
-	} else {
-		if ((cptr = getenv("ALPS_APP_PE")) != NULL) {
-			my_pe = atoi(cptr);
-		}
-	}
-
-	/*
- 	 * compute local pe rank, assuming we got our global PE rank
- 	 * via either an ALPS (or ALPS SLURM plugin) or Cray PMI,
- 	 * otherwise set to -1.
- 	 */
-	if (my_pe != -1)
-		gnix_pe_node_rank = my_pe - gnix_first_pe_on_node;
-
-	alps_init = true;
+	gnix_device_id = 0;
+	alps_init++;
 
 	ret = 0;
 err:
 	alps_app_lli_unlock();
-	fastlock_release(&__gnix_alps_lock);
 	if (rdmacred_rsp != NULL) {
 		free(rdmacred_rsp);
 	}
@@ -397,45 +243,52 @@ err:
 	return ret;
 }
 
-static int __gnix_app_init(void)
+typedef struct ccm_alps_info {
+	uint32_t version;
+	uint8_t ptag;
+	uint32_t cookie;
+} ccm_alps_info_t;
+
+int get_ccm_ptag_cookie(char *filename)
 {
-	int ret;
+	int rc, fd;
+	ccm_alps_info_t info;
+	GNIX_INFO(FI_LOG_FABRIC, "Reading job info file %s", filename);
 
-	if (app_init) {
-		return FI_SUCCESS;
-	}
+	fd = open(filename, O_RDONLY);
+	if (fd < 0)
+		return -FI_EIO;
 
-	/* Try CCM first */
-	ret = __gnix_ccm_init();
-	if (ret) {
-		ret = __gnix_alps_init();
-	}
+	rc = read(fd, &info, sizeof(ccm_alps_info_t));
+	if (rc != sizeof(ccm_alps_info_t))
+		return -FI_EIO;
 
-	if (ret == FI_SUCCESS) {
-		app_init = true;
-	}
+	gnix_app_ptag = info.ptag;
+	gnix_app_cookie = info.cookie;
 
-	gnix_device_id = 0;
-	return ret;
+	close(fd);
+	GNIX_INFO(FI_LOG_FABRIC, "Ptag=0x%x, cookie=0x%x",
+		  gnix_app_ptag, gnix_app_cookie);
 
+	return FI_SUCCESS;
 }
 
 int gnixu_get_rdma_credentials(void *addr, uint8_t *ptag, uint32_t *cookie)
 {
 	int ret = FI_SUCCESS;
 
-	/*TODO: If addr is used, ensure that ep->info->addr_format is checked*/
-
 	if ((ptag == NULL) || (cookie == NULL)) {
 		return -FI_EINVAL;
 	}
-
-	ret = __gnix_app_init();
+	ret = get_ccm_ptag_cookie("/tmp/ccm_alps_info");
 	if (ret) {
-		GNIX_WARN(FI_LOG_FABRIC,
-			  "__gnix_app_init() failed, ret=%d(%s)\n",
-			  ret, strerror(errno));
-		return ret;
+		ret = gnix_alps_init();
+		if (ret) {
+			GNIX_WARN(FI_LOG_FABRIC,
+				  "gnix_alps_init() failed, ret=%d(%s)\n",
+				  ret, strerror(errno));
+			return ret;
+		}
 	}
 
 	/*
@@ -537,14 +390,14 @@ static int gnix_write_proc_job(char *val_str)
  * assigned to the app and not assigned to corespec. */
 int _gnix_job_enable_unassigned_cpus(void)
 {
-	return gnix_write_proc_job("enable_affinity_unassigned_cpus");
+	return gnix_write_proc_job("enable_unassigned_cpus");
 }
 
 /* Indicate that the next task spawned will be restricted to CPUs that are
  * assigned to the app. */
 int _gnix_job_disable_unassigned_cpus(void)
 {
-	return gnix_write_proc_job("disable_affinity_unassigned_cpus");
+	return gnix_write_proc_job("disable_unassigned_cpus");
 }
 
 /* Indicate that the next task spawned should adhere to the the affinity rules. */
@@ -615,45 +468,18 @@ int _gnix_pes_on_node(uint32_t *num_pes)
 		return -FI_EINVAL;
 	}
 
-	rc = __gnix_app_init();
+	rc = gnix_alps_init();
 	if (rc) {
 		GNIX_WARN(FI_LOG_FABRIC,
-			  "__gnix_app_init() failed, ret=%d(%s)\n",
+			  "gnix_alps_init() failed, ret=%d(%s)\n",
 			  rc, strerror(errno));
 		return rc;
 	}
 
-	*num_pes = gnix_pes_on_node;
+	*num_pes = gnix_appLayout.numPesHere;
 	GNIX_INFO(FI_LOG_FABRIC, "num_pes: %u\n", gnix_appLayout.numPesHere);
 
 	return FI_SUCCESS;
-}
-
-int _gnix_pe_node_rank(int *pe_node_rank)
-{
-	int rc;
-
-	if (!pe_node_rank) {
-		return -FI_EINVAL;
-	}
-
-	rc = __gnix_app_init();
-	if (rc) {
-		GNIX_WARN(FI_LOG_FABRIC,
-			  "__gnix_app_init() failed, ret=%d(%s)\n",
-			  rc, strerror(errno));
-		return rc;
-	}
-
-	if (gnix_pe_node_rank != -1) {
-		*pe_node_rank = gnix_pe_node_rank;
-		rc = FI_SUCCESS;
-	} else
-		rc = -FI_EADDRNOTAVAIL;
-
-	GNIX_INFO(FI_LOG_FABRIC, "pe_node_rank: %u\n", gnix_pe_node_rank);
-
-	return rc;
 }
 
 int _gnix_nics_per_rank(uint32_t *nics_per_rank)
@@ -665,10 +491,10 @@ int _gnix_nics_per_rank(uint32_t *nics_per_rank)
 		return -FI_EINVAL;
 	}
 
-	rc = __gnix_app_init();
+	rc = gnix_alps_init();
 	if (rc) {
 		GNIX_WARN(FI_LOG_FABRIC,
-			  "__gnix_app_init() failed, ret=%d(%s)\n",
+			  "gnix_alps_init() failed, ret=%d(%s)\n",
 			  rc, strerror(errno));
 		return rc;
 	}
@@ -682,8 +508,6 @@ int _gnix_nics_per_rank(uint32_t *nics_per_rank)
 	if (rc) {
 		return rc;
 	}
-
-	gnix_cq_limit = cqs;
 	cqs /= GNIX_CQS_PER_EP;
 
 	rc = _gnix_pes_on_node(&npes);
@@ -696,104 +520,5 @@ int _gnix_nics_per_rank(uint32_t *nics_per_rank)
 	*nics_per_rank = limiting_resource / npes;
 
 	return FI_SUCCESS;
-}
-
-void _gnix_dump_gni_res(uint8_t ptag)
-{
-	int i;
-	gni_return_t status;
-	gni_dev_res_desc_t dev_res_desc;
-	gni_job_res_desc_t job_res_desc;
-#define BUF_SZ 4096
-	char buf[BUF_SZ];
-	int size = BUF_SZ, written = 0;
-
-	if (!fi_log_enabled(&gnix_prov, FI_LOG_WARN, FI_LOG_FABRIC))
-		return;
-
-	written += snprintf(buf + written, size - written,
-			    "Device Resources:\n");
-	for (i = GNI_DEV_RES_FIRST+1; i < GNI_DEV_RES_LAST; i++) {
-		status = GNI_GetDevResInfo(0, i, &dev_res_desc);
-		if (status == GNI_RC_SUCCESS) {
-			written += snprintf(buf + written, size - written,
-					    "dev res: %9s, avail: %lu res: %lu held: %lu total: %lu\n",
-					    gni_dev_res_to_str(i),
-					    dev_res_desc.available,
-					    dev_res_desc.reserved,
-					    dev_res_desc.held,
-					    dev_res_desc.total);
-		}
-	}
-
-	GNIX_WARN(FI_LOG_FABRIC, "%s", buf);
-
-	written = 0;
-	written += snprintf(buf + written, size - written,
-			    "Job Resources:\n");
-	for (i = GNI_JOB_RES_FIRST+1; i < GNI_JOB_RES_LAST; i++) {
-		status = GNI_GetJobResInfo(0, ptag, i, &job_res_desc);
-		if (status == GNI_RC_SUCCESS) {
-			written += snprintf(buf + written, size - written,
-					    "ptag[%d] job res: %9s used: %lu limit: %lu\n",
-					    ptag, gni_job_res_to_str(i),
-					    job_res_desc.used,
-					    job_res_desc.limit);
-		}
-	}
-
-	GNIX_WARN(FI_LOG_FABRIC, "%s", buf);
-}
-
-int _gnix_get_num_corespec_cpus(uint32_t *num_core_spec_cpus)
-{
-	int ret = -FI_ENODATA;
-	int ncpus = 0;
-	FILE *fd = NULL;
-	char buffer[4096], *line, *field;
-	static bool already_called;
-	static uint32_t cached_num_corespec_cpus;
-
-	if (num_core_spec_cpus == NULL)
-		return -FI_EINVAL;
-
-	if (already_called == true) {
-		*num_core_spec_cpus = cached_num_corespec_cpus;
-		return FI_SUCCESS;
-	}
-
-	fd = fopen("/proc/job", "r");
-	if (!fd) {
-		GNIX_WARN(FI_LOG_FABRIC,
-			  "open of /proc/job returned %s", strerror(errno));
-		return -errno;
-	}
-
-	while (1) {
-		line = fgets(buffer, sizeof(buffer), fd);
-		if (!line)
-			break;
-
-		line = strstr(line, "corespec");
-		if (line != NULL) {
-			field  = strtok(line, " ");
-			field  = strtok(NULL, " ");
-			if (!strcmp(field, "num_sys_cpus")) {
-				field = strtok(NULL, " ");
-				ncpus = atoi(field);
-			}
-			ret = FI_SUCCESS;
-			break;
-		}
-	}
-
-	*num_core_spec_cpus = ncpus;
-	cached_num_corespec_cpus = ncpus;
-
-	already_called = true;
-
-	fclose(fd);
-
-	return ret;
 }
 
